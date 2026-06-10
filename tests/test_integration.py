@@ -1,8 +1,18 @@
 import importlib
 import sys
+import time
 import types
 
 import numpy as np
+
+
+def wait_for(predicate, timeout=1.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
 
 
 def load_main(monkeypatch):
@@ -67,25 +77,27 @@ def test_hotkey_handlers_drive_recording_handsfree_processing_and_esc(monkeypatc
     monkeypatch.setattr(main, "_do_cancel_recording", lambda: calls.append("cancel_recording"))
     monkeypatch.setattr(main, "_indicator_send", lambda command: calls.append(command))
 
+    # process/cancel_recording 由事件處理函式另開 thread 執行，需等待
     main._sm = main.DictationStateMachine()
     main._on_hotkey_down(10.0)
     main._on_hotkey_up(10.1)
     main._on_hotkey_down(12.0)
-    assert calls == ["start", "handsfree", "process"]
+    assert wait_for(lambda: calls == ["start", "handsfree", "process"]), calls
 
     calls.clear()
     main._sm = main.DictationStateMachine()
     main._on_hotkey_down(20.0)
     main._on_esc()
-    assert calls == ["start", "cancel_recording"]
+    assert wait_for(lambda: calls == ["start", "cancel_recording"]), calls
     assert main._sm.state is main.State.IDLE
 
     calls.clear()
     main._sm = main.DictationStateMachine()
     main._on_hotkey_down(30.0)
     main._on_hotkey_up(31.0)
+    assert wait_for(lambda: calls == ["start", "process"]), calls
     main._on_esc()
-    assert calls == ["start", "process", "cancel"]
+    assert wait_for(lambda: calls == ["start", "process", "cancel"]), calls
     assert main._cancel_processing.is_set()
     assert main._sm.state is main.State.IDLE
 

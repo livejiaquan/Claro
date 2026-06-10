@@ -60,8 +60,10 @@ class HotkeyManager:
         ts = time.monotonic()
 
         if key_code == VK_ESC and event_type == Quartz.kCGEventKeyDown:
+            # 無鎖讀取：極端情況下 Esc 與熱鍵同時按、state 尚未更新時會放行，
+            # 使用者再按一次即可，不值得為此在 tap callback 內上鎖。
             if _sm.state is not State.IDLE:
-                threading.Thread(target=_on_esc, daemon=True).start()
+                _events.put(("esc", ts))
                 return None
             return event
 
@@ -71,7 +73,7 @@ class HotkeyManager:
         if event_type == Quartz.kCGEventKeyDown:
             if (flags & HOTKEY_FLAGS) == HOTKEY_FLAGS and not is_repeat:
                 self._consumed_down = True
-                threading.Thread(target=_on_hotkey_down, args=(ts,), daemon=True).start()
+                _events.put(("down", ts))
                 return None
             if is_repeat and self._consumed_down:
                 return None
@@ -80,7 +82,7 @@ class HotkeyManager:
         # keyUp：只要 keyDown 是我們吃掉的，keyUp 一律吃掉（不管修飾鍵還在不在）
         if self._consumed_down:
             self._consumed_down = False
-            threading.Thread(target=_on_hotkey_up, args=(ts,), daemon=True).start()
+            _events.put(("up", ts))
             return None
         return event
 
@@ -125,6 +127,24 @@ class HotkeyManager:
 
 _hotkey_mgr = HotkeyManager()
 _cancel_processing = threading.Event()
+_events: queue.Queue = queue.Queue()
+
+
+def _event_dispatcher():
+    """單一執行緒依鍵盤事件原始順序驅動狀態機。
+
+    tap callback 只負責入列；所有狀態轉移都在這裡序列化，
+    避免 keyDown/keyUp 各自開 thread 導致亂序（快速點放時 keyUp 先到會卡死錄音）。
+    重活（轉錄）另開 thread，不堵住後續事件。
+    """
+    while True:
+        kind, ts = _events.get()
+        if kind == "down":
+            _on_hotkey_down(ts)
+        elif kind == "up":
+            _on_hotkey_up(ts)
+        elif kind == "esc":
+            _on_esc()
 
 
 def _on_hotkey_down(ts: float):
@@ -133,7 +153,7 @@ def _on_hotkey_down(ts: float):
     if action is Action.START_RECORDING:
         _do_start_recording()
     elif action is Action.STOP_AND_PROCESS:
-        _do_stop_and_process()
+        threading.Thread(target=_do_stop_and_process, daemon=True).start()
 
 
 def _on_hotkey_up(ts: float):
@@ -143,14 +163,14 @@ def _on_hotkey_up(ts: float):
         _indicator_send("handsfree")
         print("🔁 Hands-free mode (press hotkey again to stop)", flush=True)
     elif action is Action.STOP_AND_PROCESS:
-        _do_stop_and_process()
+        threading.Thread(target=_do_stop_and_process, daemon=True).start()
 
 
 def _on_esc():
     with _lock:
         action = _sm.esc()
     if action is Action.CANCEL_RECORDING:
-        _do_cancel_recording()
+        threading.Thread(target=_do_cancel_recording, daemon=True).start()
     elif action is Action.CANCEL_PROCESSING:
         _cancel_processing.set()
         _indicator_send("cancel")
@@ -262,9 +282,10 @@ def _do_start_recording():
     _audio_chunks = []
     _audio_queue = queue.Queue()
 
+    _cancel_processing.clear()  # 每段聽寫開始時重置，避免清掉剛按下的 Esc
     threading.Thread(target=_record_worker, daemon=True).start()
     threading.Thread(target=_audio_level_poller, daemon=True).start()
-    print("🎤 Recording... (press Option+Shift+C again to stop)", flush=True)
+    print("🎤 Recording... (release to paste, Esc to cancel)", flush=True)
 
     _indicator_send("recording")
 
@@ -300,9 +321,11 @@ def _collect_audio() -> np.ndarray | None:
     if not _audio_done.wait(timeout=2.0):
         print("Audio capture timed out", flush=True)
         _indicator_send("error")
+        history.append_entry(raw="", text="", duration_s=0, status="error")
         return None
     if not _audio_chunks:
         _indicator_send("error")
+        history.append_entry(raw="", text="", duration_s=0, status="error")
         return None
 
     audio = np.concatenate(_audio_chunks)
@@ -332,7 +355,6 @@ def _transcribe(audio: np.ndarray) -> str:
 
 
 def _do_stop_and_process():
-    _cancel_processing.clear()
     try:
         audio = _collect_audio()
         if audio is None:
@@ -381,16 +403,17 @@ def _do_cancel_recording():
     if _audio_done.wait(timeout=2.0) and _audio_chunks:
         audio = np.concatenate(_audio_chunks)
     if audio is None or len(audio) < SAMPLE_RATE * 0.3 or _rms(audio) < 0.01:
+        dur = 0 if audio is None else len(audio) / SAMPLE_RATE
+        history.append_entry(raw="", text="", duration_s=dur, status="cancelled")
         return
     dur = len(audio) / SAMPLE_RATE
 
     def _bg():
         try:
             raw = _transcribe(_normalize_audio(audio))
-            if raw:
-                history.append_entry(raw=raw, text=raw, duration_s=dur, status="cancelled")
         except Exception:
-            pass
+            raw = ""
+        history.append_entry(raw=raw, text=raw, duration_s=dur, status="cancelled")
 
     threading.Thread(target=_bg, daemon=True).start()
 
@@ -403,6 +426,10 @@ def _paste_text(text: str):
     """
     try:
         old = subprocess.run(["pbpaste"], capture_output=True).stdout
+    except Exception as e:
+        print(f"Clipboard backup failed: {e}", flush=True)
+        old = None
+    try:
         subprocess.run(["pbcopy"], input=text.encode("utf-8"))
         time.sleep(0.05)
 
@@ -413,11 +440,15 @@ def _paste_text(text: str):
         Quartz.CGEventSetFlags(up, Quartz.kCGEventFlagMaskCommand)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
-
-        time.sleep(0.3)
-        subprocess.run(["pbcopy"], input=old)
     except Exception as e:
         print(f"Paste failed: {e}", flush=True)
+    finally:
+        if old is not None:
+            time.sleep(0.3)
+            try:
+                subprocess.run(["pbcopy"], input=old)
+            except Exception:
+                pass
 
 
 # ─── Mic indicator (Swift overlay) ───────────────────────────────────────────
@@ -645,6 +676,7 @@ def main():
     signal.signal(signal.SIGINT, _cleanup)
     signal.signal(signal.SIGTERM, _cleanup)
 
+    threading.Thread(target=_event_dispatcher, daemon=True).start()
     print("👂  Listening for hotkey 'Option+Shift+C'...", flush=True)
     _hotkey_mgr.start()
 
