@@ -242,6 +242,25 @@ def _rms(audio: np.ndarray) -> float:
     return float(np.sqrt(np.mean(audio ** 2)))
 
 
+def _normalize_audio(audio: np.ndarray) -> np.ndarray:
+    peak = np.max(np.abs(audio))
+    if peak > 0.001:
+        audio = audio / peak * 0.95
+    return audio
+
+
+import re as _re
+
+
+def _clean_transcript(result: dict) -> str:
+    text = result["text"].strip()
+    text = _re.sub(r"(?<=[\u4e00-\u9fff]) +(?=[\u4e00-\u9fff])", "", text)
+    text = _re.sub(r" +(?=[\u3000-\u303f\uff00-\uffef\u2000-\u206f])", "", text)
+    text = _re.sub(r"(?<=[\u3000-\u303f\uff00-\uffef\u2000-\u206f]) +", "", text)
+    text = _re.sub(r" +", " ", text)
+    return text.strip()
+
+
 def _do_stop_and_transcribe():
     global _recording
     _recording = False
@@ -268,10 +287,12 @@ def _do_stop_and_transcribe():
     print(f"  Audio: {dur:.1f}s, RMS={rms:.4f}", flush=True)
     _save_debug_audio(audio, "rec")
 
-    if rms < 0.02:
+    if rms < 0.01:
         print("  ⛔ RMS too low — likely silence/noise, ignoring", flush=True)
         _indicator_send("hide")
         return
+
+    audio = _normalize_audio(audio)
 
     _indicator_send("transcribing")
     print("⏳ Transcribing...", flush=True)
@@ -280,8 +301,9 @@ def _do_stop_and_transcribe():
         result = mlx_whisper.transcribe(
             audio,
             path_or_hf_repo=f"mlx-community/whisper-{MODEL_SIZE}",
+            language="zh",
         )
-        text = result["text"].strip()
+        text = _clean_transcript(result["text"])
     except Exception as e:
         print(f"Transcription failed: {e}", flush=True)
         _indicator_send("hide")
