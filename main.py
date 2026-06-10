@@ -32,6 +32,7 @@ _audio_done = threading.Event()
 _lock = threading.Lock()
 
 _indicator_proc: subprocess.Popen | None = None
+_rms_smoothed = 0.0
 
 # ─── Hotkey (CGEventTap) ─────────────────────────────────────────────────────
 
@@ -187,8 +188,11 @@ def _calibrate_mic():
 # ─── Audio ────────────────────────────────────────────────────────────────────
 
 def _audio_callback(indata, frames, time_info, status):
+    global _rms_smoothed
     if status:
         print(f"[audio] {status}", file=sys.stderr)
+    rms = float(np.sqrt(np.mean(indata ** 2)))
+    _rms_smoothed = _rms_smoothed * 0.6 + rms * 0.4
     _audio_queue.put(indata.copy())
 
 
@@ -210,21 +214,28 @@ def _record_worker():
     _audio_done.set()
 
 
+def _audio_level_poller():
+    while _recording:
+        _indicator_send(f"level {_rms_smoothed:.4f}")
+        time.sleep(0.08)
+
+
 def _do_start_recording():
-    global _recording, _audio_chunks, _audio_queue
+    global _recording, _audio_chunks, _audio_queue, _rms_smoothed
     _recording = True
+    _rms_smoothed = 0.0
     _audio_chunks = []
     _audio_queue = queue.Queue()
 
     threading.Thread(target=_record_worker, daemon=True).start()
+    threading.Thread(target=_audio_level_poller, daemon=True).start()
     print("🎤 Recording... (press Option+Shift+C again to stop)", flush=True)
 
-    mx, my = pyautogui.position()
     try:
         os.unlink(MENU_RESULT)
     except FileNotFoundError:
         pass
-    _indicator_send(f"recording {mx} {my}")
+    _indicator_send("recording")
 
 
 def _rms(audio: np.ndarray) -> float:
@@ -234,20 +245,22 @@ def _rms(audio: np.ndarray) -> float:
 def _do_stop_and_transcribe():
     global _recording
     _recording = False
-    _indicator_send("hide")
 
     if not _audio_done.wait(timeout=2.0):
         print("Audio capture timed out", flush=True)
+        _indicator_send("hide")
         return
 
     if not _audio_chunks:
         print("No audio captured", flush=True)
+        _indicator_send("hide")
         return
 
     audio = np.concatenate(_audio_chunks)
 
     if len(audio) < SAMPLE_RATE * 0.3:
         print("Audio too short, ignoring", flush=True)
+        _indicator_send("hide")
         return
 
     rms = _rms(audio)
@@ -257,8 +270,10 @@ def _do_stop_and_transcribe():
 
     if rms < 0.02:
         print("  ⛔ RMS too low — likely silence/noise, ignoring", flush=True)
+        _indicator_send("hide")
         return
 
+    _indicator_send("transcribing")
     print("⏳ Transcribing...", flush=True)
 
     try:
@@ -269,10 +284,12 @@ def _do_stop_and_transcribe():
         text = result["text"].strip()
     except Exception as e:
         print(f"Transcription failed: {e}", flush=True)
+        _indicator_send("hide")
         return
 
     if not text:
         print("No speech detected", flush=True)
+        _indicator_send("hide")
         return
 
     text = _apply_dict(text)
@@ -284,13 +301,13 @@ def _do_stop_and_transcribe():
 
     print(f"📝 {text}", flush=True)
 
-    mx, my = pyautogui.position()
-    _indicator_send(f"menu {mx} {my}")
+    _indicator_send("done")
     choice = _wait_menu_choice(timeout=15)
     if choice == "confirm":
         _type_text_at_mouse(text)
     else:
         print("  Cancelled", flush=True)
+    _indicator_send("hide")
 
 
 def _type_text_at_mouse(text: str):
