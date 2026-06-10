@@ -56,10 +56,10 @@ def load_main(monkeypatch):
     return importlib.import_module("main")
 
 
-def test_task4_removes_confirm_flow_and_uses_turbo(monkeypatch):
+def test_task4_removes_confirm_flow(monkeypatch):
     main = load_main(monkeypatch)
 
-    assert main.MODEL_SIZE == "large-v3-turbo"
+    # MODEL_SIZE 是設定值（turbo / large-v3-mlx 皆合法），不在此釘死
     assert not hasattr(main, "MENU_RESULT")
     assert not hasattr(main, "_wait_menu_choice")
     assert not hasattr(main, "_on_hotkey")
