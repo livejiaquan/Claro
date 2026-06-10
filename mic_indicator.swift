@@ -469,6 +469,16 @@ class SocketServer {
     init(path: String) { self.path = path }
 
     func start(indicator: IndicatorWindow) {
+        let claroDir = NSHomeDirectory() + "/.claro"
+        try? FileManager.default.createDirectory(
+            atPath: claroDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        // createDirectory 的 attributes 不影響既有目錄，明確補一次
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o700], ofItemAtPath: claroDir
+        )
         unlink(path)
         sock = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard sock >= 0 else { return }
@@ -492,7 +502,7 @@ class SocketServer {
         }
         guard ok == 0 else { close(sock); sock = -1; return }
 
-        chmod(path, 0o666)
+        chmod(path, 0o600)
         listen(sock, 5)
 
         DispatchQueue.global(qos: .background).async { [weak self] in
@@ -551,7 +561,7 @@ class SocketServer {
 // Entry
 
 let indicator = IndicatorWindow()
-let server = SocketServer(path: "/tmp/mic_indicator.sock")
+let server = SocketServer(path: NSHomeDirectory() + "/.claro/indicator.sock")
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 server.start(indicator: indicator)

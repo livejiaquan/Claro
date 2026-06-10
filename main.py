@@ -1,5 +1,6 @@
 import os
 import queue
+import re as _re
 import signal
 import socket
 import subprocess
@@ -22,6 +23,7 @@ DEBUG_AUDIO_DIR = "/tmp/voicerec_debug"
 MODEL_SIZE = "large-v3-mlx"  # 換回 "large-v3-turbo" 可大幅降低出字延遲（需下載 1.6GB）
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 1024
+MAX_RECORDING_S = 300
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
@@ -29,6 +31,7 @@ _recording = False
 _audio_queue = queue.Queue()
 _audio_chunks = []
 _audio_done = threading.Event()
+_models_ready = threading.Event()
 _lock = threading.Lock()
 
 _indicator_proc: subprocess.Popen | None = None
@@ -51,6 +54,12 @@ class HotkeyManager:
         self._consumed_down = False
 
     def _callback(self, proxy, event_type, event, refcon):
+        if event_type in (Quartz.kCGEventTapDisabledByTimeout,
+                          Quartz.kCGEventTapDisabledByUserInput):
+            if self._tap is not None:
+                Quartz.CGEventTapEnable(self._tap, True)
+            return event
+
         if event_type not in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp):
             return event
 
@@ -145,6 +154,11 @@ def _event_dispatcher():
             _on_hotkey_up(ts)
         elif kind == "esc":
             _on_esc()
+        elif kind == "force_stop":
+            with _lock:
+                action = _sm.force_stop()
+            if action is Action.STOP_AND_PROCESS:
+                _start_processing()
 
 
 def _start_processing():
@@ -156,7 +170,9 @@ def _start_processing():
     global _cancel_processing
     cancel = threading.Event()
     _cancel_processing = cancel
-    threading.Thread(target=_do_stop_and_process, args=(cancel,), daemon=True).start()
+    with _lock:
+        sess = _sm.session
+    threading.Thread(target=_do_stop_and_process, args=(cancel, sess), daemon=True).start()
 
 
 def _on_hotkey_down(ts: float):
@@ -264,21 +280,30 @@ def _audio_callback(indata, frames, time_info, status):
 
 
 def _record_worker():
+    global _recording
     _audio_done.clear()
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="float32",
-        blocksize=BLOCK_SIZE,
-        callback=_audio_callback,
-    ):
-        while _recording:
-            sd.sleep(50)
+    started = time.monotonic()
+    try:
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            blocksize=BLOCK_SIZE,
+            callback=_audio_callback,
+        ):
+            while _recording:
+                if time.monotonic() - started > MAX_RECORDING_S:
+                    _events.put(("force_stop", time.monotonic()))
+                    break
+                sd.sleep(50)
+    except Exception as e:
+        print(f"🎙️ Audio input failed: {e}", flush=True)
+        _recording = False
+    finally:
+        while not _audio_queue.empty():
+            _audio_chunks.append(_audio_queue.get().flatten())
 
-    while not _audio_queue.empty():
-        _audio_chunks.append(_audio_queue.get().flatten())
-
-    _audio_done.set()
+        _audio_done.set()
 
 
 def _audio_level_poller():
@@ -310,9 +335,6 @@ def _normalize_audio(audio: np.ndarray) -> np.ndarray:
     if peak > 0.001:
         audio = audio / peak * 0.95
     return audio
-
-
-import re as _re
 
 
 def _clean_transcript(result: dict) -> str:
@@ -383,7 +405,7 @@ def _transcribe(audio: np.ndarray) -> str:
     return _to_traditional(_clean_transcript(result))
 
 
-def _do_stop_and_process(cancel: threading.Event):
+def _do_stop_and_process(cancel: threading.Event, session: int):
     try:
         audio = _collect_audio()
         if audio is None:
@@ -391,6 +413,11 @@ def _do_stop_and_process(cancel: threading.Event):
         dur = len(audio) / SAMPLE_RATE
 
         _indicator_send("processing")
+        if not _models_ready.wait(timeout=300):
+            _indicator_send("error")
+            history.append_entry(raw="", text="", duration_s=dur, status="error")
+            return
+
         print("⏳ Transcribing...", flush=True)
         try:
             raw = _transcribe(audio)
@@ -420,7 +447,7 @@ def _do_stop_and_process(cancel: threading.Event):
         history.append_entry(raw=raw, text=text, duration_s=dur, status="pasted")
     finally:
         with _lock:
-            _sm.processing_finished()
+            _sm.processing_finished(session)
 
 
 def _do_cancel_recording():
@@ -486,7 +513,7 @@ def _paste_text(text: str):
 
 # ─── Mic indicator (Swift overlay) ───────────────────────────────────────────
 
-INDICATOR_SOCKET = "/tmp/mic_indicator.sock"
+INDICATOR_SOCKET = os.path.expanduser("~/.claro/indicator.sock")
 
 
 def _start_indicator():
@@ -734,6 +761,13 @@ def _preload_model():
     print(f"Model loaded ({time.time() - t0:.1f}s)", flush=True)
 
 
+def _load_models_background():
+    _preload_model()
+    _init_llm()
+    _models_ready.set()
+    print("✅ Models ready", flush=True)
+
+
 # ─── Permission check ─────────────────────────────────────────────────────────
 
 def _check_accessibility():
@@ -756,8 +790,6 @@ def main():
             print(f"[{e['ts']}] ({e['status']}, {e['duration_s']}s) {e['text'] or e['raw']}")
         return
 
-    _custom_terms = []
-    args = [a for a in sys.argv[1:] if not a.startswith("--add-term")]
     for a in sys.argv[1:]:
         if a.startswith("--add-term="):
             part = a.split("=", 1)[1]
@@ -780,8 +812,7 @@ def main():
     _print_audio_devices()
     _calibrate_mic()
     _start_indicator()
-    _preload_model()
-    _init_llm()
+    threading.Thread(target=_load_models_background, daemon=True).start()
 
     def _cleanup(*_):
         _hotkey_mgr.stop()
