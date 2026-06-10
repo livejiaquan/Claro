@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.sock
+/tmp/voicerec_debug/
+/tmp/mic_indicator.sock
+/tmp/mic_indicator_result
+debug_keys.py
