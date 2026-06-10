@@ -147,13 +147,25 @@ def _event_dispatcher():
             _on_esc()
 
 
+def _start_processing():
+    """每個處理 session 配發自己的取消旗標。
+
+    舊 session 的轉錄執行緒持有自己的 Event；新 session 換新的一顆，
+    不會把前一段還沒檢查到的 Esc 取消洗掉。
+    """
+    global _cancel_processing
+    cancel = threading.Event()
+    _cancel_processing = cancel
+    threading.Thread(target=_do_stop_and_process, args=(cancel,), daemon=True).start()
+
+
 def _on_hotkey_down(ts: float):
     with _lock:
         action = _sm.hotkey_down(ts)
     if action is Action.START_RECORDING:
         _do_start_recording()
     elif action is Action.STOP_AND_PROCESS:
-        threading.Thread(target=_do_stop_and_process, daemon=True).start()
+        _start_processing()
 
 
 def _on_hotkey_up(ts: float):
@@ -163,7 +175,7 @@ def _on_hotkey_up(ts: float):
         _indicator_send("handsfree")
         print("🔁 Hands-free mode (press hotkey again to stop)", flush=True)
     elif action is Action.STOP_AND_PROCESS:
-        threading.Thread(target=_do_stop_and_process, daemon=True).start()
+        _start_processing()
 
 
 def _on_esc():
@@ -282,7 +294,6 @@ def _do_start_recording():
     _audio_chunks = []
     _audio_queue = queue.Queue()
 
-    _cancel_processing.clear()  # 每段聽寫開始時重置，避免清掉剛按下的 Esc
     threading.Thread(target=_record_worker, daemon=True).start()
     threading.Thread(target=_audio_level_poller, daemon=True).start()
     print("🎤 Recording... (release to paste, Esc to cancel)", flush=True)
@@ -354,7 +365,7 @@ def _transcribe(audio: np.ndarray) -> str:
     return _clean_transcript(result)
 
 
-def _do_stop_and_process():
+def _do_stop_and_process(cancel: threading.Event):
     try:
         audio = _collect_audio()
         if audio is None:
@@ -381,7 +392,7 @@ def _do_stop_and_process():
             print("  ✨ Refining with LLM...", flush=True)
             text = _llm_refine(text, context=_get_window_context())  # 失敗時內部回傳原文
 
-        if _cancel_processing.is_set():
+        if cancel.is_set():
             history.append_entry(raw=raw, text=text, duration_s=dur, status="cancelled")
             return
 
