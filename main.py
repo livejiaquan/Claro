@@ -10,7 +10,6 @@ import wave
 
 import mlx_whisper
 import numpy as np
-import pyautogui
 import Quartz
 import sounddevice as sd
 
@@ -37,6 +36,7 @@ _rms_smoothed = 0.0
 # ─── Hotkey (CGEventTap) ─────────────────────────────────────────────────────
 
 VK_C = 8
+VK_V = 9
 HOTKEY_FLAGS = Quartz.kCGEventFlagMaskAlternate | Quartz.kCGEventFlagMaskShift
 
 
@@ -326,22 +326,35 @@ def _do_stop_and_transcribe():
     _indicator_send("done")
     choice = _wait_menu_choice(timeout=15)
     if choice == "confirm":
-        _type_text_at_mouse(text)
+        _paste_text(text)
     else:
         print("  Cancelled", flush=True)
     _indicator_send("hide")
 
 
-def _type_text_at_mouse(text: str):
+def _paste_text(text: str):
+    """備份剪貼簿 → 寫入文字 → CGEvent 送 Cmd+V → 還原剪貼簿。
+
+    游標在哪個輸入框，字就貼在哪。不點滑鼠、不搶焦點。
+    還原只保留純文字內容（夠用且簡單）。
+    """
     try:
-        x, y = pyautogui.position()
-        pyautogui.click(x, y)
+        old = subprocess.run(["pbpaste"], capture_output=True).stdout
+        subprocess.run(["pbcopy"], input=text.encode("utf-8"))
         time.sleep(0.05)
-        proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-        proc.communicate(text.encode("utf-8"))
-        pyautogui.hotkey("command", "v")
+
+        src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+        down = Quartz.CGEventCreateKeyboardEvent(src, VK_V, True)
+        up = Quartz.CGEventCreateKeyboardEvent(src, VK_V, False)
+        Quartz.CGEventSetFlags(down, Quartz.kCGEventFlagMaskCommand)
+        Quartz.CGEventSetFlags(up, Quartz.kCGEventFlagMaskCommand)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+
+        time.sleep(0.3)
+        subprocess.run(["pbcopy"], input=old)
     except Exception as e:
-        print(f"Failed to type text: {e}", flush=True)
+        print(f"Paste failed: {e}", flush=True)
 
 
 def _wait_menu_choice(timeout: float = 15) -> str:
