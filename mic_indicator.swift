@@ -1,306 +1,178 @@
 import Cocoa
 import AVFoundation
 
-let RESULT_PATH = "/tmp/mic_indicator_result"
 let SOUND_START = "/System/Library/Sounds/Ping.aiff"
-let SOUND_STOP = "/System/Library/Sounds/Pop.aiff"
-let SOUND_DONE = "/System/Library/Sounds/Submarine.aiff"
+let SOUND_SUCCESS = "/System/Library/Sounds/Pop.aiff"
 let SOUND_ERROR = "/System/Library/Sounds/Basso.aiff"
 
-private let BAR_W: CGFloat = 260
-private let BAR_H: CGFloat = 48
-private let BUBBLE_W: CGFloat = 32
-private let BUBBLE_H: CGFloat = 32
-private let NUM_BARS = 7
+private let PILL_W: CGFloat = 150
+private let PILL_H: CGFloat = 38
+private let PILL_CORNER: CGFloat = 19
+private let NUM_BARS = 9
+private let BAR_W: CGFloat = 3
+private let BAR_GAP: CGFloat = 5
+private let DOT_SIZE: CGFloat = 6
 
-// ─── Helpers ───────────────────────────────────────────────────────────────
+private var soundPlayers: [AVAudioPlayer] = []
+
+// Helpers
 
 private func playSound(_ path: String) {
-    guard let url = URL(string: "file://\(path)") else { return }
+    let url = URL(fileURLWithPath: path)
     guard let player = try? AVAudioPlayer(contentsOf: url) else { return }
-    player.volume = 0.6
+    player.volume = 0.35
     player.play()
+    soundPlayers.removeAll { !$0.isPlaying }
+    soundPlayers.append(player)
 }
 
-private func makeBubble(_ icon: String, color: NSColor, action: Selector?, target: AnyObject?) -> NSButton {
-    let b = NSButton(frame: NSRect(x: 0, y: 0, width: BUBBLE_W, height: BUBBLE_H))
-    b.title = icon
-    b.bezelStyle = .rounded
-    b.isBordered = false
-    b.wantsLayer = true
-    b.layer?.cornerRadius = BUBBLE_W / 2
-    b.layer?.backgroundColor = color.cgColor
-    b.font = NSFont.systemFont(ofSize: 16, weight: .semibold)
-    b.contentTintColor = .white
-    b.target = target
-    b.action = action
-    return b
+private enum IndicatorState {
+    case hidden
+    case recording
+    case handsfree
+    case processing
+    case success
+    case cancelled
+    case error
 }
 
-// ─── Indicator ─────────────────────────────────────────────────────────────
+// Indicator
 
-class IndicatorWindow {
+class IndicatorWindow: NSObject {
     private var panel: NSPanel?
-    private var mode = "idle"
+    private var state: IndicatorState = .hidden
 
-    // subviews
-    private var cancelBtn: NSButton?
-    private var confirmBtn: NSButton?
-    private var micIcon: NSImageView?
+    private var rootView: NSView?
+    private var contentView: NSView?
+    private var backgroundLayer: CALayer?
     private var barLayers: [CALayer] = []
-    private var spinner: NSProgressIndicator?
-    private var doneIcon: NSImageView?
+    private var processingDots: [CALayer] = []
+    private var handsfreeDot: CALayer?
 
-    private var breathing = false
-    private var scaledUp = true
-    private var currentScale: CGFloat = 1
+    private var frameTimer: Timer?
+    private var autoHideItem: DispatchWorkItem?
+    private var visibilityToken = 0
 
-    // ── public api ──
+    private var targetLevel: CGFloat = 0
+    private var displayLevel: CGFloat = 0
 
     func showRecording() {
-        mode = "recording"; currentLevel = 0
-        DispatchQueue.main.async { self._buildRecordingUI() }
+        DispatchQueue.main.async {
+            self.beginState(.recording)
+            self.targetLevel = 0
+            self.displayLevel = 0
+            self.buildWaveform(handsfree: false)
+            self.showPanel()
+            self.startFrameTimer()
+            playSound(SOUND_START)
+        }
     }
 
-    func showTranscribing() {
-        mode = "transcribing"
-        DispatchQueue.main.async { self._buildTranscribingUI() }
-    }
-
-    func showDone() {
-        mode = "done"
-        DispatchQueue.main.async { self._buildDoneUI() }
+    func showHandsfree() {
+        DispatchQueue.main.async {
+            self.beginState(.handsfree)
+            self.buildWaveform(handsfree: true)
+            self.showPanel()
+            self.startFrameTimer()
+        }
     }
 
     func updateLevel(_ level: Float) {
-        guard mode == "recording", let p = panel, p.isVisible else { return }
-        currentLevel = level
-        DispatchQueue.main.async { self._animateBars() }
+        DispatchQueue.main.async {
+            self.targetLevel = min(1.0, CGFloat(level) * 9.0)
+        }
+    }
+
+    func showProcessing() {
+        DispatchQueue.main.async {
+            self.beginState(.processing)
+            self.buildProcessing()
+            self.showPanel()
+            self.startFrameTimer()
+        }
+    }
+
+    func showSuccess() {
+        DispatchQueue.main.async {
+            self.beginState(.success)
+            self.stopFrameTimer()
+            self.buildIcon(systemName: "checkmark.circle", background: Self.defaultBackground)
+            self.showPanel()
+            playSound(SOUND_SUCCESS)
+            self.scheduleHide(after: 0.45, expected: .success)
+        }
+    }
+
+    func showCancelled() {
+        DispatchQueue.main.async {
+            self.beginState(.cancelled)
+            self.stopFrameTimer()
+            if self.panel == nil || self.panel?.isVisible != true {
+                self.buildEmpty(background: Self.defaultBackground)
+            } else {
+                self.backgroundLayer?.backgroundColor = Self.defaultBackground
+            }
+            self.showPanel()
+            playSound(SOUND_ERROR)
+            self.runCancelShake()
+        }
+    }
+
+    func showError() {
+        DispatchQueue.main.async {
+            self.beginState(.error)
+            self.stopFrameTimer()
+            self.buildIcon(systemName: "exclamationmark.circle", background: Self.errorBackground)
+            self.showPanel()
+            playSound(SOUND_ERROR)
+            self.scheduleHide(after: 0.6, expected: .error)
+        }
     }
 
     func hide() {
-        mode = "idle"
-        DispatchQueue.main.async { self._doHide() }
-    }
-
-    // ── recording ui ──
-
-    private var currentLevel: Float = 0
-
-    private func _buildRecordingUI() {
-        _ensurePanel()
-        guard let p = panel else { return }
-        breathing = false; _clear()
-
-        p.setContentSize(NSSize(width: BAR_W, height: BAR_H))
-
-        let root = _makeRoot()
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: BAR_W, height: BAR_H))
-
-        // cancel bubble
-        let cancel = makeBubble("✕", color: NSColor(red: 0.8, green: 0.2, blue: 0.2, alpha: 0.9), action: #selector(_onCancel), target: self)
-        cancelBtn = cancel
-
-        // waveform + mic
-        let center = NSView(frame: NSRect(x: 0, y: 0, width: 140, height: BAR_H))
-        for i in 0 ..< NUM_BARS {
-            let l = CALayer()
-            l.backgroundColor = NSColor.white.withAlphaComponent(0.7).cgColor
-            l.cornerRadius = 2
-            let bw: CGFloat = 4
-            let spacing: CGFloat = 6
-            let totalW = CGFloat(NUM_BARS) * bw + CGFloat(NUM_BARS - 1) * spacing
-            let ox = (140 - totalW) / 2 + CGFloat(i) * (bw + spacing)
-            l.frame = NSRect(x: ox, y: (BAR_H - 20) / 2, width: bw, height: 20)
-            center.layer?.addSublayer(l)
-            barLayers.append(l)
-        }
-        // mic icon on top of bars
-        let mic = NSImageView(frame: NSRect(x: 0, y: 0, width: BAR_H, height: BAR_H))
-        if let img = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil) {
-            let cfg = NSImage.SymbolConfiguration(pointSize: 20, weight: .semibold)
-            mic.image = img.withSymbolConfiguration(cfg)
-        }
-        mic.contentTintColor = .white
-        mic.imageScaling = .scaleProportionallyUpOrDown
-        micIcon = mic
-        center.addSubview(mic)
-
-        // confirm bubble (disabled during recording)
-        let confirm = makeBubble("✓", color: NSColor(red: 0.2, green: 0.45, blue: 0.95, alpha: 0.4), action: #selector(_onConfirm), target: self)
-        confirm.isEnabled = false
-        confirmBtn = confirm
-
-        // layout
-        let sv = NSStackView(frame: NSRect(x: 0, y: 0, width: BAR_W, height: BAR_H))
-        sv.orientation = .horizontal
-        sv.spacing = 8
-        sv.alignment = .centerY
-        sv.distribution = .fill
-        sv.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
-
-        sv.addArrangedSubview(cancel)
-        let spacerL = NSView(frame: NSRect(x: 0, y: 0, width: 0, height: 1))
-        spacerL.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        sv.addArrangedSubview(spacerL)
-        sv.addArrangedSubview(center)
-        let spacerR = NSView(frame: NSRect(x: 0, y: 0, width: 0, height: 1))
-        spacerR.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        sv.addArrangedSubview(spacerR)
-        sv.addArrangedSubview(confirm)
-
-        content.addSubview(sv)
-        root.addSubview(content)
-        p.contentView = root
-
-        _positionBottom()
-        _fadeIn()
-        playSound(SOUND_START)
-        _startBreathing()
-        _animateBars()
-    }
-
-    // ── transcribing ui ──
-
-    private func _buildTranscribingUI() {
-        _ensurePanel()
-        guard let p = panel else { return }
-        breathing = false; _clear()
-
-        p.setContentSize(NSSize(width: BAR_W, height: BAR_H))
-
-        let root = _makeRoot()
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: BAR_W, height: BAR_H))
-
-        // cancel disabled
-        let cancel = makeBubble("✕", color: NSColor(red: 0.5, green: 0.5, blue: 0.5, alpha: 0.5), action: nil, target: nil)
-        cancelBtn = cancel
-
-        // spinner
-        let sp = NSProgressIndicator(frame: NSRect(x: 0, y: 0, width: 24, height: 24))
-        sp.style = .spinning
-        sp.controlSize = .regular
-        sp.startAnimation(nil)
-        spinner = sp
-
-        // confirm disabled
-        let confirm = makeBubble("✓", color: NSColor(red: 0.2, green: 0.45, blue: 0.95, alpha: 0.4), action: nil, target: nil)
-        confirmBtn = confirm
-
-        // layout
-        let sv = NSStackView(frame: NSRect(x: 0, y: 0, width: BAR_W, height: BAR_H))
-        sv.orientation = .horizontal
-        sv.spacing = 8
-        sv.alignment = .centerY
-        sv.distribution = .fill
-        sv.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
-
-        sv.addArrangedSubview(cancel)
-        let spacerL = NSView(frame: NSRect(x: 0, y: 0, width: 0, height: 1))
-        spacerL.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        sv.addArrangedSubview(spacerL)
-        sv.addArrangedSubview(sp)
-        let spacerR = NSView(frame: NSRect(x: 0, y: 0, width: 0, height: 1))
-        spacerR.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        sv.addArrangedSubview(spacerR)
-        sv.addArrangedSubview(confirm)
-
-        content.addSubview(sv)
-        root.addSubview(content)
-        p.contentView = root
-
-        _positionBottom()
-        p.alphaValue = 0
-        p.setIsVisible(true)
-        p.orderFront(nil)
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15
-            p.animator().alphaValue = 1
+        DispatchQueue.main.async {
+            self.transitionToHidden()
         }
     }
 
-    // ── done ui ──
+    private static var defaultBackground: CGColor {
+        CGColor(red: 0, green: 0, blue: 0, alpha: 0.75)
+    }
 
-    private func _buildDoneUI() {
-        _ensurePanel()
-        guard let p = panel else { return }
-        breathing = false; _clear()
+    private static var errorBackground: CGColor {
+        CGColor(red: 0.45, green: 0.08, blue: 0.08, alpha: 0.82)
+    }
 
-        p.setContentSize(NSSize(width: BAR_W, height: BAR_H))
+    private func beginState(_ newState: IndicatorState) {
+        autoHideItem?.cancel()
+        autoHideItem = nil
+        visibilityToken += 1
+        state = newState
+    }
 
-        let root = _makeRoot()
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: BAR_W, height: BAR_H))
+    private func transitionToHidden() {
+        autoHideItem?.cancel()
+        autoHideItem = nil
+        visibilityToken += 1
+        state = .hidden
+        stopFrameTimer()
+        animateHide(token: visibilityToken)
+    }
 
-        // cancel active
-        let cancel = makeBubble("✕", color: NSColor(red: 0.8, green: 0.2, blue: 0.2, alpha: 0.9), action: #selector(_onCancel), target: self)
-        cancelBtn = cancel
-
-        // checkmark
-        let check = NSImageView(frame: NSRect(x: 0, y: 0, width: 32, height: 32))
-        if let img = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: nil) {
-            let cfg = NSImage.SymbolConfiguration(pointSize: 28, weight: .semibold)
-            check.image = img.withSymbolConfiguration(cfg)
+    private func scheduleHide(after delay: TimeInterval, expected: IndicatorState) {
+        autoHideItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self, self.state == expected else { return }
+            self.transitionToHidden()
         }
-        check.contentTintColor = NSColor(red: 0.3, green: 0.8, blue: 0.3, alpha: 1)
-        check.imageScaling = .scaleProportionallyUpOrDown
-        doneIcon = check
-
-        // confirm active
-        let confirm = makeBubble("✓", color: NSColor(red: 0.2, green: 0.45, blue: 0.95, alpha: 0.9), action: #selector(_onConfirm), target: self)
-        confirmBtn = confirm
-
-        // layout
-        let sv = NSStackView(frame: NSRect(x: 0, y: 0, width: BAR_W, height: BAR_H))
-        sv.orientation = .horizontal
-        sv.spacing = 8
-        sv.alignment = .centerY
-        sv.distribution = .fill
-        sv.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
-
-        sv.addArrangedSubview(cancel)
-        let spacerL = NSView(frame: NSRect(x: 0, y: 0, width: 0, height: 1))
-        spacerL.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        sv.addArrangedSubview(spacerL)
-        sv.addArrangedSubview(check)
-        let spacerR = NSView(frame: NSRect(x: 0, y: 0, width: 0, height: 1))
-        spacerR.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        sv.addArrangedSubview(spacerR)
-        sv.addArrangedSubview(confirm)
-
-        content.addSubview(sv)
-        root.addSubview(content)
-        p.contentView = root
-
-        _positionBottom()
-        p.alphaValue = 0
-        p.setIsVisible(true)
-        p.orderFront(nil)
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15
-            p.animator().alphaValue = 1
-        }
-        playSound(SOUND_DONE)
+        autoHideItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
-    // ── actions ──
-
-    @objc private func _onCancel() {
-        try? "cancel".write(toFile: RESULT_PATH, atomically: true, encoding: .utf8)
-        playSound(SOUND_ERROR)
-        _doHide()
-    }
-
-    @objc private func _onConfirm() {
-        try? "confirm".write(toFile: RESULT_PATH, atomically: true, encoding: .utf8)
-        _doHide()
-    }
-
-    // ── panel management ──
-
-    private func _ensurePanel() {
+    private func ensurePanel() {
         guard panel == nil else { return }
         let p = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: BAR_W, height: BAR_H),
+            contentRect: NSRect(x: 0, y: 0, width: PILL_W, height: PILL_H),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -309,126 +181,286 @@ class IndicatorWindow {
         p.backgroundColor = .clear
         p.hasShadow = false
         p.level = .floating
-        p.ignoresMouseEvents = false
+        p.ignoresMouseEvents = true
         p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .transient]
         p.isFloatingPanel = true
         p.hidesOnDeactivate = false
         p.worksWhenModal = true
-        self.panel = p
+        panel = p
     }
 
-    private func _makeRoot() -> NSView {
-        let r = NSView(frame: NSRect(x: 0, y: 0, width: BAR_W, height: BAR_H))
-        r.wantsLayer = true
+    private func prepareRoot(background: CGColor) {
+        ensurePanel()
+        guard let p = panel else { return }
 
-        let bg = CALayer()
-        bg.frame = r.bounds
-        bg.cornerRadius = BAR_H / 2
-        bg.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 0.65)
-        bg.shadowColor = CGColor(red: 0, green: 0, blue: 0, alpha: 0.3)
-        bg.shadowOpacity = 1
-        bg.shadowOffset = .zero
-        bg.shadowRadius = 10
-        r.layer?.addSublayer(bg)
+        p.setContentSize(NSSize(width: PILL_W, height: PILL_H))
 
-        return r
-    }
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: PILL_W, height: PILL_H))
+        root.wantsLayer = true
+        if let layer = root.layer {
+            layer.cornerRadius = PILL_CORNER
+            layer.backgroundColor = background
+            layer.borderWidth = 1
+            layer.borderColor = CGColor(red: 1, green: 1, blue: 1, alpha: 0.12)
+            layer.shadowColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+            layer.shadowOpacity = 0.3
+            layer.shadowOffset = .zero
+            layer.shadowRadius = 10
+            layer.shadowPath = CGPath(
+                roundedRect: root.bounds,
+                cornerWidth: PILL_CORNER,
+                cornerHeight: PILL_CORNER,
+                transform: nil
+            )
+            layer.masksToBounds = false
+        }
 
-    private func _clear() {
-        micIcon = nil; spinner = nil; doneIcon = nil
+        let content = NSView(frame: root.bounds)
+        content.wantsLayer = true
+        root.addSubview(content)
+
+        p.contentView = root
+        rootView = root
+        contentView = content
+        backgroundLayer = root.layer
         barLayers.removeAll()
-        panel?.contentView = NSView(frame: .zero)
+        processingDots.removeAll()
+        handsfreeDot = nil
     }
 
-    private func _positionBottom() {
-        guard let screen = NSScreen.main?.visibleFrame else { return }
-        let x = screen.minX + (screen.width - BAR_W) / 2
-        let y = screen.minY + 12
-        panel?.setFrameOrigin(NSPoint(x: x, y: y))
+    private func buildEmpty(background: CGColor) {
+        prepareRoot(background: background)
     }
 
-    private func _fadeIn() {
-        guard let p = panel else { return }
-        p.alphaValue = 0
-        p.setIsVisible(true)
-        p.orderFront(nil)
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.2
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            p.animator().alphaValue = 1
+    private func buildWaveform(handsfree: Bool) {
+        prepareRoot(background: Self.defaultBackground)
+        guard let contentLayer = contentView?.layer else { return }
+
+        let totalW = CGFloat(NUM_BARS) * BAR_W + CGFloat(NUM_BARS - 1) * BAR_GAP
+        let originX = (PILL_W - totalW) / 2
+
+        for i in 0 ..< NUM_BARS {
+            let layer = CALayer()
+            layer.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 0.9)
+            layer.cornerRadius = 1.5
+            let x = originX + CGFloat(i) * (BAR_W + BAR_GAP)
+            layer.frame = NSRect(x: x, y: (PILL_H - 3) / 2, width: BAR_W, height: 3)
+            contentLayer.addSublayer(layer)
+            barLayers.append(layer)
+        }
+
+        if handsfree {
+            let dot = CALayer()
+            dot.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+            dot.cornerRadius = DOT_SIZE / 2
+            dot.frame = NSRect(x: 14 - DOT_SIZE / 2, y: (PILL_H - DOT_SIZE) / 2, width: DOT_SIZE, height: DOT_SIZE)
+            contentLayer.addSublayer(dot)
+            handsfreeDot = dot
         }
     }
 
-    private func _doHide() {
-        breathing = false
+    private func buildProcessing() {
+        prepareRoot(background: Self.defaultBackground)
+        guard let contentLayer = contentView?.layer else { return }
+
+        let gap: CGFloat = 10
+        let totalW = 3 * DOT_SIZE + 2 * gap
+        let originX = (PILL_W - totalW) / 2
+        for i in 0 ..< 3 {
+            let dot = CALayer()
+            dot.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+            dot.cornerRadius = DOT_SIZE / 2
+            dot.opacity = 0.35
+            dot.frame = NSRect(
+                x: originX + CGFloat(i) * (DOT_SIZE + gap),
+                y: (PILL_H - DOT_SIZE) / 2,
+                width: DOT_SIZE,
+                height: DOT_SIZE
+            )
+            contentLayer.addSublayer(dot)
+            processingDots.append(dot)
+        }
+    }
+
+    private func buildIcon(systemName: String, background: CGColor) {
+        prepareRoot(background: background)
+        guard let content = contentView else { return }
+
+        let iconSize: CGFloat = 24
+        let imageView = NSImageView(frame: NSRect(
+            x: (PILL_W - iconSize) / 2,
+            y: (PILL_H - iconSize) / 2,
+            width: iconSize,
+            height: iconSize
+        ))
+        if let image = NSImage(systemSymbolName: systemName, accessibilityDescription: nil) {
+            let config = NSImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
+            imageView.image = image.withSymbolConfiguration(config)
+        }
+        imageView.contentTintColor = .white
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        content.addSubview(imageView)
+    }
+
+    private func positionBottom() {
+        guard let p = panel, let frame = NSScreen.main?.visibleFrame else { return }
+        let x = frame.minX + (frame.width - PILL_W) / 2
+        let y = frame.minY + 16
+        p.setFrame(NSRect(x: x, y: y, width: PILL_W, height: PILL_H), display: true)
+    }
+
+    private func showPanel() {
+        ensurePanel()
         guard let p = panel else { return }
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+
+        positionBottom()
+        rootView?.layer?.removeAllAnimations()
+        contentView?.layer?.removeAllAnimations()
+
+        let shouldAnimate = !p.isVisible || p.alphaValue < 0.99
+        p.orderFrontRegardless()
+
+        if shouldAnimate {
+            p.alphaValue = 0
+            rootView?.layer?.transform = CATransform3DMakeTranslation(0, -8, 0)
+            p.setIsVisible(true)
+
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.25
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                p.animator().alphaValue = 1
+            }, completionHandler: nil)
+
+            if let layer = rootView?.layer {
+                let spring = CASpringAnimation(keyPath: "transform.translation.y")
+                spring.fromValue = -8
+                spring.toValue = 0
+                spring.mass = 1
+                spring.stiffness = 220
+                spring.damping = 22
+                spring.initialVelocity = 0
+                spring.duration = 0.25
+                layer.transform = CATransform3DIdentity
+                layer.add(spring, forKey: "entranceY")
+            }
+        } else {
+            p.alphaValue = 1
+            p.setIsVisible(true)
+            rootView?.layer?.transform = CATransform3DIdentity
+        }
+    }
+
+    private func animateHide(token: Int) {
+        guard let p = panel, p.isVisible else {
+            clearVisualReferences()
+            return
+        }
+
+        if let layer = rootView?.layer {
+            layer.removeAllAnimations()
+            let sink = CABasicAnimation(keyPath: "transform.translation.y")
+            sink.fromValue = 0
+            sink.toValue = -8
+            sink.duration = 0.18
+            sink.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            layer.transform = CATransform3DMakeTranslation(0, -8, 0)
+            layer.add(sink, forKey: "exitY")
+        }
+
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.18
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
             p.animator().alphaValue = 0
-        } completionHandler: {
+        }, completionHandler: { [weak self] in
+            guard let self = self, self.visibilityToken == token else { return }
             p.setIsVisible(false)
+            p.alphaValue = 1
             p.contentView = NSView(frame: .zero)
+            self.clearVisualReferences()
+        })
+    }
+
+    private func clearVisualReferences() {
+        rootView = nil
+        contentView = nil
+        backgroundLayer = nil
+        barLayers.removeAll()
+        processingDots.removeAll()
+        handsfreeDot = nil
+    }
+
+    private func runCancelShake() {
+        if let layer = rootView?.layer {
+            layer.removeAnimation(forKey: "cancelShake")
+            let shake = CAKeyframeAnimation(keyPath: "transform.translation.x")
+            shake.values = [0, -6, 5, -3, 2, 0]
+            shake.keyTimes = [0, 0.2, 0.4, 0.6, 0.8, 1]
+            shake.duration = 0.22
+            shake.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer.add(shake, forKey: "cancelShake")
+        }
+        scheduleHide(after: 0.22, expected: .cancelled)
+    }
+
+    private func startFrameTimer() {
+        frameTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0 / 120.0, target: self, selector: #selector(frameTick), userInfo: nil, repeats: true)
+        RunLoop.main.add(timer, forMode: .common)
+        frameTimer = timer
+    }
+
+    private func stopFrameTimer() {
+        frameTimer?.invalidate()
+        frameTimer = nil
+    }
+
+    @objc private func frameTick() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        switch state {
+        case .recording, .handsfree:
+            updateWaveformFrame()
+        case .processing:
+            updateProcessingFrame()
+        default:
+            break
+        }
+        CATransaction.commit()
+    }
+
+    private func updateWaveformFrame() {
+        let speed: CGFloat = (targetLevel > displayLevel) ? 0.45 : 0.10
+        displayLevel += (targetLevel - displayLevel) * speed
+
+        let t = CACurrentMediaTime()
+        let totalW = CGFloat(NUM_BARS) * BAR_W + CGFloat(NUM_BARS - 1) * BAR_GAP
+        let originX = (PILL_W - totalW) / 2
+
+        for i in 0 ..< NUM_BARS {
+            let weight = 1.0 - CGFloat(abs(i - 4)) / 4.0 * 0.55
+            let phase = 0.75 + 0.25 * CGFloat(sin(t * 5.0 + Double(i) * 0.9))
+            let idle = 0.8 * CGFloat(sin(t * 2.0 + Double(i)))
+            let h = max(3.0, 3.0 + idle + 23.0 * displayLevel * weight * phase)
+            let x = originX + CGFloat(i) * (BAR_W + BAR_GAP)
+            barLayers[i].frame = NSRect(x: x, y: (PILL_H - h) / 2.0, width: BAR_W, height: h)
+        }
+
+        if let dot = handsfreeDot {
+            let alpha = 0.4 + 0.6 * (0.5 + 0.5 * CGFloat(sin(t * 2.4)))
+            dot.opacity = Float(alpha)
         }
     }
 
-    // ── waveform bars ──
-
-    private func _animateBars() {
-        let baseH: CGFloat = 4
-        let maxH: CGFloat = 36
-        let level = min(1, currentLevel * 8)
-
-        for (i, layer) in barLayers.enumerated() {
-            let phase = sin(CACurrentMediaTime() * 4 + Double(i) * 0.8)
-            let variation = CGFloat(phase) * 0.3
-            let h = baseH + (maxH - baseH) * min(1, CGFloat(level) + variation + 0.1)
-            var f = layer.frame
-            f.size.height = max(baseH, min(maxH, h))
-            f.origin.y = (BAR_H - f.size.height) / 2
-            layer.frame = f
-        }
-    }
-
-    // ── breathing ──
-
-    private func _startBreathing() {
-        guard let p = panel, p.isVisible, !breathing else { return }
-        currentScale = 1; scaledUp = true; breathing = true
-        _breath()
-    }
-
-    private func _breath() {
-        guard breathing, let p = panel, p.isVisible else { breathing = false; return }
-        let targetScale: CGFloat = scaledUp ? 0.92 : 1.0
-        let targetOpacity: CGFloat = scaledUp ? 0.7 : 1.0
-        scaledUp.toggle()
-        let dur = 0.8
-
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = dur
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            p.animator().alphaValue = targetOpacity
-        }
-
-        if let layer = p.contentView?.layer {
-            let anim = CABasicAnimation(keyPath: "transform.scale")
-            anim.fromValue = currentScale
-            anim.toValue = targetScale
-            anim.duration = dur
-            anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            layer.transform = CATransform3DMakeScale(targetScale, targetScale, 1)
-            layer.add(anim, forKey: "breathingScale")
-            currentScale = targetScale
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + dur + 0.05) { [weak self] in
-            self?._breath()
+    private func updateProcessingFrame() {
+        let t = CACurrentMediaTime()
+        for (i, dot) in processingDots.enumerated() {
+            let wave = max(0.0, sin(t * 3.0 - Double(i) * 0.55))
+            dot.opacity = Float(0.35 + 0.65 * wave)
         }
     }
 }
 
-// ─── Socket Server ─────────────────────────────────────────────────────────
+// Socket Server
 
 class SocketServer {
     private let path: String
@@ -482,19 +514,25 @@ class SocketServer {
     }
 
     private func handle(_ cmd: String, indicator: IndicatorWindow) {
-        let parts = cmd.split(separator: " ", maxSplits: 2).map(String.init)
+        let parts = cmd.split(separator: " ", maxSplits: 1).map(String.init)
         guard let action = parts.first else { return }
         switch action {
         case "recording":
             indicator.showRecording()
+        case "handsfree":
+            indicator.showHandsfree()
         case "level":
             if parts.count >= 2, let v = Float(parts[1]) {
                 indicator.updateLevel(v)
             }
-        case "transcribing":
-            indicator.showTranscribing()
-        case "done":
-            indicator.showDone()
+        case "processing":
+            indicator.showProcessing()
+        case "success":
+            indicator.showSuccess()
+        case "error":
+            indicator.showError()
+        case "cancel":
+            indicator.showCancelled()
         case "hide":
             indicator.hide()
         case "quit":
@@ -510,7 +548,7 @@ class SocketServer {
     }
 }
 
-// ─── Entry ─────────────────────────────────────────────────────────────────
+// Entry
 
 let indicator = IndicatorWindow()
 let server = SocketServer(path: "/tmp/mic_indicator.sock")
