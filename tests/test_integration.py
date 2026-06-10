@@ -73,7 +73,7 @@ def test_hotkey_handlers_drive_recording_handsfree_processing_and_esc(monkeypatc
     calls = []
 
     monkeypatch.setattr(main, "_do_start_recording", lambda: calls.append("start"))
-    monkeypatch.setattr(main, "_do_stop_and_process", lambda cancel: calls.append("process"))
+    monkeypatch.setattr(main, "_do_stop_and_process", lambda *a: calls.append("process"))
     monkeypatch.setattr(main, "_do_cancel_recording", lambda: calls.append("cancel_recording"))
     monkeypatch.setattr(main, "_indicator_send", lambda command: calls.append(command))
 
@@ -120,8 +120,9 @@ def test_stop_and_process_pastes_success_and_records_history(monkeypatch):
     monkeypatch.setattr(main, "_paste_text", lambda text: pasted.append(text))
     monkeypatch.setattr(main.history, "append_entry", lambda **entry: entries.append(entry))
     monkeypatch.setattr(main, "_llm_available", False)
+    main._models_ready.set()
 
-    main._do_stop_and_process(threading.Event())
+    main._do_stop_and_process(threading.Event(), main._sm.session)
 
     assert sent == ["processing", "success"]
     assert pasted == ["GPT 測試"]

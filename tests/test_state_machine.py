@@ -60,8 +60,41 @@ def test_processing_finished_returns_to_idle():
     sm = make()
     sm.hotkey_down(10.0)
     sm.hotkey_up(11.0)
-    sm.processing_finished()
+    sm.processing_finished(sm.session)
     assert sm.state is State.IDLE
+
+
+def test_processing_finished_ignores_stale_session_id():
+    sm = make()
+    sm.hotkey_down(10.0)
+    old_session = sm.session
+    sm.hotkey_up(11.0)
+    assert sm.esc() is Action.CANCEL_PROCESSING
+
+    sm.hotkey_down(20.0)
+    current_session = sm.session
+    sm.hotkey_up(21.0)
+    assert sm.state is State.PROCESSING
+    sm.processing_finished(old_session)
+    assert sm.state is State.PROCESSING
+    sm.processing_finished(current_session)
+    assert sm.state is State.IDLE
+
+
+def test_force_stop_moves_recording_to_processing_only():
+    sm = make()
+    assert sm.force_stop() is Action.NONE
+    assert sm.state is State.IDLE
+
+    sm.hotkey_down(10.0)
+    assert sm.force_stop() is Action.STOP_AND_PROCESS
+    assert sm.state is State.PROCESSING
+
+    sm = make()
+    sm.hotkey_down(20.0)
+    sm.hotkey_up(20.1)
+    assert sm.force_stop() is Action.STOP_AND_PROCESS
+    assert sm.state is State.PROCESSING
 
 
 def test_ignored_events():

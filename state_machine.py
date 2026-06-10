@@ -25,9 +25,11 @@ class DictationStateMachine:
     def __init__(self):
         self.state = State.IDLE
         self._down_ts = 0.0
+        self.session = 0
 
     def hotkey_down(self, ts: float) -> Action:
         if self.state is State.IDLE:
+            self.session += 1
             self.state = State.HOLD
             self._down_ts = ts
             return Action.START_RECORDING
@@ -54,6 +56,12 @@ class DictationStateMachine:
             return Action.CANCEL_PROCESSING
         return Action.NONE
 
-    def processing_finished(self):
-        if self.state is State.PROCESSING:
+    def force_stop(self) -> Action:
+        if self.state in (State.HOLD, State.HANDSFREE):
+            self.state = State.PROCESSING
+            return Action.STOP_AND_PROCESS
+        return Action.NONE
+
+    def processing_finished(self, session: int):
+        if self.state is State.PROCESSING and self.session == session:
             self.state = State.IDLE
