@@ -3,5 +3,7 @@ mlx-lm>=0.20.0
 sounddevice>=0.4.6
 numpy>=1.24.0
 pyobjc-framework-Quartz>=10.0
+pyobjc-framework-Cocoa>=10.0
+pyobjc-framework-ApplicationServices>=10.0
 opencc>=1.1
 pytest>=8.0
