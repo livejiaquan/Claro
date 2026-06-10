@@ -8,17 +8,18 @@ import threading
 import time
 import wave
 
+import history
 import mlx_whisper
 import numpy as np
 import Quartz
 import sounddevice as sd
+from state_machine import Action, DictationStateMachine, State
 
 DEBUG_AUDIO_DIR = "/tmp/voicerec_debug"
-MENU_RESULT = "/tmp/mic_indicator_result"
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-MODEL_SIZE = "large-v3-mlx"
+MODEL_SIZE = "large-v3-turbo"
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 1024
 
@@ -37,14 +38,17 @@ _rms_smoothed = 0.0
 
 VK_C = 8
 VK_V = 9
+VK_ESC = 53
 HOTKEY_FLAGS = Quartz.kCGEventFlagMaskAlternate | Quartz.kCGEventFlagMaskShift
+
+_sm = DictationStateMachine()
 
 
 class HotkeyManager:
     def __init__(self):
         self._tap = None
         self._source = None
-        self._hotkey_down = False
+        self._consumed_down = False
 
     def _callback(self, proxy, event_type, event, refcon):
         if event_type not in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp):
@@ -52,24 +56,33 @@ class HotkeyManager:
 
         key_code = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
         flags = Quartz.CGEventGetFlags(event)
+        is_repeat = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventAutorepeat)
+        ts = time.monotonic()
 
-        is_target = (
-            key_code == VK_C
-            and (flags & HOTKEY_FLAGS) == HOTKEY_FLAGS
-        )
-
-        if not is_target:
-            self._hotkey_down = False
+        if key_code == VK_ESC and event_type == Quartz.kCGEventKeyDown:
+            if _sm.state is not State.IDLE:
+                threading.Thread(target=_on_esc, daemon=True).start()
+                return None
             return event
 
-        if event_type == Quartz.kCGEventKeyDown and not self._hotkey_down:
-            self._hotkey_down = True
-            threading.Thread(target=_on_hotkey, daemon=True).start()
+        if key_code != VK_C:
+            return event
 
-        if event_type == Quartz.kCGEventKeyUp:
-            self._hotkey_down = False
+        if event_type == Quartz.kCGEventKeyDown:
+            if (flags & HOTKEY_FLAGS) == HOTKEY_FLAGS and not is_repeat:
+                self._consumed_down = True
+                threading.Thread(target=_on_hotkey_down, args=(ts,), daemon=True).start()
+                return None
+            if is_repeat and self._consumed_down:
+                return None
+            return event
 
-        return None
+        # keyUp：只要 keyDown 是我們吃掉的，keyUp 一律吃掉（不管修飾鍵還在不在）
+        if self._consumed_down:
+            self._consumed_down = False
+            threading.Thread(target=_on_hotkey_up, args=(ts,), daemon=True).start()
+            return None
+        return event
 
     def start(self):
         event_mask = (1 << Quartz.kCGEventKeyDown) | (1 << Quartz.kCGEventKeyUp)
@@ -111,15 +124,37 @@ class HotkeyManager:
 
 
 _hotkey_mgr = HotkeyManager()
+_cancel_processing = threading.Event()
 
 
-def _on_hotkey():
-    global _recording
+def _on_hotkey_down(ts: float):
     with _lock:
-        if not _recording:
-            _do_start_recording()
-        else:
-            _do_stop_and_transcribe()
+        action = _sm.hotkey_down(ts)
+    if action is Action.START_RECORDING:
+        _do_start_recording()
+    elif action is Action.STOP_AND_PROCESS:
+        _do_stop_and_process()
+
+
+def _on_hotkey_up(ts: float):
+    with _lock:
+        action = _sm.hotkey_up(ts)
+    if action is Action.ENTER_HANDSFREE:
+        _indicator_send("handsfree")
+        print("🔁 Hands-free mode (press hotkey again to stop)", flush=True)
+    elif action is Action.STOP_AND_PROCESS:
+        _do_stop_and_process()
+
+
+def _on_esc():
+    with _lock:
+        action = _sm.esc()
+    if action is Action.CANCEL_RECORDING:
+        _do_cancel_recording()
+    elif action is Action.CANCEL_PROCESSING:
+        _cancel_processing.set()
+        _indicator_send("cancel")
+        print("✕ Cancelled (processing result will go to history only)", flush=True)
 
 
 # ─── Audio (debug) ─────────────────────────────────────────────────────────────
@@ -217,7 +252,7 @@ def _record_worker():
 def _audio_level_poller():
     while _recording:
         _indicator_send(f"level {_rms_smoothed:.4f}")
-        time.sleep(0.08)
+        time.sleep(0.03)
 
 
 def _do_start_recording():
@@ -231,10 +266,6 @@ def _do_start_recording():
     threading.Thread(target=_audio_level_poller, daemon=True).start()
     print("🎤 Recording... (press Option+Shift+C again to stop)", flush=True)
 
-    try:
-        os.unlink(MENU_RESULT)
-    except FileNotFoundError:
-        pass
     _indicator_send("recording")
 
 
@@ -261,75 +292,107 @@ def _clean_transcript(result: dict) -> str:
     return text.strip()
 
 
-def _do_stop_and_transcribe():
+def _collect_audio() -> np.ndarray | None:
+    """停止錄音執行緒並收集音訊；不合格回傳 None 並顯示 error 態。"""
     global _recording
     _recording = False
 
     if not _audio_done.wait(timeout=2.0):
         print("Audio capture timed out", flush=True)
-        _indicator_send("hide")
-        return
-
+        _indicator_send("error")
+        return None
     if not _audio_chunks:
-        print("No audio captured", flush=True)
-        _indicator_send("hide")
-        return
+        _indicator_send("error")
+        return None
 
     audio = np.concatenate(_audio_chunks)
-
-    if len(audio) < SAMPLE_RATE * 0.3:
-        print("Audio too short, ignoring", flush=True)
-        _indicator_send("hide")
-        return
-
-    rms = _rms(audio)
     dur = len(audio) / SAMPLE_RATE
-    print(f"  Audio: {dur:.1f}s, RMS={rms:.4f}", flush=True)
+    if dur < 0.3:
+        print("Audio too short, ignoring", flush=True)
+        _indicator_send("error")
+        history.append_entry(raw="", text="", duration_s=dur, status="too_short")
+        return None
+    if _rms(audio) < 0.01:
+        print("  ⛔ RMS too low — silence, ignoring", flush=True)
+        _indicator_send("error")
+        history.append_entry(raw="", text="", duration_s=dur, status="silent")
+        return None
+
     _save_debug_audio(audio, "rec")
+    return _normalize_audio(audio)
 
-    if rms < 0.01:
-        print("  ⛔ RMS too low — likely silence/noise, ignoring", flush=True)
-        _indicator_send("hide")
-        return
 
-    audio = _normalize_audio(audio)
+def _transcribe(audio: np.ndarray) -> str:
+    result = mlx_whisper.transcribe(
+        audio,
+        path_or_hf_repo=f"mlx-community/whisper-{MODEL_SIZE}",
+        language="zh",
+    )
+    return _clean_transcript(result)
 
-    _indicator_send("transcribing")
-    print("⏳ Transcribing...", flush=True)
 
+def _do_stop_and_process():
+    _cancel_processing.clear()
     try:
-        result = mlx_whisper.transcribe(
-            audio,
-            path_or_hf_repo=f"mlx-community/whisper-{MODEL_SIZE}",
-            language="zh",
-        )
-        text = _clean_transcript(result["text"])
-    except Exception as e:
-        print(f"Transcription failed: {e}", flush=True)
-        _indicator_send("hide")
-        return
+        audio = _collect_audio()
+        if audio is None:
+            return
+        dur = len(audio) / SAMPLE_RATE
 
-    if not text:
-        print("No speech detected", flush=True)
-        _indicator_send("hide")
-        return
+        _indicator_send("processing")
+        print("⏳ Transcribing...", flush=True)
+        try:
+            raw = _transcribe(audio)
+        except Exception as e:
+            print(f"Transcription failed: {e}", flush=True)
+            _indicator_send("error")
+            history.append_entry(raw="", text="", duration_s=dur, status="error")
+            return
 
-    text = _apply_dict(text)
+        if not raw:
+            _indicator_send("error")
+            history.append_entry(raw="", text="", duration_s=dur, status="silent")
+            return
 
-    if _llm_available:
-        ctx = _get_window_context()
-        print("  ✨ Refining with LLM...", flush=True)
-        text = _llm_refine(text, context=ctx)
+        text = _apply_dict(raw)
+        if _llm_available:
+            print("  ✨ Refining with LLM...", flush=True)
+            text = _llm_refine(text, context=_get_window_context())  # 失敗時內部回傳原文
 
-    print(f"📝 {text}", flush=True)
+        if _cancel_processing.is_set():
+            history.append_entry(raw=raw, text=text, duration_s=dur, status="cancelled")
+            return
 
-    _indicator_send("done")
-    choice = _wait_menu_choice(timeout=15)
-    if choice == "confirm":
+        print(f"📝 {text}", flush=True)
         _paste_text(text)
-    else:
-        print("  Cancelled", flush=True)
-    _indicator_send("hide")
+        _indicator_send("success")
+        history.append_entry(raw=raw, text=text, duration_s=dur, status="pasted")
+    finally:
+        with _lock:
+            _sm.processing_finished()
+
+
+def _do_cancel_recording():
+    """Esc 取消錄音：立即收 UI，背景仍轉錄一份進歷史（可救回）。"""
+    _indicator_send("cancel")
+    audio = None
+    global _recording
+    _recording = False
+    if _audio_done.wait(timeout=2.0) and _audio_chunks:
+        audio = np.concatenate(_audio_chunks)
+    if audio is None or len(audio) < SAMPLE_RATE * 0.3 or _rms(audio) < 0.01:
+        return
+    dur = len(audio) / SAMPLE_RATE
+
+    def _bg():
+        try:
+            raw = _transcribe(_normalize_audio(audio))
+            if raw:
+                history.append_entry(raw=raw, text=raw, duration_s=dur, status="cancelled")
+        except Exception:
+            pass
+
+    threading.Thread(target=_bg, daemon=True).start()
 
 
 def _paste_text(text: str):
@@ -355,20 +418,6 @@ def _paste_text(text: str):
         subprocess.run(["pbcopy"], input=old)
     except Exception as e:
         print(f"Paste failed: {e}", flush=True)
-
-
-def _wait_menu_choice(timeout: float = 15) -> str:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with open(MENU_RESULT) as f:
-                choice = f.read().strip()
-            os.unlink(MENU_RESULT)
-            return choice if choice in ("confirm", "cancel") else "confirm"
-        except FileNotFoundError:
-            pass
-        time.sleep(0.1)
-    return "confirm"
 
 
 # ─── Mic indicator (Swift overlay) ───────────────────────────────────────────
@@ -556,6 +605,11 @@ def _check_accessibility():
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    if "--history" in sys.argv:
+        for e in history.read_recent(20):
+            print(f"[{e['ts']}] ({e['status']}, {e['duration_s']}s) {e['text'] or e['raw']}")
+        return
+
     _custom_terms = []
     args = [a for a in sys.argv[1:] if not a.startswith("--add-term")]
     for a in sys.argv[1:]:
@@ -572,8 +626,8 @@ def main():
     print("=" * 50, flush=True)
     print("  Voice-to-Text Tool", flush=True)
     print(f"  Model: whisper-{MODEL_SIZE}", flush=True)
-    print("  Hotkey: Option + Shift + C", flush=True)
-    print("  Press once to start recording, again to transcribe", flush=True)
+    print("  Hotkey: hold Option+Shift+C to talk, release to paste", flush=True)
+    print("  Quick tap = hands-free mode; Esc = cancel", flush=True)
     print("=" * 50, flush=True)
 
     _check_accessibility()
