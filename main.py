@@ -19,7 +19,7 @@ DEBUG_AUDIO_DIR = "/tmp/voicerec_debug"
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-MODEL_SIZE = "large-v3-turbo"
+MODEL_SIZE = "large-v3-mlx"  # 換回 "large-v3-turbo" 可大幅降低出字延遲（需下載 1.6GB）
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 1024
 
