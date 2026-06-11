@@ -16,6 +16,11 @@ import Quartz
 import sounddevice as sd
 from state_machine import Action, DictationStateMachine, State
 
+# 從自身環境拔掉 Malloc* 變數：fork 出的子進程在 exec 前就繼承活環境，
+# subprocess 的 env= 參數蓋不到那個階段，會噴 MallocStackLogging 警告
+for _k in [k for k in os.environ if k.startswith("Malloc")]:
+    os.environ.pop(_k, None)
+
 DEBUG_AUDIO_DIR = "/tmp/voicerec_debug"
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -393,13 +398,33 @@ def _to_traditional(text: str) -> str:
     return _opencc.convert(text) if _opencc else text
 
 
-def _transcribe(audio: np.ndarray) -> str:
+def _context_terms(context: str, limit: int = 15) -> list[str]:
+    """從螢幕上下文抽英文/技術詞彙，連同個人字典餵給 Whisper 做詞彙偏置。
+
+    這是 Typeless 準確度的關鍵之一：上下文不只給 LLM 事後修，
+    在 ASR 解碼階段就先偏置（NVIDIA、VLM、bounding box 這類詞）。
+    """
+    seen: set[str] = {"app", "window", "visible", "selected", "editing", "around", "cursor"}
+    out: list[str] = []
+    for t in list(PERSONAL_DICT.values()) + _re.findall(r"[A-Za-z][A-Za-z0-9_.+-]{2,}", context):
+        k = t.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(t)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _transcribe(audio: np.ndarray, context: str = "") -> str:
+    terms = _context_terms(context)
+    hint = f"，可能提到：{'、'.join(terms)}" if terms else ""
     result = mlx_whisper.transcribe(
         audio,
         path_or_hf_repo=f"mlx-community/whisper-{MODEL_SIZE}",
         language="zh",
-        # 引導繁體與中英夾雜；condition_on_previous_text=False 降低幻覺循環
-        initial_prompt="以下是繁體中文為主、夾雜英文技術術語的口語內容。",
+        # 引導繁體與中英夾雜＋上下文詞彙；condition_on_previous_text=False 降低幻覺循環
+        initial_prompt=f"以下是繁體中文為主、夾雜英文技術術語的口語內容{hint}。",
         condition_on_previous_text=False,
     )
     return _to_traditional(_clean_transcript(result))
@@ -418,9 +443,13 @@ def _do_stop_and_process(cancel: threading.Event, session: int):
             history.append_entry(raw="", text="", duration_s=dur, status="error")
             return
 
+        ctx = _get_window_context()
+        if ctx:
+            print(f"  🖥️ Context: {ctx.splitlines()[0]} ({len(ctx)} chars)", flush=True)
+
         print("⏳ Transcribing...", flush=True)
         try:
-            raw = _transcribe(audio)
+            raw = _transcribe(audio, ctx)
         except Exception as e:
             print(f"Transcription failed: {e}", flush=True)
             _indicator_send("error")
@@ -435,7 +464,8 @@ def _do_stop_and_process(cancel: threading.Event, session: int):
         text = _apply_dict(raw)
         if _llm_available:
             print("  ✨ Refining with LLM...", flush=True)
-            text = _llm_refine(text, context=_get_window_context())  # 失敗時內部回傳原文
+            text = _llm_refine(text, context=ctx)  # 失敗時內部回傳原文
+            text = _to_traditional(text)  # LLM 可能吐回簡體，最終再過一次 OpenCC
 
         if cancel.is_set():
             history.append_entry(raw=raw, text=text, duration_s=dur, status="cancelled")
@@ -474,10 +504,6 @@ def _do_cancel_recording():
     threading.Thread(target=_bg, daemon=True).start()
 
 
-# pbcopy/pbpaste 用乾淨環境，避免繼承 MallocStackLogging 等變數噴警告
-_CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith("Malloc")}
-
-
 def _paste_text(text: str):
     """備份剪貼簿 → 寫入文字 → CGEvent 送 Cmd+V → 還原剪貼簿。
 
@@ -485,12 +511,12 @@ def _paste_text(text: str):
     還原只保留純文字內容（夠用且簡單）。
     """
     try:
-        old = subprocess.run(["pbpaste"], capture_output=True, env=_CLEAN_ENV).stdout
+        old = subprocess.run(["pbpaste"], capture_output=True).stdout
     except Exception as e:
         print(f"Clipboard backup failed: {e}", flush=True)
         old = None
     try:
-        subprocess.run(["pbcopy"], input=text.encode("utf-8"), env=_CLEAN_ENV)
+        subprocess.run(["pbcopy"], input=text.encode("utf-8"))
         time.sleep(0.05)
 
         src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
@@ -506,7 +532,7 @@ def _paste_text(text: str):
         if old is not None:
             time.sleep(0.3)
             try:
-                subprocess.run(["pbcopy"], input=old, env=_CLEAN_ENV)
+                subprocess.run(["pbcopy"], input=old)
             except Exception:
                 pass
 
