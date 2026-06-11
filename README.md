@@ -46,11 +46,27 @@ python3 main.py
 | 快速點放 `Option + Shift + C` | 進入免持模式（連續聆聽），再按一次停止並貼上 |
 | `Esc` | 取消本次聽寫（內容仍會存入歷史紀錄） |
 
+### Menu Bar
+
+啟動後 menu bar 會出現麥克風圖示：即時狀態、今日使用統計、最近 5 筆聽寫（點擊複製）、開啟歷史紀錄、模型切換、結束 Claro。
+
 ### 歷史紀錄
 
 ```bash
 python3 main.py --history   # 印出最近 20 筆聽寫（含被取消的）
 ```
+
+### 模型設定 `~/.claro/config.json`
+
+```json
+{
+  "whisper_model": "large-v3-mlx",
+  "llm_model": "mlx-community/Qwen2.5-7B-Instruct-4bit",
+  "llm_enabled": true
+}
+```
+
+可從 menu bar 切換，或直接編輯（重啟生效）。電腦較舊可改用 `large-v3-turbo`（更快、首次需下載 1.6GB）搭配 `Qwen2.5-1.5B-Instruct-4bit`，或把 `llm_enabled` 設 `false` 關閉潤飾。不會自動下載任何模型——換新模型後第一次聽寫才會下載。
 
 ### 自訂字典
 
