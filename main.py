@@ -9,6 +9,7 @@ import threading
 import time
 import wave
 
+import config
 import history
 import mlx_whisper
 import numpy as np
@@ -551,7 +552,7 @@ def _start_indicator():
     for p in paths:
         if os.path.exists(p):
             _indicator_proc = subprocess.Popen(
-                [p],
+                [p, str(os.getpid())],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -704,6 +705,7 @@ _llm_model = None
 _llm_tokenizer = None
 _llm_available = False
 LLM_MODEL_ID = "mlx-community/Qwen2.5-7B-Instruct-4bit"  # 1.5B 會洩漏提示詞、亂加列表符號
+LLM_ENABLED = True
 
 
 def _init_llm():
@@ -789,7 +791,8 @@ def _preload_model():
 
 def _load_models_background():
     _preload_model()
-    _init_llm()
+    if LLM_ENABLED:
+        _init_llm()
     _models_ready.set()
     print("✅ Models ready", flush=True)
 
@@ -811,6 +814,14 @@ def _check_accessibility():
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    global MODEL_SIZE, LLM_MODEL_ID, LLM_ENABLED, _llm_available
+    cfg = config.load_config()
+    MODEL_SIZE = cfg["whisper_model"]
+    LLM_MODEL_ID = cfg["llm_model"]
+    LLM_ENABLED = bool(cfg["llm_enabled"])
+    if not LLM_ENABLED:
+        _llm_available = False
+
     if "--history" in sys.argv:
         for e in history.read_recent(20):
             print(f"[{e['ts']}] ({e['status']}, {e['duration_s']}s) {e['text'] or e['raw']}")
@@ -830,6 +841,7 @@ def main():
     print("=" * 50, flush=True)
     print("  Voice-to-Text Tool", flush=True)
     print(f"  Model: whisper-{MODEL_SIZE}", flush=True)
+    print(f"  LLM: {LLM_MODEL_ID if LLM_ENABLED else 'disabled'}", flush=True)
     print("  Hotkey: hold Option+Shift+C to talk, release to paste", flush=True)
     print("  Quick tap = hands-free mode; Esc = cancel", flush=True)
     print("=" * 50, flush=True)

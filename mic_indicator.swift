@@ -1,9 +1,19 @@
 import Cocoa
 import AVFoundation
+import Darwin
 
 let SOUND_START = "/System/Library/Sounds/Ping.aiff"
 let SOUND_SUCCESS = "/System/Library/Sounds/Pop.aiff"
 let SOUND_ERROR = "/System/Library/Sounds/Basso.aiff"
+let CLARO_DIR = NSHomeDirectory() + "/.claro"
+let CONFIG_PATH = CLARO_DIR + "/config.json"
+let HISTORY_PATH = CLARO_DIR + "/history.jsonl"
+
+private let DEFAULT_CONFIG: [String: Any] = [
+    "whisper_model": "large-v3-mlx",
+    "llm_model": "mlx-community/Qwen2.5-7B-Instruct-4bit",
+    "llm_enabled": true,
+]
 
 private let PILL_W: CGFloat = 150
 private let PILL_H: CGFloat = 38
@@ -460,6 +470,289 @@ class IndicatorWindow: NSObject {
     }
 }
 
+// Menu Bar
+
+class MenuBarController: NSObject, NSMenuDelegate {
+    private let statusItem: NSStatusItem
+    private let menu = NSMenu()
+    private let statusLine = NSMenuItem(title: "Claro — 待命", action: nil, keyEquivalent: "")
+    private let statsLine = NSMenuItem(title: "今日 0 次・0 字", action: nil, keyEquivalent: "")
+    private let recentMenu = NSMenu()
+    private var whisperItems: [NSMenuItem] = []
+    private var llmItems: [NSMenuItem] = []
+    private var currentStateText = "待命"
+    private var showingRestartMessage = false
+    private var restartMessageToken = 0
+
+    override init() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        super.init()
+
+        if let button = statusItem.button {
+            if let image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Claro") {
+                image.isTemplate = true
+                button.image = image
+            }
+            button.imagePosition = .imageOnly
+        }
+
+        statusLine.isEnabled = false
+        statsLine.isEnabled = false
+        menu.delegate = self
+        menu.addItem(statusLine)
+        menu.addItem(.separator())
+        menu.addItem(statsLine)
+
+        let recentItem = NSMenuItem(title: "最近聽寫", action: nil, keyEquivalent: "")
+        recentItem.submenu = recentMenu
+        menu.addItem(recentItem)
+
+        let historyItem = NSMenuItem(title: "開啟歷史紀錄", action: #selector(openHistory(_:)), keyEquivalent: "")
+        historyItem.target = self
+        menu.addItem(historyItem)
+
+        menu.addItem(.separator())
+        menu.addItem(makeWhisperMenu())
+        menu.addItem(makeLLMMenu())
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "結束 Claro", action: #selector(quitClaro(_:)), keyEquivalent: "")
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        statusItem.menu = menu
+        refreshMenu()
+    }
+
+    func setState(_ text: String) {
+        DispatchQueue.main.async {
+            self.currentStateText = text
+            self.updateStatusLine()
+        }
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshMenu()
+    }
+
+    private func makeWhisperMenu() -> NSMenuItem {
+        let parent = NSMenuItem(title: "Whisper 模型", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        let options = [
+            ("large-v3-mlx", "large-v3-mlx"),
+            ("large-v3-turbo（首次需下載 1.6GB）", "large-v3-turbo"),
+        ]
+        for (title, value) in options {
+            let item = NSMenuItem(title: title, action: #selector(selectWhisperModel(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = value
+            submenu.addItem(item)
+            whisperItems.append(item)
+        }
+        parent.submenu = submenu
+        return parent
+    }
+
+    private func makeLLMMenu() -> NSMenuItem {
+        let parent = NSMenuItem(title: "LLM 潤飾", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        let options: [(String, String?, Bool)] = [
+            ("Qwen2.5-7B（品質佳）", "mlx-community/Qwen2.5-7B-Instruct-4bit", true),
+            ("Qwen2.5-1.5B（較快）", "mlx-community/Qwen2.5-1.5B-Instruct-4bit", true),
+            ("關閉", nil, false),
+        ]
+        for (title, modelID, enabled) in options {
+            let item = NSMenuItem(title: title, action: #selector(selectLLMOption(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = ["model": modelID ?? "", "enabled": enabled]
+            submenu.addItem(item)
+            llmItems.append(item)
+        }
+        parent.submenu = submenu
+        return parent
+    }
+
+    private func refreshMenu() {
+        updateStatusLine()
+        let history = readHistory()
+        statsLine.title = "今日 \(history.todayCount) 次・\(history.todayChars) 字"
+        rebuildRecentMenu(texts: history.recentTexts)
+        refreshCheckmarks(config: readConfig())
+    }
+
+    private func updateStatusLine() {
+        guard !showingRestartMessage else { return }
+        statusLine.title = "Claro — \(currentStateText)"
+    }
+
+    private func showRestartRequired() {
+        showingRestartMessage = true
+        restartMessageToken += 1
+        let token = restartMessageToken
+        statusLine.title = "重啟後生效"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            guard self.restartMessageToken == token else { return }
+            self.showingRestartMessage = false
+            self.updateStatusLine()
+        }
+    }
+
+    private func readConfig() -> [String: Any] {
+        var config = DEFAULT_CONFIG
+        guard let data = FileManager.default.contents(atPath: CONFIG_PATH) else {
+            return config
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: data),
+              let dict = obj as? [String: Any] else {
+            return config
+        }
+        for (key, value) in dict {
+            config[key] = value
+        }
+        return config
+    }
+
+    private func writeConfig(_ config: [String: Any]) {
+        let fm = FileManager.default
+        try? fm.createDirectory(
+            atPath: CLARO_DIR,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: CLARO_DIR)
+
+        guard JSONSerialization.isValidJSONObject(config),
+              let data = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted]) else {
+            return
+        }
+        try? data.write(to: URL(fileURLWithPath: CONFIG_PATH), options: .atomic)
+        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: CONFIG_PATH)
+    }
+
+    private func refreshCheckmarks(config: [String: Any]) {
+        let currentWhisper = config["whisper_model"] as? String
+        for item in whisperItems {
+            item.state = (item.representedObject as? String == currentWhisper) ? .on : .off
+        }
+
+        let llmEnabled = config["llm_enabled"] as? Bool ?? true
+        let currentLLM = config["llm_model"] as? String
+        for item in llmItems {
+            guard let payload = item.representedObject as? [String: Any],
+                  let enabled = payload["enabled"] as? Bool else {
+                item.state = .off
+                continue
+            }
+            if !enabled {
+                item.state = llmEnabled ? .off : .on
+            } else {
+                item.state = (llmEnabled && payload["model"] as? String == currentLLM) ? .on : .off
+            }
+        }
+    }
+
+    private func readHistory() -> (todayCount: Int, todayChars: Int, recentTexts: [String]) {
+        guard let contents = try? String(contentsOfFile: HISTORY_PATH, encoding: .utf8) else {
+            return (0, 0, [])
+        }
+
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar.current
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        let todayPrefix = formatter.string(from: Date())
+
+        var todayCount = 0
+        var todayChars = 0
+        var pastedTexts: [String] = []
+
+        for lineSub in contents.split(separator: "\n").suffix(200) {
+            let line = String(lineSub)
+            guard let data = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data),
+                  let entry = obj as? [String: Any],
+                  entry["status"] as? String == "pasted" else {
+                continue
+            }
+            let text = entry["text"] as? String ?? ""
+            if let ts = entry["ts"] as? String, ts.hasPrefix(todayPrefix) {
+                todayCount += 1
+                todayChars += text.count
+            }
+            if !text.isEmpty {
+                pastedTexts.append(text)
+            }
+        }
+
+        return (todayCount, todayChars, Array(pastedTexts.suffix(5).reversed()))
+    }
+
+    private func rebuildRecentMenu(texts: [String]) {
+        recentMenu.removeAllItems()
+        if texts.isEmpty {
+            let empty = NSMenuItem(title: "尚無紀錄", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            recentMenu.addItem(empty)
+            return
+        }
+        for text in texts {
+            let item = NSMenuItem(title: truncated(text, limit: 30), action: #selector(copyRecent(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = text
+            recentMenu.addItem(item)
+        }
+    }
+
+    private func truncated(_ text: String, limit: Int) -> String {
+        if text.count <= limit {
+            return text
+        }
+        return String(text.prefix(limit))
+    }
+
+    @objc private func copyRecent(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    @objc private func openHistory(_ sender: NSMenuItem) {
+        NSWorkspace.shared.open(URL(fileURLWithPath: HISTORY_PATH))
+    }
+
+    @objc private func selectWhisperModel(_ sender: NSMenuItem) {
+        guard let model = sender.representedObject as? String else { return }
+        var config = readConfig()
+        config["whisper_model"] = model
+        writeConfig(config)
+        refreshCheckmarks(config: config)
+        showRestartRequired()
+    }
+
+    @objc private func selectLLMOption(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? [String: Any],
+              let enabled = payload["enabled"] as? Bool else {
+            return
+        }
+        var config = readConfig()
+        config["llm_enabled"] = enabled
+        if enabled, let model = payload["model"] as? String {
+            config["llm_model"] = model
+        }
+        writeConfig(config)
+        refreshCheckmarks(config: config)
+        showRestartRequired()
+    }
+
+    @objc private func quitClaro(_ sender: NSMenuItem) {
+        if CommandLine.arguments.count > 1, let pid = Int32(CommandLine.arguments[1]) {
+            Darwin.kill(pid, SIGTERM)
+        }
+        NSApplication.shared.terminate(nil)
+    }
+}
+
 // Socket Server
 
 class SocketServer {
@@ -468,8 +761,8 @@ class SocketServer {
 
     init(path: String) { self.path = path }
 
-    func start(indicator: IndicatorWindow) {
-        let claroDir = NSHomeDirectory() + "/.claro"
+    func start(indicator: IndicatorWindow, menu: MenuBarController) {
+        let claroDir = CLARO_DIR
         try? FileManager.default.createDirectory(
             atPath: claroDir,
             withIntermediateDirectories: true,
@@ -506,11 +799,11 @@ class SocketServer {
         listen(sock, 5)
 
         DispatchQueue.global(qos: .background).async { [weak self] in
-            self?.acceptLoop(indicator: indicator)
+            self?.acceptLoop(indicator: indicator, menu: menu)
         }
     }
 
-    private func acceptLoop(indicator: IndicatorWindow) {
+    private func acceptLoop(indicator: IndicatorWindow, menu: MenuBarController) {
         while sock >= 0 {
             let client = accept(sock, nil, nil)
             guard client >= 0 else { continue }
@@ -519,31 +812,38 @@ class SocketServer {
             var cmd = ""
             if n > 0 { buf[n] = 0; cmd = String(cString: buf).trimmingCharacters(in: .whitespacesAndNewlines) }
             close(client)
-            handle(cmd, indicator: indicator)
+            handle(cmd, indicator: indicator, menu: menu)
         }
     }
 
-    private func handle(_ cmd: String, indicator: IndicatorWindow) {
+    private func handle(_ cmd: String, indicator: IndicatorWindow, menu: MenuBarController) {
         let parts = cmd.split(separator: " ", maxSplits: 1).map(String.init)
         guard let action = parts.first else { return }
         switch action {
         case "recording":
+            menu.setState("錄音中")
             indicator.showRecording()
         case "handsfree":
+            menu.setState("錄音中")
             indicator.showHandsfree()
         case "level":
             if parts.count >= 2, let v = Float(parts[1]) {
                 indicator.updateLevel(v)
             }
         case "processing":
+            menu.setState("處理中")
             indicator.showProcessing()
         case "success":
+            menu.setState("待命")
             indicator.showSuccess()
         case "error":
+            menu.setState("待命")
             indicator.showError()
         case "cancel":
+            menu.setState("待命")
             indicator.showCancelled()
         case "hide":
+            menu.setState("待命")
             indicator.hide()
         case "quit":
             DispatchQueue.main.async { NSApplication.shared.terminate(nil) }
@@ -560,10 +860,11 @@ class SocketServer {
 
 // Entry
 
-let indicator = IndicatorWindow()
-let server = SocketServer(path: NSHomeDirectory() + "/.claro/indicator.sock")
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-server.start(indicator: indicator)
+let indicator = IndicatorWindow()
+let menuBar = MenuBarController()
+let server = SocketServer(path: CLARO_DIR + "/indicator.sock")
+server.start(indicator: indicator, menu: menuBar)
 atexit { server.stop() }
 app.run()
