@@ -14,7 +14,7 @@
 - `audio`：cpal 以裝置原生取樣率擷取 → rubato 重採樣 16kHz mono f32、RMS 電平、5 分鐘上限、太短/靜音防呆
 - `stt`：`SttEngine` trait ＋ `transcribe-cpp`（whisper.cpp 家族，Metal，SPEC D5）首個 provider，預設 large-v3-turbo；模型首次使用經同意才下載
 - `inject`：剪貼簿備份 → 寫入 → 合成 Cmd+V → 還原
-- overlay：底部膠囊（錄音/處理/成功/取消/錯誤五態＋電平波形），tray 基本項
+- overlay：**沿用 prototype 的 `mic_indicator`**（Rust spawn＋同一 socket 協議，動畫不動，SPEC D10）；Tauri 原生 overlay 延至 M5
 - `settings`/`history`：讀寫 `~/.claro/config.json` 與 `history.jsonl`（與原型格式相容，0600）
 
 **DoD**：關網路（模型已下載）能在任意 app 聽寫中文並貼上；`cargo test` 全綠（狀態機、音訊收集、config/history 相容性）；冷啟動（不含模型載入）< 3s；手動 smoke checklist（附錄 A）通過。

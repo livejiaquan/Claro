@@ -237,3 +237,4 @@ prototype 教訓：1.5B 級模型會洩漏提示詞、亂加列表符號 → 預
 | D7 | 全域熱鍵 PTT 用 `handy-keys` crate（press/release 事件） | **已定**（Handy 實證）；不採雙 backend |
 | D8 | 剪貼簿還原延遲：沿用 prototype 300ms（Handy 的 50ms 會 race 慢 app），後續改剪貼簿 changeCount 輪詢 | 已定 |
 | D9 | IME 切換無現成實作，M4 spike TIS API 序列 | 已定 |
+| D10 | M1 沿用 prototype 的 Swift `mic_indicator`（Rust spawn＋同一 socket 協議），動畫原封不動；Tauri 原生 overlay（nspanel＋穿透，沿用同視覺基礎）延至 M5 打磨期 | **已定**（使用者指定保留現有動畫基礎） |

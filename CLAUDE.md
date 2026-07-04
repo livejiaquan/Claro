@@ -6,20 +6,21 @@ Claro：macOS 全本地語音輸入工具。按住熱鍵說話，放開後文字
 
 ## 目前狀態（隨里程碑更新）
 
-- **Phase 0 完成（2026-07-05）**：競品研究與規格已定，見 `docs/SPEC.md`（技術真值來源）、`docs/ROADMAP.md`（里程碑與進度）、`docs/COMPETITIVE_MATRIX.md`（定位）。
-- **待使用者確認 Phase 0 後進入 M1**：以 Tauri v2（Rust + React/TS/Tailwind）重寫；現有 Python/MLX 版本降為凍結的參考實作（屆時移至 `prototype/`，Tauri app 在 `desktop/`）。
-- 在那之前，repo 根目錄仍是可運作的 Python 原型（下節）。
+- **Phase 0 完成並經使用者核准（2026-07-05）**：規格見 `docs/SPEC.md`（技術真值來源，決策 D1–D10）、`docs/ROADMAP.md`（里程碑與進度）、`docs/COMPETITIVE_MATRIX.md`（定位）、`docs/research/`（競品原始碼分析）。
+- **M1 進行中**：Tauri v2（Rust + React/TS/Tailwind）重寫於 `desktop/`；Python/MLX 版已凍結為 `prototype/`（行為真值來源，只修不增）。
+- M1 的 overlay 直接由 Rust spawn `prototype/mic_indicator`（同 socket 協議，動畫沿用——使用者指定）；Tauri 原生 overlay 延至 M5。
 
 任何 session 開工前：先讀 `docs/ROADMAP.md` 的進度區與當前里程碑 DoD；架構問題查 `docs/SPEC.md`（含決策記錄 D1–D7）。完成里程碑後更新兩者。
 
-## Python 原型（現行可跑版本，M1 後凍結為行為參考）
+## Python 原型（`prototype/`，已凍結，行為參考）
 
 ```bash
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+python3 -m venv venv && source venv/bin/activate   # venv 在 repo 根目錄
+pip install -r prototype/requirements.txt
+cd prototype
 ./build_indicator.sh          # 改過 mic_indicator.swift 後必須重編（swiftc）
 python3 main.py               # 執行；--history 印最近 20 筆；--debug 音訊存 /tmp/voicerec_debug/
-pytest                        # 全部測試；單一測試：pytest tests/test_state_machine.py::test_quick_tap_enters_handsfree
+python -m pytest              # 全部測試；單一測試：python -m pytest tests/test_state_machine.py::test_quick_tap_enters_handsfree
 ```
 
 測試不需麥克風或模型：`test_integration.py` 用 monkeypatch 塞假 `mlx_whisper`/`mlx_lm`/`sounddevice` 進 `sys.modules` 再 import `main`。

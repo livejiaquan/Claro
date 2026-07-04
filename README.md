@@ -2,6 +2,8 @@
 
 macOS 語音輸入工具。按住快捷鍵說話，放開後文字直接出現在游標位置。全部在本地處理，資料不出機器。
 
+> **改版進行中**：Claro 正以 Tauri（Rust）重寫為可下載安裝的桌面 app（規劃見 `docs/ROADMAP.md`）。現行可用版本是 `prototype/` 下的 Python 實作，以下說明皆以它為準（指令請在 `prototype/` 目錄執行）。
+
 ## 特色
 
 - **全本地處理** — 使用 mlx-whisper + mlx-lm，Apple Silicon 加速；首次執行需網路下載模型，之後完全離線
@@ -25,9 +27,10 @@ python3 -m venv venv
 source venv/bin/activate
 
 # 2. 安裝依賴
-pip install -r requirements.txt
+pip install -r prototype/requirements.txt
 
 # 3. 編譯 Swift 膠囊 overlay
+cd prototype
 swiftc -o mic_indicator mic_indicator.swift -framework Cocoa -framework AVFoundation
 ```
 
@@ -35,6 +38,7 @@ swiftc -o mic_indicator mic_indicator.swift -framework Cocoa -framework AVFounda
 
 ```bash
 source venv/bin/activate
+cd prototype
 python3 main.py
 ```
 
