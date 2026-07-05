@@ -104,7 +104,7 @@
 ## 進度
 
 - [x] Phase 0：稽核＋競品研究＋SPEC/ROADMAP/CLAUDE.md（2026-07-05）
-- [ ] M1
+- [ ] M1 — **程式碼完成（2026-07-05），待手動驗收**：37 項 Rust 測試綠；downloader 實測 1.6GB 續傳下載 OK；TTS 音檔端到端轉錄正確（中英混雜/繁體/Metal 2.8s 首跑）；`cargo test`＋前端 build＋CI 就緒。剩：使用者授予輔助使用權限後跑附錄 A checklist（1–7）。
 - [ ] M2
 - [ ] M3
 - [ ] M4

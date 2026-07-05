@@ -19,7 +19,6 @@ use tauri::Emitter;
 use crate::stt::registry::{self, ModelSpec};
 
 struct AppState {
-    core: Arc<pipeline::Core>,
     model_spec: &'static ModelSpec,
     downloading: Arc<AtomicBool>,
 }
@@ -154,8 +153,33 @@ pub fn run() {
         std::thread::spawn(move || pipeline::run_dispatcher(core, msg_rx));
     }
 
+    // 模型預載（prototype 行為：啟動即背景載入，首次聽寫不用等）
+    {
+        let core = core.clone();
+        let model_path = registry::model_path(spec);
+        std::thread::spawn(move || {
+            if model_path.exists() {
+                if let Err(e) = core.engine.lock().unwrap().load() {
+                    tracing::warn!("model preload failed: {e}");
+                }
+            } else {
+                tracing::info!("model not downloaded yet — open the Claro window to download");
+            }
+        });
+    }
+
+    // SIGTERM/SIGINT（mic_indicator 的「結束 Claro」走 SIGTERM）：清掉 overlay 再退出
+    {
+        let core = core.clone();
+        if let Err(e) = ctrlc::set_handler(move || {
+            core.overlay.stop();
+            std::process::exit(0);
+        }) {
+            tracing::warn!("signal handler setup failed: {e}");
+        }
+    }
+
     let state = AppState {
-        core: core.clone(),
         model_spec: spec,
         downloading: Arc::new(AtomicBool::new(false)),
     };
@@ -166,9 +190,15 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![get_status, download_model])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(move |_app, event| {
-            if let tauri::RunEvent::Exit = event {
+        .run(move |_app, event| match event {
+            // 關掉視窗 ≠ 結束 app（背景聽寫工具）；只有明確 exit（Cmd+Q、SIGTERM、
+            // mic_indicator 選單）才真的退出
+            tauri::RunEvent::ExitRequested { code: None, api, .. } => {
+                api.prevent_exit();
+            }
+            tauri::RunEvent::Exit => {
                 core.overlay.stop();
             }
+            _ => {}
         });
 }

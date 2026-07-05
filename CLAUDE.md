@@ -7,8 +7,23 @@ Claro：macOS 全本地語音輸入工具。按住熱鍵說話，放開後文字
 ## 目前狀態（隨里程碑更新）
 
 - **Phase 0 完成並經使用者核准（2026-07-05）**：規格見 `docs/SPEC.md`（技術真值來源，決策 D1–D10）、`docs/ROADMAP.md`（里程碑與進度）、`docs/COMPETITIVE_MATRIX.md`（定位）、`docs/research/`（競品原始碼分析）。
-- **M1 進行中**：Tauri v2（Rust + React/TS/Tailwind）重寫於 `desktop/`；Python/MLX 版已凍結為 `prototype/`（行為真值來源，只修不增）。
+- **M1 程式碼完成（2026-07-05），待使用者手動驗收**（授予輔助使用權限＋實際聽寫）：Tauri v2 重寫於 `desktop/`；Python/MLX 版凍結為 `prototype/`（行為真值來源，只修不增）。37 個 Rust 單元測試全綠；TTS 音檔端到端轉錄驗證過（中英混雜正確、繁體、Metal）。
 - M1 的 overlay 直接由 Rust spawn `prototype/mic_indicator`（同 socket 協議，動畫沿用——使用者指定）；Tauri 原生 overlay 延至 M5。
+
+## Desktop（Tauri）常用指令
+
+```bash
+cd desktop
+npm install                    # 首次
+npm run tauri dev              # 開發模式（含前端 HMR）
+npm run tauri build            # 產 Claro.app（src-tauri/target/release/bundle/macos/）
+cd src-tauri
+cargo test --lib               # Rust 單元測試（不需麥克風/模型）
+cargo run --example download_model [id]        # 下載 whisper 模型（同 app 的 downloader）
+cargo run --example transcribe_file x.wav      # WAV 走完整 STT 管線（可用 say -v Meijia 產測試音）
+```
+
+需要 `cmake`（brew）與 Rust stable。模型放 `~/Library/Application Support/Claro/models/`；config/history 沿用 `~/.claro/`（與 prototype 相容）。熱鍵/Esc 攔截需要輔助使用權限——dev 模式授權給終端機，bundle 授權給 Claro.app。
 
 任何 session 開工前：先讀 `docs/ROADMAP.md` 的進度區與當前里程碑 DoD；架構問題查 `docs/SPEC.md`（含決策記錄 D1–D7）。完成里程碑後更新兩者。
 
