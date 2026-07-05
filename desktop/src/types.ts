@@ -1,5 +1,6 @@
 export interface Status {
   model_id: string;
+  model_label: string;
   model_present: boolean;
   model_approx_mb: number;
   accessibility: boolean;
@@ -10,7 +11,26 @@ export interface Status {
   dictation_state: "idle" | "recording" | "processing";
 }
 
+export interface ModelInfo {
+  id: string;
+  label: string;
+  desc: string;
+  size_mb: number;
+  recommended: boolean;
+  downloaded: boolean;
+  active: boolean;
+  downloading: boolean;
+}
+
+export interface LlmConfig {
+  provider: string;
+  model: string;
+  base_url: string;
+  has_key: boolean;
+}
+
 export interface DownloadProgress {
+  model_id: string;
   downloaded_mb: number;
   total_mb: number | null;
   done: boolean;

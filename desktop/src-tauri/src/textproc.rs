@@ -70,6 +70,39 @@ pub fn default_dict() -> Vec<(String, String)> {
     ]
 }
 
+/// CJK 標點正規化：緊跟在 CJK 字後的半形標點 → 全形（Whisper 常吐半形逗號）。
+/// 保守規則：只在「前一字是 CJK，且下一字不是 ASCII 英數」時轉換，
+/// 避免誤傷 "3.14"、"foo,bar"、URL 等。
+pub fn normalize_cjk_punct(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 8);
+    for (i, &c) in chars.iter().enumerate() {
+        let mapped = match c {
+            ',' | '.' | '?' | '!' | ';' | ':' => {
+                let prev_cjk = i > 0 && is_cjk(chars[i - 1]);
+                let next_ascii_alnum =
+                    chars.get(i + 1).map(|n| n.is_ascii_alphanumeric()).unwrap_or(false);
+                if prev_cjk && !next_ascii_alnum {
+                    match c {
+                        ',' => '，',
+                        '.' => '。',
+                        '?' => '？',
+                        '!' => '！',
+                        ';' => '；',
+                        ':' => '：',
+                        _ => unreachable!(),
+                    }
+                } else {
+                    c
+                }
+            }
+            _ => c,
+        };
+        out.push(mapped);
+    }
+    out
+}
+
 /// OpenCC s2twp：確定性簡轉繁（台灣用語）。初始化失敗時原樣返回（不阻擋聽寫）。
 pub fn to_traditional(text: &str) -> String {
     static OPENCC: OnceLock<Option<ferrous_opencc::OpenCC>> = OnceLock::new();
@@ -118,6 +151,26 @@ mod tests {
         assert_eq!(apply_dict("我用 GBT 寫 code", &d), "我用 GPT 寫 code");
         assert_eq!(apply_dict("gbt 很好用", &d), "gpt 很好用");
         assert_eq!(apply_dict("My Torch 訓練", &d), "PyTorch 訓練");
+    }
+
+    #[test]
+    fn punct_normalizes_after_cjk() {
+        assert_eq!(normalize_cjk_punct("今天天氣很好,我們來測試."), "今天天氣很好，我們來測試。");
+        assert_eq!(normalize_cjk_punct("真的嗎?太好了!"), "真的嗎？太好了！");
+    }
+
+    #[test]
+    fn punct_leaves_ascii_context_alone() {
+        assert_eq!(normalize_cjk_punct("圓周率是3.14"), "圓周率是3.14");
+        assert_eq!(normalize_cjk_punct("run test,ing now"), "run test,ing now");
+        assert_eq!(normalize_cjk_punct("網址是 example.com"), "網址是 example.com");
+        // 前一字非 CJK → 不動
+        assert_eq!(normalize_cjk_punct("用 PyTorch, 跑訓練"), "用 PyTorch, 跑訓練");
+    }
+
+    #[test]
+    fn punct_converts_at_end_of_cjk_sentence_before_space() {
+        assert_eq!(normalize_cjk_punct("先做這個, 再做那個"), "先做這個， 再做那個");
     }
 
     #[test]

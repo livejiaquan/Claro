@@ -5,6 +5,7 @@ pub mod inject;
 pub mod models;
 pub mod overlay_client;
 pub mod pipeline;
+pub mod polish;
 pub mod settings;
 pub mod state_machine;
 pub mod stt;
@@ -18,28 +19,12 @@ use tauri::{Emitter, Manager};
 
 use crate::audio::CaptureHandle;
 use crate::state_machine::State;
-use crate::stt::registry::{self, ModelSpec};
+use crate::stt::registry;
 
 struct AppState {
     core: Arc<pipeline::Core>,
-    model_spec: &'static ModelSpec,
-    downloading: Arc<AtomicBool>,
+    downloading: Arc<Mutex<Option<&'static str>>>,
     mic_test: Arc<Mutex<Option<CaptureHandle>>>,
-}
-
-#[derive(Serialize)]
-struct Status {
-    model_id: String,
-    model_present: bool,
-    model_approx_mb: u64,
-    accessibility: bool,
-    hotkey_active: bool,
-    /// 使用者在設定中選的裝置（null = 跟隨系統預設）
-    input_device: Option<String>,
-    /// 系統目前的預設輸入裝置
-    default_input: Option<String>,
-    input_devices: Vec<String>,
-    dictation_state: &'static str,
 }
 
 fn accessibility_trusted() -> bool {
@@ -53,9 +38,25 @@ fn accessibility_trusted() -> bool {
     }
 }
 
+// ─── 狀態 ─────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct Status {
+    model_id: String,
+    model_label: String,
+    model_present: bool,
+    model_approx_mb: u64,
+    accessibility: bool,
+    hotkey_active: bool,
+    input_device: Option<String>,
+    default_input: Option<String>,
+    input_devices: Vec<String>,
+    dictation_state: &'static str,
+}
+
 #[tauri::command]
 fn get_status(state: tauri::State<AppState>) -> Status {
-    let spec = state.model_spec;
+    let spec = *state.core.active_model.lock().unwrap();
     let dictation_state = match state.core.sm.lock().unwrap().state() {
         State::Idle => "idle",
         State::Hold | State::Handsfree => "recording",
@@ -63,6 +64,7 @@ fn get_status(state: tauri::State<AppState>) -> Status {
     };
     Status {
         model_id: spec.id.to_string(),
+        model_label: spec.label.to_string(),
         model_present: registry::model_path(spec).exists(),
         model_approx_mb: spec.approx_bytes / 1_048_576,
         accessibility: accessibility_trusted(),
@@ -74,7 +76,8 @@ fn get_status(state: tauri::State<AppState>) -> Status {
     }
 }
 
-/// 空字串 = 跟隨系統預設。即時生效並持久化到 config。
+// ─── 輸入裝置與麥克風測試 ────────────────────────────────────────────────────
+
 #[tauri::command]
 fn set_input_device(name: String, state: tauri::State<AppState>) -> Result<(), String> {
     let selection = if name.is_empty() { None } else { Some(name.clone()) };
@@ -93,7 +96,6 @@ struct MicLevel {
     active: bool,
 }
 
-/// 麥克風測試：開始擷取並以 "mic-level" 事件串流電平（50ms 一次，30s 自動停）。
 #[tauri::command]
 fn mic_test_start(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
     if state.core.sm.lock().unwrap().state() != State::Idle {
@@ -114,7 +116,7 @@ fn mic_test_start(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
         let started = std::time::Instant::now();
         loop {
             if mic_test.lock().unwrap().is_none() {
-                break; // 已被 mic_test_stop 收走
+                break;
             }
             if started.elapsed().as_secs() >= 30 {
                 if let Some(h) = mic_test.lock().unwrap().take() {
@@ -137,35 +139,63 @@ fn mic_test_stop(state: tauri::State<AppState>) {
     }
 }
 
-/// 最近 n 筆聽寫歷史（首頁統計與歷史頁用）
-#[tauri::command]
-fn get_history(n: usize) -> Vec<serde_json::Value> {
-    history::read_recent(n.min(500), &history::history_path())
+// ─── 模型管理 ─────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ModelInfo {
+    id: &'static str,
+    label: &'static str,
+    desc: &'static str,
+    size_mb: u64,
+    recommended: bool,
+    downloaded: bool,
+    active: bool,
+    downloading: bool,
 }
 
-/// 複製文字到剪貼簿（歷史頁點擊複製）
 #[tauri::command]
-fn copy_text(text: String) -> Result<(), String> {
-    arboard::Clipboard::new()
-        .and_then(|mut c| c.set_text(text))
-        .map_err(|e| e.to_string())
+fn list_models(state: tauri::State<AppState>) -> Vec<ModelInfo> {
+    let active = state.core.active_model.lock().unwrap().id;
+    let downloading = *state.downloading.lock().unwrap();
+    registry::MODELS
+        .iter()
+        .map(|m| ModelInfo {
+            id: m.id,
+            label: m.label,
+            desc: m.desc,
+            size_mb: m.approx_bytes / 1_048_576,
+            recommended: m.recommended,
+            downloaded: registry::model_path(m).exists(),
+            active: m.id == active,
+            downloading: downloading == Some(m.id),
+        })
+        .collect()
 }
 
 #[derive(Serialize, Clone)]
 struct DownloadProgress {
+    model_id: &'static str,
     downloaded_mb: u64,
     total_mb: Option<u64>,
     done: bool,
     error: Option<String>,
 }
 
-/// 使用者在 UI 按下「同意下載」後才會呼叫（絕不自動下載，SPEC §6）
+/// 使用者在 UI 明確點擊後才會呼叫（絕不自動下載，SPEC §6）
 #[tauri::command]
-fn download_model(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
-    if state.downloading.swap(true, Ordering::SeqCst) {
-        return Err("已在下載中".into());
+fn download_model(
+    id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let spec = registry::find(&id).ok_or("未知的模型")?;
+    {
+        let mut guard = state.downloading.lock().unwrap();
+        if guard.is_some() {
+            return Err("已有模型在下載中".into());
+        }
+        *guard = Some(spec.id);
     }
-    let spec = state.model_spec;
     let downloading = state.downloading.clone();
     std::thread::spawn(move || {
         let dest = registry::model_path(spec);
@@ -173,6 +203,7 @@ fn download_model(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
             let _ = app.emit(
                 "model-download",
                 DownloadProgress {
+                    model_id: spec.id,
                     downloaded_mb: p.downloaded / 1_048_576,
                     total_mb: p.total.map(|t| t / 1_048_576),
                     done: false,
@@ -181,8 +212,15 @@ fn download_model(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
             );
         });
         let payload = match result {
-            Ok(()) => DownloadProgress { downloaded_mb: 0, total_mb: None, done: true, error: None },
+            Ok(()) => DownloadProgress {
+                model_id: spec.id,
+                downloaded_mb: 0,
+                total_mb: None,
+                done: true,
+                error: None,
+            },
             Err(e) => DownloadProgress {
+                model_id: spec.id,
                 downloaded_mb: 0,
                 total_mb: None,
                 done: false,
@@ -190,12 +228,134 @@ fn download_model(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
             },
         };
         let _ = app.emit("model-download", payload);
-        downloading.store(false, Ordering::SeqCst);
+        *downloading.lock().unwrap() = None;
     });
     Ok(())
 }
 
+/// 切換使用中的模型（需已下載）；引擎熱換、背景預載、寫回 config。
+#[tauri::command]
+fn set_model(id: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let spec = registry::find(&id).ok_or("未知的模型")?;
+    if !registry::model_path(spec).exists() {
+        return Err("請先下載這個模型".into());
+    }
+    if state.core.sm.lock().unwrap().state() != State::Idle {
+        return Err("聽寫進行中，稍後再切換".into());
+    }
+    state.core.swap_model(spec);
+    settings::update_config_key(
+        &settings::config_path(),
+        "whisper_model",
+        serde_json::Value::String(spec.id.into()),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// 刪除已下載的模型檔（使用中的不可刪）。
+#[tauri::command]
+fn delete_model(id: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let spec = registry::find(&id).ok_or("未知的模型")?;
+    if state.core.active_model.lock().unwrap().id == spec.id {
+        return Err("使用中的模型不能刪除，先切換到其他模型".into());
+    }
+    std::fs::remove_file(registry::model_path(spec)).map_err(|e| e.to_string())
+}
+
+// ─── LLM 潤飾設定 ─────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct LlmConfig {
+    provider: String,
+    model: String,
+    base_url: String,
+    has_key: bool,
+}
+
+#[tauri::command]
+fn get_llm_config() -> LlmConfig {
+    let s = settings::Settings::load();
+    LlmConfig {
+        provider: s.llm_provider(),
+        model: s.llm_model(),
+        base_url: s.llm_base_url(),
+        has_key: polish::has_api_key(),
+    }
+}
+
+#[tauri::command]
+fn set_llm_config(provider: String, model: String, base_url: String) -> Result<(), String> {
+    let path = settings::config_path();
+    settings::update_config_key(&path, "llm_provider", provider.into()).map_err(|e| e.to_string())?;
+    settings::update_config_key(&path, "llm_polish_model", model.into()).map_err(|e| e.to_string())?;
+    settings::update_config_key(&path, "llm_base_url", base_url.into()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_llm_key(key: String) -> Result<(), String> {
+    polish::set_api_key(&key).map_err(|e| e.to_string())
+}
+
+/// 用固定樣例測潤飾設定；回傳整理後文字。
+#[tauri::command]
+async fn test_polish() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let polisher = polish::from_settings(&settings::Settings::load())
+            .ok_or("尚未設定潤飾（選擇 Ollama 或自訂 API，並填模型名稱）")?;
+        polisher.self_test().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ─── 歷史與剪貼簿 ────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn get_history(n: usize) -> Vec<serde_json::Value> {
+    history::read_recent(n.min(500), &history::history_path())
+}
+
+#[tauri::command]
+fn copy_text(text: String) -> Result<(), String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(text))
+        .map_err(|e| e.to_string())
+}
+
+// ─── 熱鍵 ─────────────────────────────────────────────────────────────────────
+
 static HOTKEY_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn wire_hotkey(core: &Arc<pipeline::Core>) -> Result<(), String> {
+    let service = hotkey::start().map_err(|e| e.to_string())?;
+    HOTKEY_ACTIVE.store(true, Ordering::SeqCst);
+    let tx = core.msg_tx.clone();
+    let events = service.events;
+    std::thread::spawn(move || {
+        for ev in events {
+            if tx.send(pipeline::Msg::Hotkey(ev)).is_err() {
+                break;
+            }
+        }
+    });
+    *core.esc_ctl.lock().unwrap() = service.esc_ctl;
+    Ok(())
+}
+
+/// 使用者授予輔助使用權限後，不用重啟就能啟用熱鍵。
+#[tauri::command]
+fn retry_hotkey(state: tauri::State<AppState>) -> Result<bool, String> {
+    if HOTKEY_ACTIVE.load(Ordering::SeqCst) {
+        return Ok(true);
+    }
+    if !accessibility_trusted() {
+        return Ok(false);
+    }
+    wire_hotkey(&state.core)?;
+    Ok(true)
+}
+
+// ─── 進入點 ───────────────────────────────────────────────────────────────────
 
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -204,10 +364,9 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
-
+/// 所有重初始化（引擎、overlay、熱鍵、預載）都在這裡——
+/// 必須在 single-instance 檢查之後才跑，第二個實例才不會 spawn 任何東西。
+fn init_core(app: &tauri::AppHandle) {
     let cfg = settings::Settings::load();
     let spec = registry::resolve(&cfg.whisper_model());
     tracing::info!("Claro starting — whisper model: {}", spec.id);
@@ -220,44 +379,29 @@ pub fn run() {
 
     let overlay = overlay_client::OverlayClient::start();
     let (msg_tx, msg_rx) = crossbeam_channel::unbounded::<pipeline::Msg>();
-
-    // 熱鍵：Accessibility 未授權時降級啟動（UI 會顯示指引，授權後重啟生效）
-    let esc_ctl = match hotkey::start() {
-        Ok(service) => {
-            HOTKEY_ACTIVE.store(true, Ordering::SeqCst);
-            let tx = msg_tx.clone();
-            let events = service.events;
-            std::thread::spawn(move || {
-                for ev in events {
-                    if tx.send(pipeline::Msg::Hotkey(ev)).is_err() {
-                        break;
-                    }
-                }
-            });
-            service.esc_ctl
-        }
-        Err(e) => {
-            tracing::warn!("hotkey unavailable ({e}) — grant Accessibility and restart");
-            let (dummy_tx, _dummy_rx) = crossbeam_channel::unbounded();
-            dummy_tx
-        }
-    };
+    let (dummy_esc, _keep) = crossbeam_channel::unbounded();
+    std::mem::forget(_keep); // 佔位 receiver；wire_hotkey 成功後會被真的 sender 換掉
 
     let core = Arc::new(pipeline::Core::new(
         engine,
+        spec,
         overlay,
         Box::new(inject::MacPasteInjector),
-        esc_ctl,
+        dummy_esc,
         msg_tx.clone(),
         cfg.input_device(),
     ));
+
+    if let Err(e) = wire_hotkey(&core) {
+        tracing::warn!("hotkey unavailable ({e}) — grant Accessibility, then use設定頁「重試」");
+    }
 
     {
         let core = core.clone();
         std::thread::spawn(move || pipeline::run_dispatcher(core, msg_rx));
     }
 
-    // 模型預載（prototype 行為：啟動即背景載入，首次聽寫不用等）
+    // 模型預載（啟動即背景載入，首次聽寫不用等）
     {
         let core = core.clone();
         let model_path = registry::model_path(spec);
@@ -272,48 +416,61 @@ pub fn run() {
         });
     }
 
-    let state = AppState {
-        core: core.clone(),
-        model_spec: spec,
-        downloading: Arc::new(AtomicBool::new(false)),
+    // SIGTERM/SIGINT：走 AppHandle::exit 優雅收場（直接 exit 會觸發 crash reporter）
+    {
+        let core = core.clone();
+        let handle = app.clone();
+        if let Err(e) = ctrlc::set_handler(move || {
+            core.overlay.stop();
+            handle.exit(0);
+        }) {
+            tracing::warn!("signal handler setup failed: {e}");
+        }
+    }
+
+    app.manage(AppState {
+        core,
+        downloading: Arc::new(Mutex::new(None)),
         mic_test: Arc::new(Mutex::new(None)),
-    };
+    });
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
 
     tauri::Builder::default()
+        // 防雙開（雙實例會雙重貼上）；二度啟動時喚出既有視窗。必須是第一個 plugin。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
-        .manage(state)
         .invoke_handler(tauri::generate_handler![
             get_status,
             set_input_device,
             mic_test_start,
             mic_test_stop,
+            list_models,
             download_model,
+            set_model,
+            delete_model,
+            get_llm_config,
+            set_llm_config,
+            set_llm_key,
+            test_polish,
             get_history,
-            copy_text
+            copy_text,
+            retry_hotkey
         ])
-        .setup({
-            let signal_core = core.clone();
-            move |app| {
-                // CLARO_DEVTOOLS=1 時自動打開 inspector（除錯 webview 白屏用）
-                if std::env::var("CLARO_DEVTOOLS").as_deref() == Ok("1") {
-                    if let Some(w) = app.get_webview_window("main") {
-                        w.open_devtools();
-                    }
+        .setup(|app| {
+            init_core(app.handle());
+            if std::env::var("CLARO_DEVTOOLS").as_deref() == Ok("1") {
+                if let Some(w) = app.get_webview_window("main") {
+                    w.open_devtools();
                 }
-                // SIGTERM/SIGINT（mic_indicator 的「結束 Claro」走 SIGTERM）。
-                // 必須走 AppHandle::exit 讓事件迴圈優雅收場——
-                // 從 signal 執行緒直接 std::process::exit 會觸發 macOS crash reporter。
-                let handle = app.handle().clone();
-                if let Err(e) = ctrlc::set_handler(move || {
-                    signal_core.overlay.stop();
-                    handle.exit(0);
-                }) {
-                    tracing::warn!("signal handler setup failed: {e}");
-                }
-                Ok(())
             }
+            Ok(())
         })
-        // 關窗＝隱藏（背景工具不退出）；Dock 點擊（Reopen）再顯示。Cmd+Q 正常退出。
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
@@ -326,7 +483,14 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => show_main_window(app),
             tauri::RunEvent::Exit => {
-                core.overlay.stop();
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.core.overlay.stop();
+                    // 主動釋放 whisper/Metal 資源：留給 atexit teardown 會 ggml_abort
+                    // （SIGABRT + crash report）。轉錄中拿不到鎖就算了。
+                    if let Ok(mut engine) = state.core.engine.try_lock() {
+                        engine.unload();
+                    }
+                }
             }
             _ => {}
         });

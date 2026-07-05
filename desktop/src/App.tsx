@@ -149,7 +149,13 @@ export default function App() {
           ) : page === "history" ? (
             <History onCopied={() => showToast("已複製")} />
           ) : (
-            <Settings status={status} mic={mic} progress={progress} refresh={refresh} />
+            <Settings
+              status={status}
+              mic={mic}
+              progress={progress}
+              refresh={refresh}
+              onToast={showToast}
+            />
           )}
         </div>
       </main>
