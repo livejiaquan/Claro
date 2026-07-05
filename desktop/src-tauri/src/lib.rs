@@ -11,16 +11,20 @@ pub mod stt;
 pub mod textproc;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
+use crate::audio::CaptureHandle;
+use crate::state_machine::State;
 use crate::stt::registry::{self, ModelSpec};
 
 struct AppState {
+    core: Arc<pipeline::Core>,
     model_spec: &'static ModelSpec,
     downloading: Arc<AtomicBool>,
+    mic_test: Arc<Mutex<Option<CaptureHandle>>>,
 }
 
 #[derive(Serialize)]
@@ -30,6 +34,12 @@ struct Status {
     model_approx_mb: u64,
     accessibility: bool,
     hotkey_active: bool,
+    /// 使用者在設定中選的裝置（null = 跟隨系統預設）
+    input_device: Option<String>,
+    /// 系統目前的預設輸入裝置
+    default_input: Option<String>,
+    input_devices: Vec<String>,
+    dictation_state: &'static str,
 }
 
 fn accessibility_trusted() -> bool {
@@ -46,12 +56,84 @@ fn accessibility_trusted() -> bool {
 #[tauri::command]
 fn get_status(state: tauri::State<AppState>) -> Status {
     let spec = state.model_spec;
+    let dictation_state = match state.core.sm.lock().unwrap().state() {
+        State::Idle => "idle",
+        State::Hold | State::Handsfree => "recording",
+        State::Processing => "processing",
+    };
     Status {
         model_id: spec.id.to_string(),
         model_present: registry::model_path(spec).exists(),
         model_approx_mb: spec.approx_bytes / 1_048_576,
         accessibility: accessibility_trusted(),
         hotkey_active: HOTKEY_ACTIVE.load(Ordering::SeqCst),
+        input_device: state.core.input_device.lock().unwrap().clone(),
+        default_input: audio::default_input_name(),
+        input_devices: audio::list_input_devices(),
+        dictation_state,
+    }
+}
+
+/// 空字串 = 跟隨系統預設。即時生效並持久化到 config。
+#[tauri::command]
+fn set_input_device(name: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let selection = if name.is_empty() { None } else { Some(name.clone()) };
+    *state.core.input_device.lock().unwrap() = selection;
+    settings::update_config_key(
+        &settings::config_path(),
+        "input_device",
+        serde_json::Value::String(name),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize, Clone)]
+struct MicLevel {
+    level: f32,
+    active: bool,
+}
+
+/// 麥克風測試：開始擷取並以 "mic-level" 事件串流電平（50ms 一次，30s 自動停）。
+#[tauri::command]
+fn mic_test_start(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+    if state.core.sm.lock().unwrap().state() != State::Idle {
+        return Err("聽寫進行中，無法測試麥克風".into());
+    }
+    let mut guard = state.mic_test.lock().unwrap();
+    if guard.is_some() {
+        return Ok(());
+    }
+    let device = state.core.input_device.lock().unwrap().clone();
+    let handle = audio::start_capture(device).map_err(|e| e.to_string())?;
+    let level = handle.level_handle();
+    *guard = Some(handle);
+    drop(guard);
+
+    let mic_test = state.mic_test.clone();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        loop {
+            if mic_test.lock().unwrap().is_none() {
+                break; // 已被 mic_test_stop 收走
+            }
+            if started.elapsed().as_secs() >= 30 {
+                if let Some(h) = mic_test.lock().unwrap().take() {
+                    let _ = h.stop();
+                }
+                break;
+            }
+            let _ = app.emit("mic-level", MicLevel { level: level.get(), active: true });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = app.emit("mic-level", MicLevel { level: 0.0, active: false });
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn mic_test_stop(state: tauri::State<AppState>) {
+    if let Some(h) = state.mic_test.lock().unwrap().take() {
+        let _ = h.stop();
     }
 }
 
@@ -101,6 +183,13 @@ fn download_model(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
 
 static HOTKEY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
@@ -146,6 +235,7 @@ pub fn run() {
         Box::new(inject::MacPasteInjector),
         esc_ctl,
         msg_tx.clone(),
+        cfg.input_device(),
     ));
 
     {
@@ -180,32 +270,43 @@ pub fn run() {
     }
 
     let state = AppState {
+        core: core.clone(),
         model_spec: spec,
         downloading: Arc::new(AtomicBool::new(false)),
+        mic_test: Arc::new(Mutex::new(None)),
     };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(state)
-        .invoke_handler(tauri::generate_handler![get_status, download_model])
+        .invoke_handler(tauri::generate_handler![
+            get_status,
+            set_input_device,
+            mic_test_start,
+            mic_test_stop,
+            download_model
+        ])
         .setup(|app| {
             // CLARO_DEVTOOLS=1 時自動打開 inspector（除錯 webview 白屏用）
             if std::env::var("CLARO_DEVTOOLS").as_deref() == Ok("1") {
-                use tauri::Manager;
                 if let Some(w) = app.get_webview_window("main") {
                     w.open_devtools();
                 }
             }
             Ok(())
         })
+        // 關窗＝隱藏（背景工具不退出）；Dock 點擊（Reopen）再顯示。Cmd+Q 正常退出。
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(move |_app, event| match event {
-            // 關掉視窗 ≠ 結束 app（背景聽寫工具）；只有明確 exit（Cmd+Q、SIGTERM、
-            // mic_indicator 選單）才真的退出
-            tauri::RunEvent::ExitRequested { code: None, api, .. } => {
-                api.prevent_exit();
-            }
+        .run(move |app, event| match event {
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => show_main_window(app),
             tauri::RunEvent::Exit => {
                 core.overlay.stop();
             }

@@ -137,9 +137,34 @@ impl CaptureHandle {
     }
 }
 
+/// 列出可用輸入裝置名稱（給設定 UI）
+pub fn list_input_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    host.input_devices()
+        .map(|it| it.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// 系統預設輸入裝置名稱
+pub fn default_input_name() -> Option<String> {
+    cpal::default_host().default_input_device()?.name().ok()
+}
+
+fn pick_device(host: &cpal::Host, preferred: Option<&str>) -> Option<cpal::Device> {
+    if let Some(name) = preferred {
+        if let Ok(mut devices) = host.input_devices() {
+            if let Some(d) = devices.find(|d| d.name().map(|n| n == name).unwrap_or(false)) {
+                return Some(d);
+            }
+        }
+        tracing::warn!("input device '{name}' not found, falling back to default");
+    }
+    host.default_input_device()
+}
+
 /// 開始錄音：專屬執行緒持有 cpal stream，收 mono 原生率樣本；
-/// stop() 後重採樣到 16k 返回。
-pub fn start_capture() -> Result<CaptureHandle> {
+/// stop() 後重採樣到 16k 返回。preferred_device 找不到時退回系統預設。
+pub fn start_capture(preferred_device: Option<String>) -> Result<CaptureHandle> {
     let (stop_tx, stop_rx) = bounded::<()>(1);
     let (ready_tx, ready_rx) = bounded::<Result<()>>(1);
     let level = Arc::new(AtomicLevel::default());
@@ -147,13 +172,16 @@ pub fn start_capture() -> Result<CaptureHandle> {
 
     let join = std::thread::spawn(move || -> Result<Vec<f32>> {
         let host = cpal::default_host();
-        let device = match host.default_input_device() {
+        let device = match pick_device(&host, preferred_device.as_deref()) {
             Some(d) => d,
             None => {
-                let _ = ready_tx.send(Err(anyhow!("no default input device")));
-                return Err(anyhow!("no default input device"));
+                let _ = ready_tx.send(Err(anyhow!("no input device available")));
+                return Err(anyhow!("no input device available"));
             }
         };
+        if let Ok(name) = device.name() {
+            tracing::info!("capturing from input device: {name}");
+        }
         let config = match device.default_input_config() {
             Ok(c) => c,
             Err(e) => {

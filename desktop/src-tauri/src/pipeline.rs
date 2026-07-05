@@ -31,6 +31,8 @@ pub struct Core {
     pub dict: Vec<(String, String)>,
     pub esc_ctl: crossbeam_channel::Sender<EscControl>,
     pub msg_tx: crossbeam_channel::Sender<Msg>,
+    /// 使用者指定的輸入裝置（None = 系統預設）；設定 UI 可即時更新
+    pub input_device: Mutex<Option<String>>,
 
     capture: Mutex<Option<CaptureHandle>>,
     recording_flag: Arc<AtomicBool>,
@@ -44,6 +46,7 @@ impl Core {
         injector: Box<dyn TextInjector>,
         esc_ctl: crossbeam_channel::Sender<EscControl>,
         msg_tx: crossbeam_channel::Sender<Msg>,
+        input_device: Option<String>,
     ) -> Self {
         Self {
             sm: Mutex::new(DictationStateMachine::new()),
@@ -53,6 +56,7 @@ impl Core {
             dict: textproc::default_dict(),
             esc_ctl,
             msg_tx,
+            input_device: Mutex::new(input_device),
             capture: Mutex::new(None),
             recording_flag: Arc::new(AtomicBool::new(false)),
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
@@ -120,7 +124,8 @@ pub fn run_dispatcher(core: Arc<Core>, rx: crossbeam_channel::Receiver<Msg>) {
 }
 
 fn start_recording(core: &Arc<Core>) {
-    match audio::start_capture() {
+    let device = core.input_device.lock().unwrap().clone();
+    match audio::start_capture(device) {
         Ok(handle) => {
             core.recording_flag.store(true, Ordering::SeqCst);
             let level = handle.level_handle();

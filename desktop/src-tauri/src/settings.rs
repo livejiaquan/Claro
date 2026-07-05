@@ -103,6 +103,36 @@ impl Settings {
     pub fn llm_enabled(&self) -> bool {
         self.raw.get("llm_enabled").and_then(Value::as_bool).unwrap_or(true)
     }
+
+    /// 使用者指定的輸入裝置（缺省 = 系統預設）
+    pub fn input_device(&self) -> Option<String> {
+        self.raw
+            .get("input_device")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+}
+
+/// 更新單一設定鍵並寫回（保留未知欄位、0600）。
+pub fn update_config_key(path: &Path, key: &str, value: Value) -> anyhow::Result<()> {
+    let mut cfg = load_config(path);
+    cfg.insert(key.to_string(), value);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let mut s = serde_json::to_string_pretty(&Value::Object(cfg))?;
+    s.push('\n');
+    f.write_all(s.as_bytes())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -144,6 +174,21 @@ mod tests {
         fs::write(&path, "{not json!!").unwrap();
         let cfg = load_config(&path);
         assert_eq!(cfg.get("whisper_model").unwrap(), "large-v3-turbo");
+    }
+
+    // update_config_key：改一鍵、留其餘（含未知鍵）、權限 0600
+    #[test]
+    fn update_config_key_preserves_other_fields() {
+        let dir = tempdir();
+        let path = dir.join("config.json");
+        fs::write(&path, r#"{"future_field": 42, "llm_enabled": false}"#).unwrap();
+        update_config_key(&path, "input_device", serde_json::json!("MacBook Pro麥克風")).unwrap();
+        let cfg = load_config(&path);
+        assert_eq!(cfg.get("input_device").unwrap(), "MacBook Pro麥克風");
+        assert_eq!(cfg.get("future_field").unwrap(), 42);
+        assert_eq!(cfg.get("llm_enabled").unwrap(), false);
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     // 對應 test_unknown_keys_are_preserved_in_returned_config
