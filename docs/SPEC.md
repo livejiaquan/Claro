@@ -153,12 +153,15 @@ pub trait TextInjector: Send + Sync {
 
 ### Polisher providers
 
-| Provider | 說明 | 預設 |
+| Provider | 說明 | 定位 |
 |---|---|---|
-| `llamacpp` | 內嵌 llama.cpp，GGUF（預設 Qwen3-4B-Instruct Q4；8GB 機器 Qwen3-1.7B） | ✅（下載經同意） |
-| `ollama` | localhost:11434，自動偵測，模型任選 | 偵測到才顯示 |
-| `openai-compat` | BYOK：Base URL / API Key / Model 全可設（OpenAI/Groq/DeepSeek/自架皆可） | 關 |
-| `off` | 純轉錄 | — |
+| `apple` | Apple Intelligence 端上模型（FoundationModels，macOS 26+）：零下載、零常駐 RAM（系統程序/ANE）、離線免費、繁中支援（26.1+）。in-process Swift bridge＋弱連結（Handy 實證模式），偵測 `appleIntelligenceNotEnabled` 並引導開啟 | 可用時的推薦預設 |
+| `llamacpp` | 內嵌 llama.cpp（`llama-cpp-2`，Metal），GGUF 預設 Qwen3-4B-Instruct-2507 Q4（~2.4GB，下載經同意）；閒置卸載（watcher 同 STT，預設 5 分鐘） | macOS <26 或未啟用 Apple Intelligence 時的推薦 |
+| `ollama` | localhost:11434，自動偵測，模型任選 | 進階選項（**永不要求使用者安裝**） |
+| `openai-compat` | BYOK：Base URL / API Key / Model 全可設（OpenAI/Groq/DeepSeek/LM Studio/自架皆可） | 進階選項 |
+| `off` | 純轉錄 | 出廠預設（隱私鐵律：不靜默連任何端點） |
+
+選型依據與競品證據：`docs/research/llm-polish-runtime.md`（2026-07-06）。
 
 prototype 教訓：1.5B 級模型會洩漏提示詞、亂加列表符號 → 預設 4B 級；防呆全保留（空輸出、長度 > max(3×, +200) → 退回原文）。API key 存 macOS Keychain，不進 JSON。
 
@@ -230,7 +233,7 @@ prototype 教訓：1.5B 級模型會洩漏提示詞、亂加列表符號 → 預
 |---|---|---|
 | D1 | Python/MLX → Tauri/Rust 重寫；prototype 凍結為參考實作 | Phase 0 提案，待使用者確認 |
 | D2 | 上下文預設 AX、不截圖；截圖+VLM 為 post-v0.1 選項 | 已定 |
-| D3 | 潤飾預設內嵌 llama.cpp（開箱即用），Ollama/BYOK 為選項 | 已定；M4 spike 驗證二進位大小與建置複雜度 |
+| D3 | 潤飾「零安裝」雙軌：macOS 26+ 推薦 Apple Intelligence（FoundationModels in-process Swift bridge＋弱連結）；其餘內嵌 llama.cpp（`llama-cpp-2`/Metal，Qwen3-4B-Instruct-2507 Q4）。Ollama/BYOK 降為進階選項，**永不要求裝 Ollama**。內嵌引擎閒置卸載沿用 Handy watcher 模式 | **已定（2026-07-06 研究定案，見 `docs/research/llm-polish-runtime.md`）**；M4 實作，llama.cpp 二進位大小於實作時驗證 |
 | D4 | overlay 用 `tauri-nspanel`（NSPanel）＋自行補滑鼠穿透 | **已定**（Handy 實證；穿透是 Handy 缺口） |
 | D5 | STT 推理 crate：`transcribe-cpp`（Whisper/Metal）＋ `transcribe-rs`（ONNX：Parakeet/Moonshine/SenseVoice） | **已定**（Handy 實證） |
 | D6 | OpenCC Rust 選型（opencc-rust vs 純 Rust 實作） | M4 定案 |

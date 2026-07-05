@@ -49,7 +49,7 @@
 **目標**：潤飾品質對齊原型、CJK 處理超越所有競品。
 
 範圍：
-- `polish`：`Polisher` trait；providers：內嵌 llama.cpp（預設，Qwen 系列 GGUF）、Ollama（HTTP）、OpenAI-compatible BYOK（Base URL / Key / Model 可設）、off
+- `polish`：`Polisher` trait；providers（SPEC D3，2026-07-06 定案）：Apple Intelligence（FoundationModels，macOS 26+，Swift bridge＋弱連結）、內嵌 llama.cpp（`llama-cpp-2`/Metal，Qwen3-4B-Instruct-2507 Q4，閒置卸載）、Ollama（HTTP，進階）、OpenAI-compatible BYOK（進階）、off；Ollama/自訂已於 M2 提前上線
 - 保守糾錯 prompt：移植原型 prompt＋吸收 yetone「只修不改寫」設計；防呆（長度爆炸/空輸出退回原文）
 - OpenCC s2twp 終盤繁化（Rust 綁定或 vendored）
 - CJK 貼上防護：偵測當前輸入法，CJK IME 時暫切 ABC → 貼上 → 還原（yetone 技巧）
@@ -107,6 +107,6 @@
 - [x] M1 —（2026-07-05）42 項 Rust 測試綠；全自動 e2e（合成熱鍵＋TTS 過內建麥克風）驗證免持路徑逐字正確；產品級 UI（側欄＋首頁統計＋歷史＋設定，Handy/Typeless 風格經使用者確認）；overlay 沿用 prototype 膠囊。PTT 按住路徑由使用者真手驗收。
 - [ ] M2 — **大部分完成（2026-07-05）**：App icon＋品牌；模型庫 6 個 whisper 變體（含 q5 量化），逐一下載/切換/刪除、引擎熱換免重啟；**AI 潤飾提前上線**（M4 前移）：off/Ollama/自訂 OpenAI-compatible，API key 進鑰匙圈，保守糾錯 prompt＋防呆（mock server 三路徑驗證），設定頁一鍵測試；CJK 標點正規化；single-instance 防雙開；SIGTERM/退出的 Metal teardown 修復（零 crash report）；權限授予後熱鍵免重啟重試。**剩**：SenseVoice/Moonshine（ONNX 引擎）、依 RAM 推薦預設、閒置卸載、字典 UI。
 - [ ] M3
-- [ ] M4
+- [ ] M4 — 前置研究完成（2026-07-06）：潤飾 runtime 選型定案（SPEC D3 改版），競品證據與本機 FoundationModels 實測見 `docs/research/llm-polish-runtime.md`；本機（M4/macOS 26.6）實測回報 `appleIntelligenceNotEnabled`，UI 需偵測引導
 - [ ] M5
 - [ ] M6
