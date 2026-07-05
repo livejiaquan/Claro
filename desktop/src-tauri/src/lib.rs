@@ -298,10 +298,15 @@ async fn list_provider_models(provider: String) -> Result<Vec<String>, String> {
 
 #[tauri::command]
 fn set_llm_config(provider: String, model: String, base_url: String) -> Result<(), String> {
-    let path = settings::config_path();
-    settings::update_config_key(&path, "llm_provider", provider.into()).map_err(|e| e.to_string())?;
-    settings::update_config_key(&path, "llm_polish_model", model.into()).map_err(|e| e.to_string())?;
-    settings::update_config_key(&path, "llm_base_url", base_url.into()).map_err(|e| e.to_string())
+    settings::update_config_keys(
+        &settings::config_path(),
+        vec![
+            ("llm_provider".into(), provider.into()),
+            ("llm_polish_model".into(), model.into()),
+            ("llm_base_url".into(), base_url.into()),
+        ],
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

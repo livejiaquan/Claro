@@ -143,8 +143,16 @@ impl Settings {
 
 /// 更新單一設定鍵並寫回（保留未知欄位、0600）。
 pub fn update_config_key(path: &Path, key: &str, value: Value) -> anyhow::Result<()> {
+    update_config_keys(path, vec![(key.to_string(), value)])
+}
+
+/// 一次更新多個設定鍵、單次寫回——多鍵設定（如 LLM provider/model/base_url）
+/// 必須原子成組寫入，分次寫會在連續操作時留下混搭的中間狀態。
+pub fn update_config_keys(path: &Path, pairs: Vec<(String, Value)>) -> anyhow::Result<()> {
     let mut cfg = load_config(path);
-    cfg.insert(key.to_string(), value);
+    for (key, value) in pairs {
+        cfg.insert(key, value);
+    }
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;

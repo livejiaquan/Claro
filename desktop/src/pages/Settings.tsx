@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { DownloadProgress, LlmConfig, MicLevel, ModelInfo, Status } from "../types";
 import { Hotkey, LevelBar, Row, Section } from "../ui";
 
@@ -32,8 +32,9 @@ export default function Settings({
   const [keyDraft, setKeyDraft] = useState("");
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
-  const [localModels, setLocalModels] = useState<string[] | null>(null);
-  const [localModelsErr, setLocalModelsErr] = useState<string | null>(null);
+  // 清單/錯誤都綁 provider：偵測回應晚到時不能污染已切換的 provider（race）
+  const [localModels, setLocalModels] = useState<{ provider: string; models: string[] } | null>(null);
+  const [localModelsErr, setLocalModelsErr] = useState<{ provider: string; msg: string } | null>(null);
 
   const loadModels = () => invoke<ModelInfo[]>("list_models").then(setModels).catch(() => {});
   const loadLlm = () => invoke<LlmConfig>("get_llm_config").then(setLlm).catch(() => {});
@@ -42,8 +43,8 @@ export default function Settings({
     setLocalModels(null);
     setLocalModelsErr(null);
     invoke<string[]>("list_provider_models", { provider })
-      .then(setLocalModels)
-      .catch((e) => setLocalModelsErr(String(e)));
+      .then((models) => setLocalModels({ provider, models }))
+      .catch((e) => setLocalModelsErr({ provider, msg: String(e) }));
   };
 
   useEffect(() => {
@@ -74,16 +75,26 @@ export default function Settings({
       .catch((e) => setError(String(e)));
   };
 
+  // 連續操作（選 preset 後馬上改欄位）的兩道防線：
+  // 1) llmRef 即時反映最新值——閉包裡的舊 llm 不會把欄位倒退
+  // 2) 寫入請求串行化——舊請求不會晚到蓋掉新請求
+  const llmRef = useRef<LlmConfig | null>(null);
+  llmRef.current = llm;
+  const llmSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
   const saveLlm = (next: Partial<LlmConfig>) => {
-    if (!llm) return;
-    const merged = { ...llm, ...next };
+    const cur = llmRef.current;
+    if (!cur) return;
+    const merged = { ...cur, ...next };
+    llmRef.current = merged;
     setLlm(merged);
     setTestResult(null);
-    invoke("set_llm_config", {
-      provider: merged.provider,
-      model: merged.model,
-      baseUrl: merged.base_url,
-    }).catch((e) => setError(String(e)));
+    llmSaveQueue.current = llmSaveQueue.current.then(() =>
+      invoke("set_llm_config", {
+        provider: merged.provider,
+        model: merged.model,
+        baseUrl: merged.base_url,
+      }).catch((e) => setError(String(e))),
+    );
   };
 
   const saveKey = () => {
@@ -281,53 +292,58 @@ export default function Settings({
           </Row>
         )}
 
-        {llm && (llm.provider === "ollama" || llm.provider === "lmstudio") && (
-          <Row
-            label="模型"
-            sub={
-              localModelsErr
-                ? llm.provider === "ollama"
-                  ? "未偵測到 Ollama——先安裝並啟動（brew install ollama），再按「重新偵測」。"
-                  : "未偵測到 LM Studio——先啟動它的本機伺服器（Developer → Start Server），再按「重新偵測」。"
-                : localModels && localModels.length === 0
+        {llm && (llm.provider === "ollama" || llm.provider === "lmstudio") && (() => {
+          // 只採用「屬於目前 provider」的偵測結果——晚到的舊回應直接無視
+          const detected = localModels?.provider === llm.provider ? localModels.models : null;
+          const detectErr = localModelsErr?.provider === llm.provider ? localModelsErr.msg : null;
+          return (
+            <Row
+              label="模型"
+              sub={
+                detectErr
                   ? llm.provider === "ollama"
-                    ? "服務在跑但沒有模型——先 ollama pull qwen3:4b。"
-                    : "服務在跑但沒有載入模型——在 LM Studio 載入一個模型。"
-                  : "建議 4B 級以上的指令模型，例如 qwen3:4b。"
-            }
-          >
-            <div className="flex items-center gap-2">
-              {localModels && localModels.length > 0 ? (
-                <select
-                  className="select no-drag"
-                  style={{ minWidth: 200 }}
-                  value={llm.model}
-                  onChange={(e) => saveLlm({ model: e.target.value })}
-                >
-                  {!localModels.includes(llm.model) && (
-                    <option value={llm.model}>{llm.model || "— 選擇模型 —"}</option>
-                  )}
-                  {localModels.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <input
-                  className="select no-drag"
-                  style={{ minWidth: 200 }}
-                  value={llm.model}
-                  placeholder="qwen3:4b"
-                  onChange={(e) => saveLlm({ model: e.target.value })}
-                />
-              )}
-              <button className="btn no-drag" onClick={() => loadLocalModels(llm.provider)}>
-                重新偵測
-              </button>
-            </div>
-          </Row>
-        )}
+                    ? "未偵測到 Ollama——先安裝並啟動（brew install ollama），再按「重新偵測」。"
+                    : "未偵測到 LM Studio——先啟動它的本機伺服器（Developer → Start Server），再按「重新偵測」。"
+                  : detected && detected.length === 0
+                    ? llm.provider === "ollama"
+                      ? "服務在跑但沒有模型——先 ollama pull qwen3:4b。"
+                      : "服務在跑但沒有載入模型——在 LM Studio 載入一個模型。"
+                    : "建議 4B 級以上的指令模型，例如 qwen3:4b。"
+              }
+            >
+              <div className="flex items-center gap-2">
+                {detected && detected.length > 0 ? (
+                  <select
+                    className="select no-drag"
+                    style={{ minWidth: 200 }}
+                    value={llm.model}
+                    onChange={(e) => saveLlm({ model: e.target.value })}
+                  >
+                    {!detected.includes(llm.model) && (
+                      <option value={llm.model}>{llm.model || "— 選擇模型 —"}</option>
+                    )}
+                    {detected.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    className="select no-drag"
+                    style={{ minWidth: 200 }}
+                    value={llm.model}
+                    placeholder="qwen3:4b"
+                    onChange={(e) => saveLlm({ model: e.target.value })}
+                  />
+                )}
+                <button className="btn no-drag" onClick={() => loadLocalModels(llm.provider)}>
+                  重新偵測
+                </button>
+              </div>
+            </Row>
+          );
+        })()}
 
         {llm?.provider === "custom" && (
           <>
