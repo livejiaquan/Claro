@@ -157,8 +157,9 @@ pub trait TextInjector: Send + Sync {
 |---|---|---|
 | `apple` | Apple Intelligence 端上模型（FoundationModels，macOS 26+）：零下載、零常駐 RAM（系統程序/ANE）、離線免費、繁中支援（26.1+）。in-process Swift bridge＋弱連結（Handy 實證模式），偵測 `appleIntelligenceNotEnabled` 並引導開啟 | 可用時的推薦預設 |
 | `llamacpp` | 內嵌 llama.cpp（`llama-cpp-2`，Metal），GGUF 預設 Qwen3-4B-Instruct-2507 Q4（~2.4GB，下載經同意）；閒置卸載（watcher 同 STT，預設 5 分鐘） | macOS <26 或未啟用 Apple Intelligence 時的推薦 |
-| `ollama` | localhost:11434，自動偵測，模型任選 | 進階選項（**永不要求使用者安裝**） |
-| `openai-compat` | BYOK：Base URL / API Key / Model 全可設（OpenAI/Groq/DeepSeek/LM Studio/自架皆可） | 進階選項 |
+| `ollama` | localhost:11434，模型清單自動偵測（/api/tags） | 進階選項（**永不要求使用者安裝**） |
+| `lmstudio` | localhost:1234，模型清單自動偵測（/v1/models） | 進階選項 |
+| `openai-compat` | BYOK：Base URL / API Key / Model 全可設；UI 內建 OpenAI/Anthropic/Groq/DeepSeek/Gemini/OpenRouter preset | 進階選項 |
 | `off` | 純轉錄 | 出廠預設（隱私鐵律：不靜默連任何端點） |
 
 選型依據與競品證據：`docs/research/llm-polish-runtime.md`（2026-07-06）。
