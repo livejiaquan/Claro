@@ -44,7 +44,7 @@ fn find_indicator() -> Option<PathBuf> {
 }
 
 pub struct OverlayClient {
-    child: Option<Child>,
+    child: std::sync::Mutex<Option<Child>>,
 }
 
 impl OverlayClient {
@@ -63,7 +63,7 @@ impl OverlayClient {
                 None
             }
         };
-        Self { child }
+        Self { child: std::sync::Mutex::new(child) }
     }
 
     /// 送命令；任何錯誤都吞掉（overlay 掛了不影響聽寫）。
@@ -78,8 +78,9 @@ impl OverlayClient {
         stream.write_all(format!("{command}\n").as_bytes())
     }
 
-    pub fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
+    pub fn stop(&self) {
+        let taken = self.child.lock().ok().and_then(|mut c| c.take());
+        if let Some(mut child) = taken {
             let _ = Self::send_raw("quit");
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             loop {
@@ -100,6 +101,6 @@ impl OverlayClient {
 
 impl Drop for OverlayClient {
     fn drop(&mut self) {
-        self.stop();
+        OverlayClient::stop(self);
     }
 }

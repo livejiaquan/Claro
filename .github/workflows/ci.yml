@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths: ["desktop/**", ".github/workflows/ci.yml"]
+  pull_request:
+    paths: ["desktop/**", ".github/workflows/ci.yml"]
+
+jobs:
+  desktop:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Frontend build
+        working-directory: desktop
+        run: |
+          npm ci
+          npm run build
+
+      - name: Rust tests
+        working-directory: desktop/src-tauri
+        run: cargo test --lib

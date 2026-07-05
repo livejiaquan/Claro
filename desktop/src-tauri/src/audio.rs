@@ -119,6 +119,11 @@ impl CaptureHandle {
         self.level.get()
     }
 
+    /// 共享電平（給獨立的 poller 執行緒，capture handle 移交後仍可讀）
+    pub fn level_handle(&self) -> Arc<AtomicLevel> {
+        self.level.clone()
+    }
+
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
     }
