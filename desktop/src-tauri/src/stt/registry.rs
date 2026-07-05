@@ -49,12 +49,12 @@ pub const MODELS: &[ModelSpec] = &[
 
 const _: () = assert!(!HF.is_empty()); // HF 常數保留給 M2 目錄擴充
 
-/// config 值 → 模型 spec。prototype 舊值映射：
-/// "large-v3-mlx"（MLX repo 名）→ large-v3；未知值 → 預設 large-v3-turbo。
+/// config 值 → 模型 spec。prototype 舊值（*-mlx，MLX repo 名）一律映射到
+/// large-v3-turbo（SPEC 建議預設；避免逼使用者多下載 3.1GB 的 large-v3——
+/// 想用 large-v3 的人明確設 "large-v3" 即可）。未知值 → 預設 large-v3-turbo。
 pub fn resolve(config_value: &str) -> &'static ModelSpec {
     let id = match config_value {
-        "large-v3-mlx" => "large-v3",
-        "large-v3-turbo-mlx" => "large-v3-turbo",
+        "large-v3-mlx" | "large-v3-turbo-mlx" => "large-v3-turbo",
         other => other,
     };
     MODELS
@@ -84,8 +84,9 @@ mod tests {
 
     #[test]
     fn resolve_maps_legacy_mlx_values() {
-        assert_eq!(resolve("large-v3-mlx").id, "large-v3");
+        assert_eq!(resolve("large-v3-mlx").id, "large-v3-turbo");
         assert_eq!(resolve("large-v3-turbo").id, "large-v3-turbo");
+        assert_eq!(resolve("large-v3").id, "large-v3");
     }
 
     #[test]
