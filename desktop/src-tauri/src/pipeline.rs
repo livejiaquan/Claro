@@ -14,7 +14,10 @@ use crate::history::{self, NewEntry};
 use crate::hotkey::{EscControl, HotkeyMsg};
 use crate::inject::TextInjector;
 use crate::overlay_client::OverlayClient;
+use crate::polish;
+use crate::settings::Settings;
 use crate::state_machine::{DictationStateMachine, SmAction, State};
+use crate::stt::registry::ModelSpec;
 use crate::stt::SttEngine;
 use crate::textproc;
 
@@ -26,10 +29,13 @@ pub enum Msg {
 pub struct Core {
     pub sm: Mutex<DictationStateMachine>,
     pub engine: Mutex<Box<dyn SttEngine>>,
+    /// UI 顯示與模型管理用的「使用中模型」（與 engine 分開，避免轉錄中卡 get_status）
+    pub active_model: Mutex<&'static ModelSpec>,
     pub overlay: OverlayClient,
     pub injector: Box<dyn TextInjector>,
     pub dict: Vec<(String, String)>,
-    pub esc_ctl: crossbeam_channel::Sender<EscControl>,
+    /// 熱鍵服務可能在授權後重試重建，所以是 Mutex
+    pub esc_ctl: Mutex<crossbeam_channel::Sender<EscControl>>,
     pub msg_tx: crossbeam_channel::Sender<Msg>,
     /// 使用者指定的輸入裝置（None = 系統預設）；設定 UI 可即時更新
     pub input_device: Mutex<Option<String>>,
@@ -42,6 +48,7 @@ pub struct Core {
 impl Core {
     pub fn new(
         engine: Box<dyn SttEngine>,
+        active_model: &'static ModelSpec,
         overlay: OverlayClient,
         injector: Box<dyn TextInjector>,
         esc_ctl: crossbeam_channel::Sender<EscControl>,
@@ -51,10 +58,11 @@ impl Core {
         Self {
             sm: Mutex::new(DictationStateMachine::new()),
             engine: Mutex::new(engine),
+            active_model: Mutex::new(active_model),
             overlay,
             injector,
             dict: textproc::default_dict(),
-            esc_ctl,
+            esc_ctl: Mutex::new(esc_ctl),
             msg_tx,
             input_device: Mutex::new(input_device),
             capture: Mutex::new(None),
@@ -66,10 +74,28 @@ impl Core {
     /// 依狀態機現況同步 Esc 的攔截（非 IDLE 才攔，對應 prototype 條件式攔截）
     fn sync_esc(&self) {
         let state = self.sm.lock().unwrap().state();
-        let _ = self.esc_ctl.send(if state == State::Idle {
+        let _ = self.esc_ctl.lock().unwrap().send(if state == State::Idle {
             EscControl::Disarm
         } else {
             EscControl::Arm
+        });
+    }
+
+    /// 熱換 STT 模型：先丟舊引擎（避免雙駐留，Handy 實證），再背景載入新引擎。
+    pub fn swap_model(self: &Arc<Self>, spec: &'static ModelSpec) {
+        *self.active_model.lock().unwrap() = spec;
+        {
+            let mut engine = self.engine.lock().unwrap();
+            *engine = Box::new(crate::stt::whisper::WhisperEngine::new(
+                spec.id,
+                crate::stt::registry::model_path(spec),
+            ));
+        }
+        let core = self.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = core.engine.lock().unwrap().load() {
+                tracing::warn!("model preload after swap failed: {e}");
+            }
         });
     }
 }
@@ -242,7 +268,7 @@ fn process_session(core: &Arc<Core>, _session: u64, cancel: &AtomicBool) {
     };
     let stt_ms = t0.elapsed().as_millis() as u64;
 
-    let raw = textproc::to_traditional(&textproc::clean_transcript(&raw));
+    let raw = textproc::normalize_cjk_punct(&textproc::to_traditional(&textproc::clean_transcript(&raw)));
     if raw.is_empty() {
         core.overlay.send("error");
         let _ = history::append_entry(
@@ -252,9 +278,36 @@ fn process_session(core: &Arc<Core>, _session: u64, cancel: &AtomicBool) {
         return;
     }
 
-    // M1：確定性規則；LLM 潤飾在 M4 接上（SPEC §8）
-    let text = textproc::apply_dict(&raw, &core.dict);
-    let timings = Some(json!({ "stt_ms": stt_ms }));
+    let mut text = textproc::apply_dict(&raw, &core.dict);
+
+    // LLM 潤飾（使用者在設定中選擇；失敗一律退回原文，聽寫不因 LLM 而失敗）
+    let mut polish_ms: Option<u64> = None;
+    if let Some(polisher) = polish::from_settings(&Settings::load()) {
+        let t1 = Instant::now();
+        match polisher.polish(&text, "") {
+            Ok(p) => {
+                text = textproc::normalize_cjk_punct(&textproc::to_traditional(&p));
+                polish_ms = Some(t1.elapsed().as_millis() as u64);
+            }
+            Err(e) => tracing::warn!("polish failed, using raw transcript: {e}"),
+        }
+        // 潤飾期間使用者可能按了 Esc
+        if cancel.load(Ordering::SeqCst) {
+            let _ = history::append_entry(
+                NewEntry {
+                    raw: &raw,
+                    text: &text,
+                    duration_s: dur,
+                    status: "cancelled",
+                    timings: Some(json!({ "stt_ms": stt_ms, "polish_ms": polish_ms })),
+                },
+                &history::history_path(),
+            );
+            return;
+        }
+    }
+
+    let timings = Some(json!({ "stt_ms": stt_ms, "polish_ms": polish_ms }));
 
     if cancel.load(Ordering::SeqCst) {
         let _ = history::append_entry(
@@ -300,7 +353,7 @@ fn cancel_recording(core: &Arc<Core>) {
             .lock()
             .unwrap()
             .transcribe(&req)
-            .map(|t| textproc::to_traditional(&textproc::clean_transcript(&t)))
+            .map(|t| textproc::normalize_cjk_punct(&textproc::to_traditional(&textproc::clean_transcript(&t))))
             .unwrap_or_default();
         let _ = history::append_entry(
             NewEntry { raw: &raw, text: &raw, duration_s: dur, status: "cancelled", timings: None },
