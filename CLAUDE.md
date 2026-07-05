@@ -7,7 +7,8 @@ Claro：macOS 全本地語音輸入工具。按住熱鍵說話，放開後文字
 ## 目前狀態（隨里程碑更新）
 
 - **Phase 0 完成並經使用者核准（2026-07-05）**：規格見 `docs/SPEC.md`（技術真值來源，決策 D1–D10）、`docs/ROADMAP.md`（里程碑與進度）、`docs/COMPETITIVE_MATRIX.md`（定位）、`docs/research/`（競品原始碼分析）。
-- **M1 程式碼完成（2026-07-05），待使用者手動驗收**（授予輔助使用權限＋實際聽寫）：Tauri v2 重寫於 `desktop/`；Python/MLX 版凍結為 `prototype/`（行為真值來源，只修不增）。37 個 Rust 單元測試全綠；TTS 音檔端到端轉錄驗證過（中英混雜正確、繁體、Metal）。
+- **M1 完成、M2 大部分完成（2026-07-05）**：Tauri v2 重寫於 `desktop/`；Python/MLX 版凍結為 `prototype/`（行為真值來源，只修不增）。42 個 Rust 測試綠；e2e（合成熱鍵＋TTS 過麥克風）驗證過。UI 為產品級側欄式（Handy/Typeless 風格，使用者已確認方向；見記憶 claro-ui-taste）。模型管理（6 whisper 變體熱切換）與 AI 潤飾（off/Ollama/自訂 API，key 進鑰匙圈）已上線。潤飾驗證用 mock OpenAI server（`cargo run --example test_polish`）。
+- **已知地雷**：退出路徑必須先 `engine.unload()` 再走 AppHandle::exit——Metal 資源留給 atexit teardown 會 ggml_abort（SIGABRT+crash report）；signal handler 不可直接 std::process::exit（同樣炸）。重初始化一律放 tauri setup()（single-instance 檢查之後）。
 - M1 的 overlay 直接由 Rust spawn `prototype/mic_indicator`（同 socket 協議，動畫沿用——使用者指定）；Tauri 原生 overlay 延至 M5。
 
 ## Desktop（Tauri）常用指令
