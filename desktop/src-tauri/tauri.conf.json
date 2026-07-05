@@ -13,8 +13,15 @@
     "windows": [
       {
         "title": "Claro",
-        "width": 800,
-        "height": 600
+        "width": 460,
+        "height": 660,
+        "minWidth": 440,
+        "minHeight": 600,
+        "maxWidth": 560,
+        "resizable": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "backgroundColor": "#0d0b08"
       }
     ],
     "security": {

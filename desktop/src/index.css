@@ -1,1 +1,326 @@
 @import "tailwindcss";
+
+/* ── Claro 儀器面板設計系統 ─────────────────────────────────────────────── */
+
+:root {
+  --ink-0: #0d0b08; /* 機身墨黑（暖） */
+  --ink-1: #141109;
+  --ink-2: #1c1810;
+  --line: rgba(232, 220, 196, 0.08);
+  --line-strong: rgba(232, 220, 196, 0.16);
+  --paper: #ede5d4; /* 暖紙白文字 */
+  --muted: #90876f;
+  --faint: #5c553f;
+  --amber: #e8a33d; /* on-air 琥珀 */
+  --amber-soft: rgba(232, 163, 61, 0.14);
+  --moss: #9dc06c; /* 就緒綠 */
+  --moss-soft: rgba(157, 192, 108, 0.12);
+  --rec: #e0563f; /* 錄音紅 */
+  --rec-soft: rgba(224, 86, 63, 0.16);
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --serif: "Fraunces", "Songti TC", serif;
+  --sans: -apple-system, "PingFang TC", "Noto Sans TC", sans-serif;
+}
+
+html,
+body {
+  background: var(--ink-0);
+  color: var(--paper);
+  font-family: var(--sans);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+/* 機身：層疊光暈＋細噪點 */
+.chassis {
+  min-height: 100vh;
+  background:
+    radial-gradient(120% 90% at 50% -10%, rgba(232, 163, 61, 0.06), transparent 55%),
+    radial-gradient(140% 120% at 50% 115%, rgba(232, 220, 196, 0.04), transparent 60%),
+    var(--ink-0);
+  position: relative;
+}
+.chassis::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.35;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3CfeColorMatrix type='matrix' values='0 0 0 0 0.93 0 0 0 0 0.90 0 0 0 0 0.83 0 0 0 0.05 0'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* 拖曳區（無邊框視窗） */
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+.titlebar-drag button,
+.titlebar-drag select {
+  -webkit-app-region: no-drag;
+}
+
+.wordmark {
+  font-family: var(--serif);
+  font-style: italic;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: var(--paper);
+}
+
+.readout {
+  font-family: var(--mono);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+/* 狀態燈 */
+.lamp {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--faint);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4) inset;
+  transition: background 0.3s, box-shadow 0.3s;
+}
+.lamp.ok {
+  background: var(--moss);
+  box-shadow: 0 0 6px rgba(157, 192, 108, 0.55);
+}
+.lamp.warn {
+  background: var(--amber);
+  box-shadow: 0 0 6px rgba(232, 163, 61, 0.6);
+}
+.lamp.rec {
+  background: var(--rec);
+  box-shadow: 0 0 8px rgba(224, 86, 63, 0.7);
+  animation: lamp-pulse 1.1s ease-in-out infinite;
+}
+.lamp.busy {
+  background: var(--amber);
+  animation: lamp-pulse 0.8s ease-in-out infinite;
+}
+@keyframes lamp-pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* 示波器窗 */
+.scope {
+  position: relative;
+  border-block: 1px solid var(--line);
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.25), transparent 30%, transparent 70%, rgba(0, 0, 0, 0.25)),
+    var(--ink-1);
+  overflow: hidden;
+}
+.scope-ticks {
+  position: absolute;
+  inset-inline: 0;
+  bottom: 6px;
+  display: flex;
+  justify-content: space-between;
+  padding-inline: 14px;
+}
+.scope-ticks span {
+  width: 1px;
+  height: 5px;
+  background: var(--line-strong);
+}
+.scope-ticks span:nth-child(5n + 1) {
+  height: 9px;
+}
+.wavebars {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 92px;
+  padding-inline: 14px;
+}
+.wavebars i {
+  flex: 1;
+  height: 100%;
+  display: block;
+  background: linear-gradient(180deg, transparent 0%, var(--amber) 50%, transparent 100%);
+  opacity: 0.85;
+  transform: scaleY(0.06);
+  border-radius: 2px;
+  transition: none;
+}
+.scope.rec .wavebars i {
+  background: linear-gradient(180deg, transparent 0%, var(--rec) 50%, transparent 100%);
+}
+
+/* 鍵帽 */
+.keycap {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1;
+  padding: 5px 7px 6px;
+  border-radius: 6px;
+  color: var(--paper);
+  background: linear-gradient(180deg, var(--ink-2), var(--ink-1));
+  border: 1px solid var(--line-strong);
+  box-shadow: 0 2px 0 rgba(0, 0, 0, 0.5), 0 1px 0 rgba(232, 220, 196, 0.06) inset;
+}
+
+/* 面板列 */
+.panel {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(232, 220, 196, 0.02), transparent 40%), var(--ink-1);
+  box-shadow: 0 1px 0 rgba(232, 220, 196, 0.04) inset, 0 12px 32px rgba(0, 0, 0, 0.35);
+}
+.panel-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 16px;
+}
+.panel-row + .panel-row {
+  border-top: 1px solid var(--line);
+}
+.row-label {
+  font-size: 13px;
+  color: var(--paper);
+}
+.row-sub {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+.row-value {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.row-value.ok {
+  color: var(--moss);
+}
+.row-value.warn {
+  color: var(--amber);
+}
+
+/* 通道選擇器（select） */
+.channel-select {
+  appearance: none;
+  -webkit-appearance: none;
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--paper);
+  background: var(--ink-2);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 7px 26px 7px 10px;
+  max-width: 210px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%2390876f'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+}
+.channel-select:focus {
+  outline: none;
+  border-color: var(--amber);
+}
+
+/* LED 電平表 */
+.led-meter {
+  display: flex;
+  gap: 2px;
+  flex: 1;
+  height: 14px;
+  align-items: stretch;
+}
+.led-meter i {
+  flex: 1;
+  border-radius: 1.5px;
+  background: var(--ink-2);
+  border: 1px solid rgba(232, 220, 196, 0.05);
+  transition: background 60ms linear, box-shadow 60ms linear;
+}
+.led-meter i.on.g {
+  background: var(--moss);
+  box-shadow: 0 0 4px rgba(157, 192, 108, 0.45);
+}
+.led-meter i.on.a {
+  background: var(--amber);
+  box-shadow: 0 0 4px rgba(232, 163, 61, 0.5);
+}
+.led-meter i.on.r {
+  background: var(--rec);
+  box-shadow: 0 0 4px rgba(224, 86, 63, 0.55);
+}
+
+/* 按鈕 */
+.btn {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line-strong);
+  background: var(--ink-2);
+  color: var(--paper);
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.btn:hover {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+.btn.active {
+  border-color: var(--rec);
+  color: var(--rec);
+  background: var(--rec-soft);
+}
+.btn-primary {
+  width: 100%;
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 11px;
+  border-radius: 10px;
+  color: #14110a;
+  background: linear-gradient(180deg, #f0b256, var(--amber));
+  border: 1px solid rgba(0, 0, 0, 0.4);
+  box-shadow: 0 1px 0 rgba(255, 235, 200, 0.35) inset, 0 6px 18px rgba(232, 163, 61, 0.25);
+  transition: filter 0.15s;
+}
+.btn-primary:hover {
+  filter: brightness(1.06);
+}
+
+/* 下載進度 */
+.progress-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--ink-2);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(232, 163, 61, 0.55), var(--amber));
+  box-shadow: 0 0 8px rgba(232, 163, 61, 0.4);
+  transition: width 0.3s ease;
+}
+
+/* 入場動畫 */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.rise {
+  animation: rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+}

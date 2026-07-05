@@ -258,17 +258,6 @@ pub fn run() {
         });
     }
 
-    // SIGTERM/SIGINT（mic_indicator 的「結束 Claro」走 SIGTERM）：清掉 overlay 再退出
-    {
-        let core = core.clone();
-        if let Err(e) = ctrlc::set_handler(move || {
-            core.overlay.stop();
-            std::process::exit(0);
-        }) {
-            tracing::warn!("signal handler setup failed: {e}");
-        }
-    }
-
     let state = AppState {
         core: core.clone(),
         model_spec: spec,
@@ -286,14 +275,27 @@ pub fn run() {
             mic_test_stop,
             download_model
         ])
-        .setup(|app| {
-            // CLARO_DEVTOOLS=1 時自動打開 inspector（除錯 webview 白屏用）
-            if std::env::var("CLARO_DEVTOOLS").as_deref() == Ok("1") {
-                if let Some(w) = app.get_webview_window("main") {
-                    w.open_devtools();
+        .setup({
+            let signal_core = core.clone();
+            move |app| {
+                // CLARO_DEVTOOLS=1 時自動打開 inspector（除錯 webview 白屏用）
+                if std::env::var("CLARO_DEVTOOLS").as_deref() == Ok("1") {
+                    if let Some(w) = app.get_webview_window("main") {
+                        w.open_devtools();
+                    }
                 }
+                // SIGTERM/SIGINT（mic_indicator 的「結束 Claro」走 SIGTERM）。
+                // 必須走 AppHandle::exit 讓事件迴圈優雅收場——
+                // 從 signal 執行緒直接 std::process::exit 會觸發 macOS crash reporter。
+                let handle = app.handle().clone();
+                if let Err(e) = ctrlc::set_handler(move || {
+                    signal_core.overlay.stop();
+                    handle.exit(0);
+                }) {
+                    tracing::warn!("signal handler setup failed: {e}");
+                }
+                Ok(())
             }
-            Ok(())
         })
         // 關窗＝隱藏（背景工具不退出）；Dock 點擊（Reopen）再顯示。Cmd+Q 正常退出。
         .on_window_event(|window, event| {
