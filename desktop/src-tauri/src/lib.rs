@@ -500,9 +500,20 @@ pub fn run() {
                 if let Some(state) = app.try_state::<AppState>() {
                     state.core.overlay.stop();
                     // 主動釋放 whisper/Metal 資源：留給 atexit teardown 會 ggml_abort
-                    // （SIGABRT + crash report）。轉錄中拿不到鎖就算了。
-                    if let Ok(mut engine) = state.core.engine.try_lock() {
-                        engine.unload();
+                    // （SIGABRT + crash report）。背景載入/轉錄可能占著鎖，最多等 3s；
+                    // 還是拿不到就跳過 atexit 直接收場（_exit），寧可少跑 teardown
+                    // 也不要給使用者一個 crash 對話框。
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    loop {
+                        if let Ok(mut engine) = state.core.engine.try_lock() {
+                            engine.unload();
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            tracing::warn!("engine busy at exit — fast-exit to skip Metal teardown");
+                            unsafe { libc::_exit(0) };
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                 }
             }

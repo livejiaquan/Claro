@@ -566,6 +566,7 @@ dependencies = [
  "handy-keys",
  "hex",
  "hound",
+ "libc",
  "macos-accessibility-client",
  "rubato",
  "serde",
