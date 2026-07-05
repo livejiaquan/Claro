@@ -3,6 +3,16 @@ import { useEffect, useState } from "react";
 import type { DownloadProgress, LlmConfig, MicLevel, ModelInfo, Status } from "../types";
 import { Hotkey, LevelBar, Row, Section } from "../ui";
 
+/** 自訂 API 的常用服務 preset：帶入 Base URL 與建議模型（都走 OpenAI 相容介面） */
+const CUSTOM_PRESETS = [
+  { id: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+  { id: "anthropic", label: "Anthropic", baseUrl: "https://api.anthropic.com/v1", model: "claude-haiku-4-5" },
+  { id: "groq", label: "Groq", baseUrl: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
+  { id: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" },
+  { id: "gemini", label: "Google Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-2.5-flash" },
+  { id: "openrouter", label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", model: "openai/gpt-4o-mini" },
+];
+
 export default function Settings({
   status,
   mic,
@@ -22,14 +32,32 @@ export default function Settings({
   const [keyDraft, setKeyDraft] = useState("");
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
+  const [localModels, setLocalModels] = useState<string[] | null>(null);
+  const [localModelsErr, setLocalModelsErr] = useState<string | null>(null);
 
   const loadModels = () => invoke<ModelInfo[]>("list_models").then(setModels).catch(() => {});
   const loadLlm = () => invoke<LlmConfig>("get_llm_config").then(setLlm).catch(() => {});
+
+  const loadLocalModels = (provider: string) => {
+    setLocalModels(null);
+    setLocalModelsErr(null);
+    invoke<string[]>("list_provider_models", { provider })
+      .then(setLocalModels)
+      .catch((e) => setLocalModelsErr(String(e)));
+  };
 
   useEffect(() => {
     loadModels();
     loadLlm();
   }, []);
+
+  // 選到本機服務時偵測其模型清單
+  useEffect(() => {
+    if (llm && (llm.provider === "ollama" || llm.provider === "lmstudio")) {
+      loadLocalModels(llm.provider);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [llm?.provider]);
   // 下載進度事件會改變模型清單狀態
   useEffect(() => {
     loadModels();
@@ -208,7 +236,7 @@ export default function Settings({
       <Section title="AI 潤飾">
         <Row
           label="潤飾引擎"
-          sub="聽寫後用本地或自選的 LLM 做保守糾錯（去填充詞、修同音錯字、補標點）。文字只送到你選的端點。"
+          sub="聽寫後做保守糾錯（去填充詞、修同音錯字、補標點）。文字只送到你選的引擎，預設關閉。"
         >
           <select
             className="select no-drag"
@@ -216,55 +244,151 @@ export default function Settings({
             onChange={(e) => saveLlm({ provider: e.target.value })}
           >
             <option value="off">關閉（純轉錄）</option>
-            <option value="ollama">Ollama（本機）</option>
+            <option value="apple" disabled={!!llm && [1, 4].includes(llm.apple_status)}>
+              Apple Intelligence（免安裝{llm?.apple_status === 0 ? "・推薦" : ""}）
+            </option>
+            <option value="ollama">Ollama（本機服務）</option>
+            <option value="lmstudio">LM Studio（本機服務）</option>
             <option value="custom">自訂 API（OpenAI 相容）</option>
           </select>
         </Row>
-        {llm && llm.provider !== "off" && (
+
+        {llm?.provider === "apple" && (
+          <Row
+            label="系統模型狀態"
+            sub={
+              llm.apple_status === 0
+                ? "使用 macOS 內建的端上模型：不用下載、不占 Claro 記憶體、文字不出機器。"
+                : llm.apple_status === 2
+                  ? "到 系統設定 → Apple Intelligence 與 Siri 開啟後即可使用。"
+                  : llm.apple_status === 3
+                    ? "系統正在下載 Apple Intelligence 模型，稍後就緒。"
+                    : llm.apple_status === 1
+                      ? "這台 Mac 不支援 Apple Intelligence（需要 Apple Silicon）。"
+                      : "需要 macOS 26 以上。"
+            }
+          >
+            <span className={`pill ${llm.apple_status === 0 ? "green" : "amber"}`}>
+              <span className="dot" />
+              {llm.apple_status === 0
+                ? "可用"
+                : llm.apple_status === 2
+                  ? "未開啟"
+                  : llm.apple_status === 3
+                    ? "準備中"
+                    : "不可用"}
+            </span>
+          </Row>
+        )}
+
+        {llm && (llm.provider === "ollama" || llm.provider === "lmstudio") && (
+          <Row
+            label="模型"
+            sub={
+              localModelsErr
+                ? llm.provider === "ollama"
+                  ? "未偵測到 Ollama——先安裝並啟動（brew install ollama），再按「重新偵測」。"
+                  : "未偵測到 LM Studio——先啟動它的本機伺服器（Developer → Start Server），再按「重新偵測」。"
+                : localModels && localModels.length === 0
+                  ? llm.provider === "ollama"
+                    ? "服務在跑但沒有模型——先 ollama pull qwen3:4b。"
+                    : "服務在跑但沒有載入模型——在 LM Studio 載入一個模型。"
+                  : "建議 4B 級以上的指令模型，例如 qwen3:4b。"
+            }
+          >
+            <div className="flex items-center gap-2">
+              {localModels && localModels.length > 0 ? (
+                <select
+                  className="select no-drag"
+                  style={{ minWidth: 200 }}
+                  value={llm.model}
+                  onChange={(e) => saveLlm({ model: e.target.value })}
+                >
+                  {!localModels.includes(llm.model) && (
+                    <option value={llm.model}>{llm.model || "— 選擇模型 —"}</option>
+                  )}
+                  {localModels.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  className="select no-drag"
+                  style={{ minWidth: 200 }}
+                  value={llm.model}
+                  placeholder="qwen3:4b"
+                  onChange={(e) => saveLlm({ model: e.target.value })}
+                />
+              )}
+              <button className="btn no-drag" onClick={() => loadLocalModels(llm.provider)}>
+                重新偵測
+              </button>
+            </div>
+          </Row>
+        )}
+
+        {llm?.provider === "custom" && (
           <>
-            <Row
-              label="模型名稱"
-              sub={llm.provider === "ollama" ? "例如 qwen3:4b、llama3.2:3b（需先 ollama pull）" : "例如 gpt-4o-mini、deepseek-chat"}
-            >
+            <Row label="常用服務" sub="選一個自動帶入端點與建議模型，或維持自訂。">
+              <select
+                className="select no-drag"
+                value={CUSTOM_PRESETS.find((p) => p.baseUrl === llm.base_url)?.id ?? ""}
+                onChange={(e) => {
+                  const p = CUSTOM_PRESETS.find((x) => x.id === e.target.value);
+                  if (p) saveLlm({ base_url: p.baseUrl, model: p.model });
+                }}
+              >
+                <option value="">自訂端點…</option>
+                {CUSTOM_PRESETS.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.label}
+                  </option>
+                ))}
+              </select>
+            </Row>
+            <Row label="Base URL" sub="OpenAI 相容端點">
+              <input
+                className="select no-drag"
+                style={{ minWidth: 260 }}
+                value={llm.base_url}
+                placeholder="https://api.openai.com/v1"
+                onChange={(e) => saveLlm({ base_url: e.target.value })}
+              />
+            </Row>
+            <Row label="模型名稱" sub="該服務的模型 ID">
               <input
                 className="select no-drag"
                 style={{ minWidth: 200 }}
                 value={llm.model}
-                placeholder={llm.provider === "ollama" ? "qwen3:4b" : "gpt-4o-mini"}
+                placeholder="gpt-4o-mini"
                 onChange={(e) => saveLlm({ model: e.target.value })}
               />
             </Row>
-            {llm.provider === "custom" && (
-              <>
-                <Row label="Base URL" sub="OpenAI 相容端點，例如 https://api.openai.com/v1">
-                  <input
-                    className="select no-drag"
-                    style={{ minWidth: 260 }}
-                    value={llm.base_url}
-                    placeholder="https://api.openai.com/v1"
-                    onChange={(e) => saveLlm({ base_url: e.target.value })}
-                  />
-                </Row>
-                <Row
-                  label="API Key"
-                  sub={llm.has_key ? "已存入 macOS 鑰匙圈（不會寫進任何檔案）" : "存入 macOS 鑰匙圈"}
-                >
-                  <div className="flex items-center gap-2">
-                    <input
-                      className="select no-drag"
-                      style={{ minWidth: 180 }}
-                      type="password"
-                      value={keyDraft}
-                      placeholder={llm.has_key ? "••••••••" : "sk-…"}
-                      onChange={(e) => setKeyDraft(e.target.value)}
-                    />
-                    <button className="btn no-drag" onClick={saveKey} disabled={!keyDraft}>
-                      儲存
-                    </button>
-                  </div>
-                </Row>
-              </>
-            )}
+            <Row
+              label="API Key"
+              sub={llm.has_key ? "已存入 macOS 鑰匙圈（不會寫進任何檔案）" : "存入 macOS 鑰匙圈"}
+            >
+              <div className="flex items-center gap-2">
+                <input
+                  className="select no-drag"
+                  style={{ minWidth: 180 }}
+                  type="password"
+                  value={keyDraft}
+                  placeholder={llm.has_key ? "••••••••" : "sk-…"}
+                  onChange={(e) => setKeyDraft(e.target.value)}
+                />
+                <button className="btn no-drag" onClick={saveKey} disabled={!keyDraft}>
+                  儲存
+                </button>
+              </div>
+            </Row>
+          </>
+        )}
+
+        {llm && llm.provider !== "off" && (
+          <>
             <Row label="測試潤飾" sub="送一句「嗯我們用 hyTorch，那個，跑訓練」看看效果">
               <button className="btn no-drag" onClick={runTest} disabled={testing}>
                 {testing ? "測試中…" : "測試"}

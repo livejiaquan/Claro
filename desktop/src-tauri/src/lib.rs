@@ -270,6 +270,8 @@ struct LlmConfig {
     model: String,
     base_url: String,
     has_key: bool,
+    /// Apple Intelligence 可用性：0=可用 1=裝置不支援 2=未開啟 3=模型下載中 4=系統過舊 5=其他
+    apple_status: i32,
 }
 
 #[tauri::command]
@@ -280,7 +282,18 @@ fn get_llm_config() -> LlmConfig {
         model: s.llm_model(),
         base_url: s.llm_base_url(),
         has_key: polish::has_api_key(),
+        apple_status: polish::apple_status(),
     }
+}
+
+/// 本機 LLM 服務（Ollama/LM Studio）目前可用的模型清單；連不上回 Err。
+#[tauri::command]
+async fn list_provider_models(provider: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        polish::list_local_models(&provider).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -301,7 +314,7 @@ fn set_llm_key(key: String) -> Result<(), String> {
 async fn test_polish() -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let polisher = polish::from_settings(&settings::Settings::load())
-            .ok_or("尚未設定潤飾（選擇 Ollama 或自訂 API，並填模型名稱）")?;
+            .ok_or("尚未設定潤飾（選擇 Apple Intelligence、本機服務或自訂 API）")?;
         polisher.self_test().map_err(|e| e.to_string())
     })
     .await
@@ -457,6 +470,7 @@ pub fn run() {
             get_llm_config,
             set_llm_config,
             set_llm_key,
+            list_provider_models,
             test_polish,
             get_history,
             copy_text,

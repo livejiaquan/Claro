@@ -27,6 +27,8 @@ export interface LlmConfig {
   model: string;
   base_url: string;
   has_key: boolean;
+  /** Apple Intelligence 可用性：0=可用 1=裝置不支援 2=未開啟 3=模型下載中 4=系統過舊 5=其他 */
+  apple_status: number;
 }
 
 export interface DownloadProgress {
