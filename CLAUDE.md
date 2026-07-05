@@ -23,7 +23,9 @@ cargo run --example download_model [id]        # 下載 whisper 模型（同 app
 cargo run --example transcribe_file x.wav      # WAV 走完整 STT 管線（可用 say -v Meijia 產測試音）
 ```
 
-需要 `cmake`（brew）與 Rust stable。模型放 `~/Library/Application Support/Claro/models/`；config/history 沿用 `~/.claro/`（與 prototype 相容）。熱鍵/Esc 攔截需要輔助使用權限——dev 模式授權給終端機，bundle 授權給 Claro.app。
+需要 `cmake`（brew）與 Rust stable。模型放 `~/Library/Application Support/Claro/models/`；config/history 沿用 `~/.claro/`（與 prototype 相容）。熱鍵/Esc 攔截需要輔助使用權限——dev 模式授權給終端機，bundle 授權給 Claro.app（從終端機啟動 .app 內的 binary 會繼承終端機的權限，最適合開發驗證）。
+
+**已踩的坑**：`cargo build --release` 直接編出的 binary 是 dev context——webview 會去連 `devUrl`（localhost:1420），dev server 沒開就白屏。**驗證跑的一律用 `npm run tauri build` 產物**（`bundle/macos/Claro.app`）。白屏除錯：`CLARO_DEVTOOLS=1` 啟動會自動打開 inspector。
 
 任何 session 開工前：先讀 `docs/ROADMAP.md` 的進度區與當前里程碑 DoD；架構問題查 `docs/SPEC.md`（含決策記錄 D1–D7）。完成里程碑後更新兩者。
 

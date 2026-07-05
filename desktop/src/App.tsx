@@ -36,8 +36,15 @@ export default function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [fatal, setFatal] = useState<string | null>(null);
 
-  const refresh = () => invoke<Status>("get_status").then(setStatus).catch(console.error);
+  const refresh = () =>
+    invoke<Status>("get_status")
+      .then((s) => {
+        setStatus(s);
+        setFatal(null);
+      })
+      .catch((e) => setFatal(String(e)));
 
   useEffect(() => {
     refresh();
@@ -61,7 +68,20 @@ export default function App() {
     invoke("download_model").catch((e) => setError(String(e)));
   };
 
-  if (!status) return null;
+  if (!status) {
+    return (
+      <main className="min-h-screen bg-neutral-950 text-neutral-100 flex items-center justify-center p-8">
+        <div className="text-center">
+          <h1 className="text-2xl font-semibold mb-2">Claro</h1>
+          {fatal ? (
+            <p className="text-sm text-red-400 break-all max-w-md">狀態載入失敗：{fatal}</p>
+          ) : (
+            <p className="text-sm text-neutral-400">載入中…</p>
+          )}
+        </div>
+      </main>
+    );
+  }
 
   const pct =
     progress && progress.total_mb

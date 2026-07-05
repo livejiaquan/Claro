@@ -188,6 +188,16 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![get_status, download_model])
+        .setup(|app| {
+            // CLARO_DEVTOOLS=1 時自動打開 inspector（除錯 webview 白屏用）
+            if std::env::var("CLARO_DEVTOOLS").as_deref() == Ok("1") {
+                use tauri::Manager;
+                if let Some(w) = app.get_webview_window("main") {
+                    w.open_devtools();
+                }
+            }
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(move |_app, event| match event {
