@@ -137,6 +137,20 @@ fn mic_test_stop(state: tauri::State<AppState>) {
     }
 }
 
+/// 最近 n 筆聽寫歷史（首頁統計與歷史頁用）
+#[tauri::command]
+fn get_history(n: usize) -> Vec<serde_json::Value> {
+    history::read_recent(n.min(500), &history::history_path())
+}
+
+/// 複製文字到剪貼簿（歷史頁點擊複製）
+#[tauri::command]
+fn copy_text(text: String) -> Result<(), String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(text))
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Serialize, Clone)]
 struct DownloadProgress {
     downloaded_mb: u64,
@@ -273,7 +287,9 @@ pub fn run() {
             set_input_device,
             mic_test_start,
             mic_test_stop,
-            download_model
+            download_model,
+            get_history,
+            copy_text
         ])
         .setup({
             let signal_core = core.clone();
