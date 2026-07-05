@@ -112,6 +112,33 @@ impl Settings {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     }
+
+    /// 潤飾 provider："off"（預設）| "ollama" | "custom"。
+    /// 注意：prototype 的 llm_enabled/llm_model 是 MLX 語意，desktop 不沿用，
+    /// 未明確設定 llm_provider 一律視為 off（不悄悄外連）。
+    pub fn llm_provider(&self) -> String {
+        self.raw
+            .get("llm_provider")
+            .and_then(Value::as_str)
+            .unwrap_or("off")
+            .to_string()
+    }
+
+    pub fn llm_model(&self) -> String {
+        self.raw
+            .get("llm_polish_model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    pub fn llm_base_url(&self) -> String {
+        self.raw
+            .get("llm_base_url")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
 }
 
 /// 更新單一設定鍵並寫回（保留未知欄位、0600）。
