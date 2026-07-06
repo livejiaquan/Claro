@@ -248,9 +248,21 @@ fn process_session(core: &Arc<Core>, _session: u64, cancel: &AtomicBool) {
 
     // 螢幕上下文（M3 前移）：AX 抓前景視窗詞彙，餵辨識偏置＋潤飾參考。
     // 只在記憶體、永不落盤；使用者可在設定關閉。
+    // 放到帶超時的執行緒：AX 有 messaging timeout＋BFS 牆鐘預算雙保險，
+    // 但聽寫 session 絕不容許被卡——2 秒等不到就不用上下文。
     let screen_ctx = if Settings::load().context_enabled() {
         let t = Instant::now();
-        let ctx = crate::context::capture().unwrap_or_default();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::context::capture().unwrap_or_default());
+        });
+        let ctx = match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(c) => c,
+            Err(_) => {
+                tracing::warn!("context capture timed out — proceeding without it");
+                String::new()
+            }
+        };
         if !ctx.is_empty() {
             tracing::info!(
                 "🖥️ context: {} chars in {}ms",

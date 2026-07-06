@@ -397,8 +397,15 @@ fn download_builtin_llm(
 fn delete_builtin_llm(id: String) -> Result<(), String> {
     let spec = llm::find(&id).ok_or("未知的內建模型")?;
     let s = settings::Settings::load();
-    if s.llm_provider() == "builtin" && s.llm_model() == spec.id {
-        return Err("使用中的模型不能刪除，先切換潤飾引擎或模型".into());
+    if s.llm_provider() == "builtin" {
+        // 與 from_settings 同語意：model 未設定時實際使用的是預設模型
+        let active = {
+            let m = s.llm_model();
+            if m.is_empty() { "qwen3-4b-instruct-2507".to_string() } else { m }
+        };
+        if active == spec.id {
+            return Err("使用中的模型不能刪除，先切換潤飾引擎或模型".into());
+        }
     }
     llm::unload_now();
     std::fs::remove_file(llm::model_path(spec)).map_err(|e| e.to_string())
@@ -667,15 +674,21 @@ pub fn run() {
             tauri::RunEvent::Exit => {
                 if let Some(state) = app.try_state::<AppState>() {
                     state.core.overlay.stop();
-                    llm::unload_now();
-                    // 主動釋放 whisper/Metal 資源：留給 atexit teardown 會 ggml_abort
-                    // （SIGABRT + crash report）。背景載入/轉錄可能占著鎖，最多等 3s；
-                    // 還是拿不到就跳過 atexit 直接收場（_exit），寧可少跑 teardown
-                    // 也不要給使用者一個 crash 對話框。
+                    // 主動釋放 whisper/llama 的 Metal 資源：留給 atexit teardown 會
+                    // ggml_abort（SIGABRT + crash report）。背景載入/轉錄/潤飾可能
+                    // 占著鎖，最多等 3s；還是拿不到就跳過 atexit 直接收場（_exit），
+                    // 寧可少跑 teardown 也不要給使用者一個 crash 對話框。
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    let mut whisper_done = false;
                     loop {
-                        if let Ok(mut engine) = state.core.engine.try_lock() {
-                            engine.unload();
+                        if !whisper_done {
+                            if let Ok(mut engine) = state.core.engine.try_lock() {
+                                engine.unload();
+                                whisper_done = true;
+                            }
+                        }
+                        let llm_done = whisper_done && llm::unload_now();
+                        if llm_done {
                             break;
                         }
                         if std::time::Instant::now() >= deadline {

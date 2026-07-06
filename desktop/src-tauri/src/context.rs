@@ -92,12 +92,27 @@ mod macos {
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn AXUIElementCreateApplication(pid: i32) -> CFTypeRef;
+        fn AXUIElementCreateSystemWide() -> CFTypeRef;
         fn AXUIElementCopyAttributeValue(
             element: CFTypeRef,
             attribute: CFStringRef,
             value: *mut CFTypeRef,
         ) -> i32;
+        fn AXUIElementSetMessagingTimeout(element: CFTypeRef, timeout_seconds: f32) -> i32;
         fn AXValueGetValue(value: CFTypeRef, the_type: u32, out: *mut c_void) -> bool;
+    }
+
+    /// 對 system-wide 元素設 messaging timeout ＝ 全程序 AX 呼叫的預設逾時。
+    /// 沒有這個，目標 app 的 AX server 卡住會 wedge 整個聽寫 session（review 抓到的坑）。
+    fn set_global_ax_timeout_once() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            let sys = AXUIElementCreateSystemWide();
+            if !sys.is_null() {
+                let _ = AXUIElementSetMessagingTimeout(sys, 0.25);
+                CFRelease(sys);
+            }
+        });
     }
 
     /// 前景 app 的 (pid, 名稱)。走 NSWorkspace（prototype 原路）——
@@ -142,6 +157,12 @@ mod macos {
     }
 
     fn attr_string(el: &Owned, name: &str) -> Option<String> {
+        attr_string_capped(el, name, usize::MAX)
+    }
+
+    /// 讀字串屬性，但先用 CFStringGetLength 檢查長度——超過上限直接放棄，
+    /// 不為巨大文件（AXValue 可能是整份內容）做整串複製。
+    fn attr_string_capped(el: &Owned, name: &str, max_chars: usize) -> Option<String> {
         let v = copy_attr(el, name)?;
         unsafe {
             if CFGetTypeID(v.0) != CFString::type_id() {
@@ -149,6 +170,9 @@ mod macos {
             }
             // wrap_under_get_rule：所有權仍在 Owned（drop 釋放），wrapper 借用＋retain
             let s = CFString::wrap_under_get_rule(v.0 as CFStringRef);
+            if s.char_len() as usize > max_chars {
+                return None;
+            }
             Some(s.to_string())
         }
     }
@@ -188,6 +212,18 @@ mod macos {
 
     /// 取游標前後文。拿不到游標位置時退而取尾段（聽寫時游標通常在文末）。
     fn text_around_cursor(focused: &Owned, value: &str) -> String {
+        // 巨大文件防護：AXValue 可能是整份文件（MB 級），
+        // 超過上限就直接取尾段，不為它展開整串 Vec<char>
+        const VALUE_BYTES_CAP: usize = 512 * 1024;
+        if value.len() > VALUE_BYTES_CAP {
+            let tail_start = value
+                .char_indices()
+                .rev()
+                .nth(CTX_CURSOR_CHARS * 2 - 1)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            return value[tail_start..].to_string();
+        }
         let chars: Vec<char> = value.chars().collect();
         if let Some((pos, _)) = attr_range(focused, "AXSelectedTextRange") {
             // AX 的 location 是 UTF-16 單位，這裡以字元近似（CJK 情境差距可忽略），夾住邊界
@@ -200,10 +236,12 @@ mod macos {
         chars[lo..].iter().collect()
     }
 
-    /// 廣度優先走訪焦點視窗的 AX 樹，收集可見文字（預算上限）。
+    /// 廣度優先走訪焦點視窗的 AX 樹，收集可見文字（預算上限＋牆鐘預算）。
     /// 只收內容性角色；按鈕/連結（書籤列、工具列）噪音多，排除。
-    /// AXSecureTextField 不在允收角色內，天然跳過。
+    /// 密碼欄雙重防護：role 不在允收清單天然跳過，subrole 是
+    /// AXSecureTextField（未聚焦的一般 TextField 也可能如此標記）明確跳過。
     fn collect_visible_text(window: &Owned) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
         let mut chunks: Vec<String> = Vec::new();
         let mut total = 0usize;
         let mut visited = 0usize;
@@ -211,23 +249,30 @@ mod macos {
         queue.push_back(Owned(unsafe { CFRetain(window.0) }));
 
         while let Some(el) = queue.pop_front() {
-            if visited >= CTX_MAX_NODES || total >= CTX_VISIBLE_CHARS {
+            if visited >= CTX_MAX_NODES
+                || total >= CTX_VISIBLE_CHARS
+                || std::time::Instant::now() >= deadline
+            {
                 break;
             }
             visited += 1;
             if let Some(role) = attr_string(&el, "AXRole") {
                 if matches!(role.as_str(), "AXStaticText" | "AXTextField" | "AXTextArea" | "AXHeading")
                 {
-                    for attr in ["AXValue", "AXTitle"] {
-                        if let Some(t) = attr_string(&el, attr) {
-                            let t = t.trim();
-                            if t.chars().count() >= 3 {
-                                let t = truncate_chars(t, CTX_VISIBLE_CHARS - total);
-                                if !chunks.contains(&t) {
-                                    total += t.chars().count();
-                                    chunks.push(t);
+                    let secure = attr_string(&el, "AXSubrole")
+                        .is_some_and(|s| s == "AXSecureTextField");
+                    if !secure {
+                        for attr in ["AXValue", "AXTitle"] {
+                            if let Some(t) = attr_string_capped(&el, attr, CTX_VISIBLE_CHARS * 4) {
+                                let t = t.trim();
+                                if t.chars().count() >= 3 {
+                                    let t = truncate_chars(t, CTX_VISIBLE_CHARS - total);
+                                    if !chunks.contains(&t) {
+                                        total += t.chars().count();
+                                        chunks.push(t);
+                                    }
+                                    break;
                                 }
-                                break;
                             }
                         }
                     }
@@ -242,6 +287,7 @@ mod macos {
 
     /// 讀前景 app／視窗／游標周邊／可見文字。任何一步失敗都靜默略過該部分。
     pub fn capture() -> Option<String> {
+        set_global_ax_timeout_once();
         let (pid, app_name) = frontmost_app()?;
         let app = Owned(unsafe { AXUIElementCreateApplication(pid) });
         if app.0.is_null() {
@@ -266,7 +312,8 @@ mod macos {
             let role = attr_string(&focused, "AXRole").unwrap_or_default();
             let subrole = attr_string(&focused, "AXSubrole").unwrap_or_default();
             if role != "AXSecureTextField" && subrole != "AXSecureTextField" {
-                if let Some(value) = attr_string(&focused, "AXValue") {
+                // 20 萬字上限：焦點若在整份大型文件，值太大直接放棄（不整串複製）
+                if let Some(value) = attr_string_capped(&focused, "AXValue", 200_000) {
                     if !value.trim().is_empty() {
                         let around = text_around_cursor(&focused, &value);
                         let around = around.trim();

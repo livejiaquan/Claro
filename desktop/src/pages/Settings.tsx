@@ -563,9 +563,8 @@ export default function Settings({
                 onChange={(ev) => {
                   const next = [...(dict ?? [])];
                   next[i] = { ...next[i], from: ev.target.value };
-                  setDict(next);
+                  saveDict(next); // 用本地 next 存，避免 stale state；佇列已串行化
                 }}
-                onBlur={() => saveDict(dict ?? [])}
               />
               <span style={{ color: "var(--faint)" }}>→</span>
               <input
@@ -575,9 +574,8 @@ export default function Settings({
                 onChange={(ev) => {
                   const next = [...(dict ?? [])];
                   next[i] = { ...next[i], to: ev.target.value };
-                  setDict(next);
+                  saveDict(next);
                 }}
-                onBlur={() => saveDict(dict ?? [])}
               />
             </div>
             <button

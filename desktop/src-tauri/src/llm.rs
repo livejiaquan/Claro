@@ -87,6 +87,12 @@ mod engine {
     static WATCHER: Once = Once::new();
 
     fn backend() -> Result<&'static LlamaBackend> {
+        if let Some(b) = BACKEND.get() {
+            return Ok(b);
+        }
+        // 初始化鎖：首次並發呼叫（聽寫潤飾＋設定頁測試同時）不能重複 init
+        static INIT_LOCK: Mutex<()> = Mutex::new(());
+        let _g = INIT_LOCK.lock().unwrap();
         if BACKEND.get().is_none() {
             let b = LlamaBackend::init().context("init llama backend")?;
             let _ = BACKEND.set(b);
@@ -109,10 +115,15 @@ mod engine {
         });
     }
 
-    /// 立即卸載（app 退出路徑用：Metal 資源不能留給 atexit teardown）
-    pub fn unload_now() {
-        if let Ok(mut guard) = STATE.try_lock() {
-            *guard = None;
+    /// 立即卸載（app 退出路徑用：Metal 資源不能留給 atexit teardown）。
+    /// 回傳 false = 鎖被占（生成中），呼叫端要重試或走 _exit 跳過 atexit。
+    pub fn unload_now() -> bool {
+        match STATE.try_lock() {
+            Ok(mut guard) => {
+                *guard = None;
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -211,4 +222,6 @@ pub fn generate(_model_id: &str, _system: &str, _user: &str) -> Result<String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn unload_now() {}
+pub fn unload_now() -> bool {
+    true
+}
