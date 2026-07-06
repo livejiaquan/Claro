@@ -1,111 +1,93 @@
 # Claro
 
-macOS 語音輸入工具。按住快捷鍵說話，放開後文字直接出現在游標位置。全部在本地處理，資料不出機器。
+**macOS 全本地語音輸入。按住快捷鍵說話，放開，文字直接出現在游標位置。**
 
-> **改版進行中**：Claro 正以 Tauri（Rust）重寫為可下載安裝的桌面 app（規劃見 `docs/ROADMAP.md`）。現行可用版本是 `prototype/` 下的 Python 實作，以下說明皆以它為準（指令請在 `prototype/` 目錄執行）。
+語音、螢幕內容、輸出的文字——全部在你的機器上處理。沒有帳號、沒有訂閱、
+預設不發出任何網路請求。針對「繁體中文為主、夾雜英文技術術語」的說話方式最佳化。
 
-## 特色
+> 開發進行中（pre-release）。可從原始碼建置使用；簽章安裝檔在 roadmap 上（M6）。
 
-- **全本地處理** — 使用 mlx-whisper + mlx-lm，Apple Silicon 加速；首次執行需網路下載模型，之後完全離線
-- **中英混雜辨識** — 針對台灣繁體中文 + 英文技術術語最佳化
-- **個人字典** — 自訂術語對照表，不怕專有名詞聽錯
-- **螢幕上下文感知** — 自動讀取前景 App 與視窗資訊，提升辨識準確度
-- **Typeless 風格 UI** — 底部極簡膠囊，即時波形回饋，滑鼠穿透不搶焦點
-- **歷史紀錄** — 每次聽寫存本地 `~/.claro/history.jsonl`，取消或失敗都救得回來
+## 為什麼是 Claro
 
-## 系統需求
+| | Claro | 一般雲端聽寫 |
+|---|---|---|
+| 語音資料 | 不離開機器 | 上傳雲端 |
+| 螢幕上下文 | 本地讀取、用完即丟、永不儲存 | 多半上傳 |
+| 辨識模型 | 自選（whisper 家族，可換大小） | 固定 |
+| 潤飾模型 | 自選（Apple 端上模型／內建模型／自帶 API） | 固定 |
+| 費用 | 免費開源 | 訂閱 |
 
-- macOS 14+ (Sonoma)
-- Apple Silicon Mac (M1 以上)
-- Python 3.10+
+### 四個支柱
 
-## 安裝
+1. **本地優先隱私**——STT 與潤飾都在本機跑（Metal 加速）。潤飾預設關閉；
+   就算開，預設選項（Apple Intelligence／內建模型）也完全離線。
+   密碼欄永不讀取；上下文永不落盤；設定檔 0600；API key 進 Keychain。
+2. **真上下文感知**——聽寫時讀取目前視窗的內容（app、標題、游標周邊文字），
+   把畫面上出現過的術語在**辨識階段**就餵給模型。你在看 PyTorch 文件時說
+   「派托奇」，出來的就是 PyTorch。
+3. **模型可插拔**——辨識模型 6 種 whisper 變體 UI 內下載切換；潤飾引擎五選一：
+   Apple Intelligence（macOS 26+，免安裝）、內建模型（llama.cpp，免安裝）、
+   Ollama、LM Studio、自訂 OpenAI-compatible API（OpenAI/Anthropic/Groq/
+   DeepSeek/Gemini/OpenRouter preset）。
+4. **CJK 極致**——繁體中文（台灣用語）終盤 OpenCC 正規化、全形標點修正、
+   中英混排處理、個人字典（常錯的詞教一次就好）。
+
+## 安裝（從原始碼）
+
+需求：macOS 14+、Apple Silicon、Rust stable、Node 18+、`brew install cmake`。
 
 ```bash
-# 1. 建立虛擬環境
-python3 -m venv venv
-source venv/bin/activate
-
-# 2. 安裝依賴
-pip install -r prototype/requirements.txt
-
-# 3. 編譯 Swift 膠囊 overlay
-cd prototype
-swiftc -o mic_indicator mic_indicator.swift -framework Cocoa -framework AVFoundation
+git clone https://github.com/livejiaquan/Claro && cd Claro/desktop
+npm install
+npm run tauri build
+# 產物：src-tauri/target/release/bundle/macos/Claro.app（拖進 Applications）
+# 或 dmg：src-tauri/target/release/bundle/dmg/
 ```
+
+首次啟動：
+
+1. 授予**輔助使用**權限（系統會提示；授權後 app 自動啟用，不用重啟）。
+2. 到 設定 → 語音模型 下載一個模型（推薦 Large v3 Turbo，1.5GB）。
+3. 第一次聽寫時允許**麥克風**。
+
+就這兩個權限，不多要。
 
 ## 使用
 
-```bash
-source venv/bin/activate
-cd prototype
-python3 main.py
-```
+- **按住 ⌥⇧C 說話，放開出字**（快捷鍵可在設定改成右 ⌘／右 ⌥／fn 單鍵按住）。
+- **快點一下**＝免持模式，再按一下結束；免持單次上限 5 分鐘。
+- **Esc**＝取消（內容仍存在歷史，可救回）。
+- 設定 → AI 潤飾：開啟後自動去填充詞（嗯、那個）、修同音錯字、補標點。
+  潤飾失敗永遠退回原始轉錄——聽寫不會因為 LLM 掛掉而失敗。
+- 設定 → 個人字典：左邊填常被認錯的寫法、右邊填正確寫法，
+  同時會提示辨識模型少認錯。
 
-### 快捷鍵
+## 隱私模型
 
-| 操作 | 動作 |
-|------|------|
-| 按住 `Option + Shift + C` | 說話，放開即貼到游標處 |
-| 快速點放 `Option + Shift + C` | 進入免持模式（連續聆聽），再按一次停止並貼上 |
-| `Esc` | 取消本次聽寫（內容仍會存入歷史紀錄） |
+- **T0（預設）**：語音、文字、螢幕上下文全部不出機器。潤飾用 Apple 端上模型
+  或內建模型時也是 T0。
+- **T1（自選）**：你自己設定雲端潤飾端點時，「轉錄文字＋螢幕上下文」會送到
+  **你指定的**端點。UI 會明確標示。
+- 音訊永不落盤；上下文只在記憶體；歷史紀錄存本地 `~/.claro/history.jsonl`
+  （0600，可清）。
+- 已知限制：剪貼簿還原僅保留純文字（貼上前複製的圖片/富文本會遺失）。
 
-### Menu Bar
-
-啟動後 menu bar 會出現麥克風圖示：即時狀態、今日使用統計、最近 5 筆聽寫（點擊複製）、開啟歷史紀錄、模型切換、結束 Claro。
-
-### 歷史紀錄
-
-```bash
-python3 main.py --history   # 印出最近 20 筆聽寫（含被取消的）
-```
-
-### 模型設定 `~/.claro/config.json`
-
-```json
-{
-  "whisper_model": "large-v3-mlx",
-  "llm_model": "mlx-community/Qwen2.5-7B-Instruct-4bit",
-  "llm_enabled": true
-}
-```
-
-可從 menu bar 切換，或直接編輯（重啟生效）。電腦較舊可改用 `large-v3-turbo`（更快、首次需下載 1.6GB）搭配 `Qwen2.5-1.5B-Instruct-4bit`，或把 `llm_enabled` 設 `false` 關閉潤飾。不會自動下載任何模型——換新模型後第一次聽寫才會下載。
-
-### 自訂字典
+## 開發
 
 ```bash
-python3 main.py --add-term="GBT:GPT" --add-term="My Torch:PyTorch"
+cd desktop
+npm run tauri dev          # 開發模式（前端 HMR）
+cd src-tauri
+cargo test --lib           # 單元測試（不需麥克風/模型）
 ```
 
-### 除錯模式
+- 架構與原理：**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**（維護者必讀：
+  執行緒模型、每個子系統的設計原因、已知地雷、怎麼加模型/provider）
+- 產品規格與決策記錄：[docs/SPEC.md](docs/SPEC.md)
+- 里程碑：[docs/ROADMAP.md](docs/ROADMAP.md)
+- 競品研究：[docs/research/](docs/research/)
 
-```bash
-python3 main.py --debug  # 音訊會儲存到 /tmp/voicerec_debug/
-```
-
-## 權限
-
-初次使用需要授予：
-
-1. **麥克風權限** — 系統設定 → 隱私與安全性 → 麥克風
-2. **輔助使用權限** — 系統設定 → 隱私與安全性 → 輔助使用
-
-## 隱私與限制
-
-- 全程本地處理，資料不出機器
-- 聽寫歷史僅存 `~/.claro/history.jsonl`（權限 `0600`）
-- 螢幕上下文只在記憶體中提供給本地 LLM，不落盤
-- 剪貼簿還原僅保留純文字；貼上前複製的圖片或富文本會遺失
-- 免持模式單次錄音上限 5 分鐘
-
-## 架構
-
-```
-音訊 → Whisper (mlx-whisper) → 個人字典 → LLM 潤飾 (mlx-lm) → 貼上游標處
-        ↑
-    Accessibility API 讀取前景 App 資訊
-```
+`prototype/` 是已凍結的 Python/MLX 原型（行為參考實作），日常開發都在 `desktop/`。
 
 ## License
 
