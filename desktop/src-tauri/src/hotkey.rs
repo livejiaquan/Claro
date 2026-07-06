@@ -21,9 +21,21 @@ pub enum HotkeyMsg {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum EscControl {
-    Arm,
-    Disarm,
+pub enum Ctl {
+    ArmEsc,
+    DisarmEsc,
+    /// 換主熱鍵（設定頁自訂）：先註冊新鍵成功才卸舊鍵，失敗維持原狀
+    SetMain(Hotkey),
+}
+
+/// 預設主熱鍵；config `hotkey` 鍵可覆寫（見 settings::hotkey_combo）
+pub const DEFAULT_COMBO: &str = "Opt+Shift+C";
+
+/// 解析使用者設定的熱鍵字串；無效時退回預設（絕不讓 app 沒有熱鍵）
+pub fn parse_combo(combo: &str) -> Hotkey {
+    combo
+        .parse::<Hotkey>()
+        .unwrap_or_else(|_| DEFAULT_COMBO.parse().expect("default combo valid"))
 }
 
 /// 單調時鐘秒數（給狀態機的 tap 判定）
@@ -34,13 +46,13 @@ pub fn now_ts() -> f64 {
 
 pub struct HotkeyService {
     pub events: Receiver<HotkeyMsg>,
-    pub esc_ctl: Sender<EscControl>,
+    pub esc_ctl: Sender<Ctl>,
 }
 
 /// 啟動熱鍵執行緒。Accessibility 未授權時 HotkeyManager::new_with_blocking 會失敗。
-pub fn start() -> Result<HotkeyService> {
+pub fn start(main: Hotkey) -> Result<HotkeyService> {
     let (event_tx, event_rx) = unbounded::<HotkeyMsg>();
-    let (ctl_tx, ctl_rx) = unbounded::<EscControl>();
+    let (ctl_tx, ctl_rx) = unbounded::<Ctl>();
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<Result<()>>(1);
 
     std::thread::spawn(move || {
@@ -51,10 +63,7 @@ pub fn start() -> Result<HotkeyService> {
                 return;
             }
         };
-        let main_hotkey = match Hotkey::new(Modifiers::OPT | Modifiers::SHIFT, Key::C)
-            .context("build main hotkey")
-            .and_then(|hk| manager.register(hk).context("register main hotkey"))
-        {
+        let mut main_hotkey = match manager.register(main).context("register main hotkey") {
             Ok(id) => id,
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
@@ -65,10 +74,10 @@ pub fn start() -> Result<HotkeyService> {
 
         let mut esc_id = None;
         loop {
-            // esc arm/disarm 命令
+            // 控制命令：Esc 攔截開關／換主熱鍵
             while let Ok(cmd) = ctl_rx.try_recv() {
                 match cmd {
-                    EscControl::Arm if esc_id.is_none() => {
+                    Ctl::ArmEsc if esc_id.is_none() => {
                         match Hotkey::new(Modifiers::empty(), Key::Escape)
                             .map_err(anyhow::Error::from)
                             .and_then(|hk| manager.register(hk).map_err(anyhow::Error::from))
@@ -77,11 +86,19 @@ pub fn start() -> Result<HotkeyService> {
                             Err(e) => tracing::warn!("arm esc failed: {e}"),
                         }
                     }
-                    EscControl::Disarm => {
+                    Ctl::DisarmEsc => {
                         if let Some(id) = esc_id.take() {
                             let _ = manager.unregister(id);
                         }
                     }
+                    Ctl::SetMain(hk) => match manager.register(hk) {
+                        Ok(new_id) => {
+                            let _ = manager.unregister(main_hotkey);
+                            main_hotkey = new_id;
+                            tracing::info!("main hotkey changed to {hk}");
+                        }
+                        Err(e) => tracing::warn!("set main hotkey failed, keeping old: {e}"),
+                    },
                     _ => {}
                 }
             }
@@ -117,5 +134,24 @@ pub fn start() -> Result<HotkeyService> {
         Ok(Ok(())) => Ok(HotkeyService { events: event_rx, esc_ctl: ctl_tx }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(anyhow::anyhow!("hotkey thread did not start")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_presets_all_parse() {
+        // 設定頁提供的每個 preset 都必須能解析（與 Settings.tsx 同步維護）
+        for combo in ["Opt+Shift+C", "CmdRight", "OptRight", "Fn", "F5"] {
+            assert!(combo.parse::<Hotkey>().is_ok(), "preset {combo} must parse");
+        }
+    }
+
+    #[test]
+    fn invalid_combo_falls_back_to_default() {
+        let hk = parse_combo("NotAKey+Whatever");
+        assert_eq!(hk, DEFAULT_COMBO.parse::<Hotkey>().unwrap());
     }
 }

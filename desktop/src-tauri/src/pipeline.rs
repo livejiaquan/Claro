@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::audio::{self, CaptureHandle};
 use crate::history::{self, NewEntry};
-use crate::hotkey::{EscControl, HotkeyMsg};
+use crate::hotkey::{Ctl, HotkeyMsg};
 use crate::inject::TextInjector;
 use crate::overlay_client::OverlayClient;
 use crate::polish;
@@ -36,7 +36,7 @@ pub struct Core {
     /// 個人字典（設定 UI 可即時更新）
     pub dict: Mutex<Vec<(String, String)>>,
     /// 熱鍵服務可能在授權後重試重建，所以是 Mutex
-    pub esc_ctl: Mutex<crossbeam_channel::Sender<EscControl>>,
+    pub esc_ctl: Mutex<crossbeam_channel::Sender<Ctl>>,
     pub msg_tx: crossbeam_channel::Sender<Msg>,
     /// 使用者指定的輸入裝置（None = 系統預設）；設定 UI 可即時更新
     pub input_device: Mutex<Option<String>>,
@@ -52,7 +52,7 @@ impl Core {
         active_model: &'static ModelSpec,
         overlay: OverlayClient,
         injector: Box<dyn TextInjector>,
-        esc_ctl: crossbeam_channel::Sender<EscControl>,
+        esc_ctl: crossbeam_channel::Sender<Ctl>,
         msg_tx: crossbeam_channel::Sender<Msg>,
         input_device: Option<String>,
     ) -> Self {
@@ -76,9 +76,9 @@ impl Core {
     fn sync_esc(&self) {
         let state = self.sm.lock().unwrap().state();
         let _ = self.esc_ctl.lock().unwrap().send(if state == State::Idle {
-            EscControl::Disarm
+            Ctl::DisarmEsc
         } else {
-            EscControl::Arm
+            Ctl::ArmEsc
         });
     }
 

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 沒有這個 key，從 Finder 啟動的 app 拿麥克風會被 TCC 靜默拒絕（不跳授權窗） -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Claro 需要麥克風把你的語音轉成文字。音訊全程在本機處理，不會離開這台電腦。</string>
+</dict>
+</plist>

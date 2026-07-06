@@ -50,9 +50,47 @@ export default function Home({
     <div className="page-in">
       <h1 className="text-[24px] font-bold tracking-tight">自然說話，直接出字。</h1>
       <p className="text-[14px] mt-2 mb-7" style={{ color: "var(--muted)" }}>
-        在任何輸入框，按住 <Hotkey /> 說話，放開就貼上；快點一下進入免持模式，
+        在任何輸入框，按住 <Hotkey combo={status.hotkey} /> 說話，放開就貼上；快點一下進入免持模式，
         <kbd className="keycap" style={{ height: 22, fontSize: 11.5 }}>esc</kbd> 取消。
       </p>
+
+      {/* 未就緒時大聲說清楚：使用者不該需要猜「為什麼沒反應」 */}
+      {!status.hotkey_active && (
+        <div
+          className="card mb-7"
+          style={{ borderLeft: "3px solid var(--amber)", background: "rgba(255,159,10,0.06)" }}
+        >
+          <div className="row" style={{ alignItems: "flex-start" }}>
+            <div className="flex-1 min-w-0">
+              <div className="row-label">快捷鍵尚未啟用——需要「輔助使用」權限</div>
+              <div className="row-sub">
+                macOS 要求語音輸入工具取得輔助使用權限才能監聽快捷鍵與貼上文字。
+                到 系統設定 → 隱私與安全性 → 輔助使用，勾選 Claro（若已在清單中請先移除再重新加入）。
+                授權後會<b>自動啟用</b>，不用重啟。
+              </div>
+            </div>
+            <button
+              className="btn no-drag"
+              onClick={() => invoke("open_accessibility_settings").catch(() => {})}
+            >
+              打開系統設定
+            </button>
+          </div>
+        </div>
+      )}
+      {status.hotkey_active && !status.model_present && (
+        <div
+          className="card mb-7"
+          style={{ borderLeft: "3px solid var(--amber)", background: "rgba(255,159,10,0.06)" }}
+        >
+          <div className="row">
+            <div className="flex-1 min-w-0">
+              <div className="row-label">還沒有語音模型</div>
+              <div className="row-sub">到 設定 → 語音模型 下載一個模型（推薦 Large v3 Turbo）就能開始聽寫。</div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-7">
         <StatCard icon={<IconMic />} value={String(today.length)} unit="次" label="今日聽寫" />
@@ -81,7 +119,7 @@ export default function Home({
       <div className="card">
         {recent.length === 0 && (
           <div className="row" style={{ color: "var(--muted)", fontSize: 13 }}>
-            還沒有聽寫紀錄——按住 <Hotkey /> 說第一句話吧。
+            還沒有聽寫紀錄——按住 <Hotkey combo={status.hotkey} /> 說第一句話吧。
           </div>
         )}
         {recent.map((e, i) => (

@@ -14,6 +14,8 @@ pub fn default_config() -> Map<String, Value> {
         "whisper_model": "large-v3-turbo",
         "llm_model": "mlx-community/Qwen2.5-7B-Instruct-4bit",
         "llm_enabled": true,
+        // 主熱鍵（handy-keys 字串格式，如 "Opt+Shift+C"、"CmdRight"）
+        "hotkey": "Opt+Shift+C",
         // 個人字典（誤認詞 → 正確詞）：貼上前替換＋餵給語音模型做詞彙偏置
         "dictionary": { "GBT": "GPT", "My Torch": "PyTorch" },
         // 螢幕上下文（AX）：抓前景視窗詞彙給辨識與潤飾；內容永不落盤
@@ -165,6 +167,16 @@ impl Settings {
     /// 螢幕上下文擷取開關（預設開；內容只在記憶體，永不落盤）
     pub fn context_enabled(&self) -> bool {
         self.raw.get("context_enabled").and_then(Value::as_bool).unwrap_or(true)
+    }
+
+    /// 主熱鍵組合字串（handy-keys 格式）；缺省用預設
+    pub fn hotkey_combo(&self) -> String {
+        self.raw
+            .get("hotkey")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(crate::hotkey::DEFAULT_COMBO)
+            .to_string()
     }
 }
 

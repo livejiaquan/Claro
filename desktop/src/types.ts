@@ -10,6 +10,7 @@ export interface Status {
   input_devices: string[];
   dictation_state: "idle" | "recording" | "processing";
   context_enabled: boolean;
+  hotkey: string;
 }
 
 export interface ModelInfo {

@@ -157,8 +157,28 @@ export default function Settings({
       <h1 className="text-[24px] font-bold tracking-tight mb-6">設定</h1>
 
       <Section title="聽寫">
-        <Row label="快捷鍵" sub="按住說話、放開出字；快點一下＝免持模式">
-          <Hotkey />
+        <Row label="快捷鍵" sub="按住說話、放開出字；快點一下＝免持模式。改完立即生效。">
+          <div className="flex items-center gap-3">
+            <Hotkey combo={status.hotkey} />
+            <select
+              className="select no-drag"
+              value={status.hotkey}
+              onChange={(e) =>
+                invoke("set_hotkey", { combo: e.target.value })
+                  .then(() => {
+                    refresh();
+                    onToast("快捷鍵已更新");
+                  })
+                  .catch((err) => setError(String(err)))
+              }
+            >
+              <option value="Opt+Shift+C">⌥⇧C（預設）</option>
+              <option value="CmdRight">右 ⌘（單鍵按住）</option>
+              <option value="OptRight">右 ⌥（單鍵按住）</option>
+              <option value="Fn">fn（單鍵按住）</option>
+              <option value="F5">F5</option>
+            </select>
+          </div>
         </Row>
       </Section>
 
@@ -630,9 +650,17 @@ export default function Settings({
         >
           <div className="flex items-center gap-2">
             {!permsOk && (
-              <button className="btn no-drag" onClick={retryHotkey}>
-                重試
-              </button>
+              <>
+                <button
+                  className="btn no-drag"
+                  onClick={() => invoke("open_accessibility_settings").catch(() => {})}
+                >
+                  打開系統設定
+                </button>
+                <button className="btn no-drag" onClick={retryHotkey}>
+                  重試
+                </button>
+              </>
             )}
             <span className={`pill ${permsOk ? "green" : "amber"}`}>
               <span className="dot" />

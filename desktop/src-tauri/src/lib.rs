@@ -56,6 +56,7 @@ struct Status {
     input_devices: Vec<String>,
     dictation_state: &'static str,
     context_enabled: bool,
+    hotkey: String,
 }
 
 #[tauri::command]
@@ -78,6 +79,7 @@ fn get_status(state: tauri::State<AppState>) -> Status {
         input_devices: audio::list_input_devices(),
         dictation_state,
         context_enabled: settings::Settings::load().context_enabled(),
+        hotkey: settings::Settings::load().hotkey_combo(),
     }
 }
 
@@ -508,7 +510,8 @@ fn copy_text(text: String) -> Result<(), String> {
 static HOTKEY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn wire_hotkey(core: &Arc<pipeline::Core>) -> Result<(), String> {
-    let service = hotkey::start().map_err(|e| e.to_string())?;
+    let combo = settings::Settings::load().hotkey_combo();
+    let service = hotkey::start(hotkey::parse_combo(&combo)).map_err(|e| e.to_string())?;
     HOTKEY_ACTIVE.store(true, Ordering::SeqCst);
     let tx = core.msg_tx.clone();
     let events = service.events;
@@ -521,6 +524,32 @@ fn wire_hotkey(core: &Arc<pipeline::Core>) -> Result<(), String> {
     });
     *core.esc_ctl.lock().unwrap() = service.esc_ctl;
     Ok(())
+}
+
+/// 換主熱鍵：驗證 → 寫 config → 熱鍵執行緒動態換註冊（免重啟）。
+#[tauri::command]
+fn set_hotkey(combo: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let hk: handy_keys::Hotkey = combo.parse().map_err(|e| format!("無效的快捷鍵：{e}"))?;
+    settings::update_config_key(
+        &settings::config_path(),
+        "hotkey",
+        serde_json::Value::String(combo),
+    )
+    .map_err(|e| e.to_string())?;
+    let _ = state.core.esc_ctl.lock().unwrap().send(hotkey::Ctl::SetMain(hk));
+    Ok(())
+}
+
+/// 打開 系統設定 → 隱私與安全性 → 輔助使用（授權引導用）
+#[tauri::command]
+fn open_accessibility_settings(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            None::<String>,
+        )
+        .map_err(|e| e.to_string())
 }
 
 /// 使用者授予輔助使用權限後，不用重啟就能啟用熱鍵。
@@ -574,7 +603,29 @@ fn init_core(app: &tauri::AppHandle) {
     ));
 
     if let Err(e) = wire_hotkey(&core) {
-        tracing::warn!("hotkey unavailable ({e}) — grant Accessibility, then use設定頁「重試」");
+        tracing::warn!("hotkey unavailable ({e}) — prompting for Accessibility");
+        // 明確告訴使用者發生什麼：跳系統授權提示（只在未授權時出現一次）
+        #[cfg(target_os = "macos")]
+        if !accessibility_trusted() {
+            let _ = macos_accessibility_client::accessibility::application_is_trusted_with_prompt();
+        }
+        // 授權後自動啟用，不需要使用者回設定頁按「重試」
+        let core = core.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if HOTKEY_ACTIVE.load(Ordering::SeqCst) {
+                break;
+            }
+            if accessibility_trusted() {
+                match wire_hotkey(&core) {
+                    Ok(()) => {
+                        tracing::info!("accessibility granted — hotkey now active");
+                        break;
+                    }
+                    Err(e) => tracing::warn!("hotkey retry failed: {e}"),
+                }
+            }
+        });
     }
 
     {
@@ -647,6 +698,8 @@ pub fn run() {
             list_builtin_llms,
             download_builtin_llm,
             delete_builtin_llm,
+            set_hotkey,
+            open_accessibility_settings,
             get_history,
             copy_text,
             retry_hotkey

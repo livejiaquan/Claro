@@ -37,12 +37,31 @@ export function Kbd({ k }: { k: string }) {
   return <kbd className="keycap">{k}</kbd>;
 }
 
-export function Hotkey() {
+const KEY_SYMBOLS: Record<string, string> = {
+  opt: "⌥",
+  option: "⌥",
+  alt: "⌥",
+  optright: "右⌥",
+  optleft: "左⌥",
+  shift: "⇧",
+  cmd: "⌘",
+  command: "⌘",
+  cmdright: "右⌘",
+  cmdleft: "左⌘",
+  ctrl: "⌃",
+  control: "⌃",
+  fn: "fn",
+  space: "␣",
+};
+
+/** 渲染快捷鍵組合（handy-keys 字串格式，如 "Opt+Shift+C"、"CmdRight"） */
+export function Hotkey({ combo = "Opt+Shift+C" }: { combo?: string }) {
+  const parts = combo.split("+").map((p) => p.trim()).filter(Boolean);
   return (
     <span className="inline-flex gap-1 align-middle mx-0.5">
-      <Kbd k="⌥" />
-      <Kbd k="⇧" />
-      <Kbd k="C" />
+      {parts.map((p, i) => (
+        <Kbd key={i} k={KEY_SYMBOLS[p.toLowerCase()] ?? p.toUpperCase()} />
+      ))}
     </span>
   );
 }

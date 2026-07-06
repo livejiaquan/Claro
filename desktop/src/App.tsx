@@ -77,11 +77,13 @@ export default function App() {
   return (
     <div className="flex h-screen">
       {/* 側欄 */}
+      {/* data-tauri-drag-region：Tauri 的拖曳靠這個屬性（-webkit-app-region 是 Electron 的，無效） */}
       <aside
+        data-tauri-drag-region
         className="w-[210px] shrink-0 flex flex-col px-3 pb-4 pt-11 titlebar-drag"
         style={{ borderRight: "1px solid var(--hairline)" }}
       >
-        <div className="flex items-center px-2 mb-6">
+        <div data-tauri-drag-region className="flex items-center px-2 mb-6">
           <span className="logo-wave" aria-hidden>
             <i />
             <i />
@@ -139,7 +141,7 @@ export default function App() {
 
       {/* 內容 */}
       <main className="flex-1 overflow-y-auto">
-        <div className="titlebar-drag h-9 sticky top-0 z-10" />
+        <div data-tauri-drag-region className="titlebar-drag h-9 sticky top-0 z-10" />
         <div className="px-9 pb-10 max-w-[880px]">
           {!status ? (
             <div className="page-in space-y-4 pt-2" aria-busy>
