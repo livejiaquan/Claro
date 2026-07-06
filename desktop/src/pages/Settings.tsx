@@ -135,7 +135,9 @@ export default function Settings({
     setTesting(true);
     setTestResult(null);
     setError(null);
-    invoke<string>("test_polish")
+    // 排在存檔佇列後面：剛改完 provider 立刻按測試，要測到「新」設定
+    llmSaveQueue.current
+      .then(() => invoke<string>("test_polish"))
       .then((r) => setTestResult(r))
       .catch((e) => setError(String(e)))
       .finally(() => setTesting(false));

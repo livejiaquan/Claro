@@ -536,6 +536,9 @@ fn set_hotkey(combo: String, state: tauri::State<AppState>) -> Result<(), String
         serde_json::Value::String(combo),
     )
     .map_err(|e| e.to_string())?;
+    // 若正按著舊熱鍵錄音，先強制收尾——換鍵後舊鍵的 release 事件
+    // 會因 id 不符被忽略，不收尾會卡在錄音狀態（review 抓到的情境）
+    let _ = state.core.msg_tx.send(pipeline::Msg::ForceStop);
     let _ = state.core.esc_ctl.lock().unwrap().send(hotkey::Ctl::SetMain(hk));
     Ok(())
 }

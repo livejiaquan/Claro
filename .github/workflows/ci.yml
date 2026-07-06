@@ -34,3 +34,9 @@ jobs:
       - name: Rust tests
         working-directory: desktop/src-tauri
         run: cargo test --lib
+
+      # debug bundle：驗證打包鏈（Info.plist 合併、icon、capabilities）不會等到發版才炸；
+      # debug profile 與上面測試共用編譯快取，成本可控
+      - name: Tauri bundle (debug)
+        working-directory: desktop
+        run: npm run tauri build -- --debug

@@ -27,13 +27,14 @@ impl TextInjector for MacPasteInjector {
         clipboard.set_text(text.to_string()).context("set clipboard")?;
         thread::sleep(Duration::from_millis(50));
 
-        send_cmd_v().context("synthesize Cmd+V")?;
+        // 貼上失敗也要還原剪貼簿——不能讓使用者原本複製的東西被聽寫文字蓋掉
+        let paste_result = send_cmd_v().context("synthesize Cmd+V");
 
         if let Some(old) = backup {
             thread::sleep(Duration::from_millis(300));
             let _ = clipboard.set_text(old);
         }
-        Ok(())
+        paste_result
     }
 }
 

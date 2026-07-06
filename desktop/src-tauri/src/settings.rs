@@ -185,9 +185,14 @@ pub fn update_config_key(path: &Path, key: &str, value: Value) -> anyhow::Result
     update_config_keys(path, vec![(key.to_string(), value)])
 }
 
+/// 全域寫入鎖：多個 Tauri command 併發 read-modify-write 會互相蓋寫
+/// （改輸入裝置後馬上切上下文開關，後寫者可能帶著舊快照覆蓋前者）
+static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 一次更新多個設定鍵、單次寫回——多鍵設定（如 LLM provider/model/base_url）
 /// 必須原子成組寫入，分次寫會在連續操作時留下混搭的中間狀態。
 pub fn update_config_keys(path: &Path, pairs: Vec<(String, Value)>) -> anyhow::Result<()> {
+    let _g = CONFIG_WRITE_LOCK.lock().unwrap();
     let mut cfg = load_config(path);
     for (key, value) in pairs {
         cfg.insert(key, value);
