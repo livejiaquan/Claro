@@ -21,6 +21,7 @@ export default function App() {
   const [page, setPage] = useState<Page>("home");
   const [status, setStatus] = useState<Status | null>(null);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
+  const [llmProgress, setLlmProgress] = useState<DownloadProgress | null>(null);
   const [mic, setMic] = useState<MicLevel>({ level: 0, active: false });
   const [toast, setToast] = useState<string | null>(null);
   const micRef = useRef(false);
@@ -44,10 +45,16 @@ export default function App() {
       }
     });
     const un2 = listen<MicLevel>("mic-level", (e) => setMic(e.payload));
+    const un3 = listen<DownloadProgress>("llm-model-download", (e) => {
+      setLlmProgress(e.payload.done || e.payload.error ? null : e.payload);
+      if (e.payload.error) showToast(`下載失敗：${e.payload.error}`);
+      if (e.payload.done) showToast("模型下載完成");
+    });
     return () => {
       clearInterval(t);
       un1.then((f) => f());
       un2.then((f) => f());
+      un3.then((f) => f());
       if (micRef.current) invoke("mic_test_stop").catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -153,6 +160,7 @@ export default function App() {
               status={status}
               mic={mic}
               progress={progress}
+              llmProgress={llmProgress}
               refresh={refresh}
               onToast={showToast}
             />

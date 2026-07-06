@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
-import type { DownloadProgress, LlmConfig, MicLevel, ModelInfo, Status } from "../types";
+import type { DictEntry, DownloadProgress, LlmConfig, MicLevel, ModelInfo, Status } from "../types";
 import { Hotkey, LevelBar, Row, Section } from "../ui";
 
 /** 自訂 API 的常用服務 preset：帶入 Base URL 與建議模型（都走 OpenAI 相容介面） */
@@ -17,12 +17,14 @@ export default function Settings({
   status,
   mic,
   progress,
+  llmProgress,
   refresh,
   onToast,
 }: {
   status: Status;
   mic: MicLevel;
   progress: DownloadProgress | null;
+  llmProgress: DownloadProgress | null;
   refresh: () => void;
   onToast: (msg: string) => void;
 }) {
@@ -36,8 +38,24 @@ export default function Settings({
   const [localModels, setLocalModels] = useState<{ provider: string; models: string[] } | null>(null);
   const [localModelsErr, setLocalModelsErr] = useState<{ provider: string; msg: string } | null>(null);
 
+  const [builtinLlms, setBuiltinLlms] = useState<ModelInfo[]>([]);
+  const [dict, setDict] = useState<DictEntry[] | null>(null);
+  const [dictDraft, setDictDraft] = useState<DictEntry>({ from: "", to: "" });
+
   const loadModels = () => invoke<ModelInfo[]>("list_models").then(setModels).catch(() => {});
   const loadLlm = () => invoke<LlmConfig>("get_llm_config").then(setLlm).catch(() => {});
+  const loadBuiltinLlms = () =>
+    invoke<ModelInfo[]>("list_builtin_llms").then(setBuiltinLlms).catch(() => {});
+  const loadDict = () => invoke<DictEntry[]>("get_dictionary").then(setDict).catch(() => {});
+
+  // 字典整存（串行化，同 saveLlm 的理由）
+  const dictSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
+  const saveDict = (entries: DictEntry[]) => {
+    setDict(entries);
+    dictSaveQueue.current = dictSaveQueue.current.then(() =>
+      invoke("set_dictionary", { entries }).catch((e) => setError(String(e))),
+    );
+  };
 
   const loadLocalModels = (provider: string) => {
     setLocalModels(null);
@@ -50,7 +68,13 @@ export default function Settings({
   useEffect(() => {
     loadModels();
     loadLlm();
+    loadBuiltinLlms();
+    loadDict();
   }, []);
+  // 內建 LLM 下載進度改變清單狀態
+  useEffect(() => {
+    loadBuiltinLlms();
+  }, [llmProgress?.model_id, llmProgress?.done, llm?.model, llm?.provider]);
 
   // 選到本機服務時偵測其模型清單
   useEffect(() => {
@@ -258,11 +282,92 @@ export default function Settings({
             <option value="apple" disabled={!!llm && [1, 4].includes(llm.apple_status)}>
               Apple Intelligence（免安裝{llm?.apple_status === 0 ? "・推薦" : ""}）
             </option>
+            <option value="builtin">內建模型（免安裝・高精度）</option>
             <option value="ollama">Ollama（本機服務）</option>
             <option value="lmstudio">LM Studio（本機服務）</option>
             <option value="custom">自訂 API（OpenAI 相容）</option>
           </select>
         </Row>
+
+        {llm?.provider === "builtin" && (
+          <>
+            {builtinLlms.map((m) => {
+              const isDownloading = llmProgress?.model_id === m.id && !llmProgress.done;
+              const pct =
+                isDownloading && llmProgress!.total_mb
+                  ? Math.min(100, (llmProgress!.downloaded_mb / llmProgress!.total_mb) * 100)
+                  : null;
+              return (
+                <div className="row" key={m.id} style={{ alignItems: "flex-start" }}>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="row-label">{m.label}</span>
+                      {m.recommended && <span className="pill blue">推薦</span>}
+                      {m.active && m.downloaded && (
+                        <span className="pill green">
+                          <span className="dot" />
+                          使用中
+                        </span>
+                      )}
+                    </div>
+                    <div className="row-sub">
+                      {m.desc}・{m.size_mb >= 1024 ? `${(m.size_mb / 1024).toFixed(1)} GB` : `${m.size_mb} MB`}
+                      ・閒置 5 分鐘自動釋放記憶體
+                    </div>
+                    {isDownloading && (
+                      <div className="mt-2 w-[240px]">
+                        <div className="progress-track">
+                          <div
+                            className="progress-fill"
+                            style={{ width: pct !== null ? `${pct}%` : "30%" }}
+                          />
+                        </div>
+                        <div className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
+                          {llmProgress!.downloaded_mb}/{llmProgress!.total_mb ?? "?"} MB
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 pt-0.5">
+                    {m.downloaded && !m.active && (
+                      <>
+                        <button className="btn no-drag" onClick={() => saveLlm({ model: m.id })}>
+                          使用
+                        </button>
+                        <button
+                          className="btn no-drag"
+                          style={{ color: "var(--red)" }}
+                          onClick={() =>
+                            invoke("delete_builtin_llm", { id: m.id })
+                              .then(() => {
+                                loadBuiltinLlms();
+                                onToast("已刪除");
+                              })
+                              .catch((e) => setError(String(e)))
+                          }
+                        >
+                          刪除
+                        </button>
+                      </>
+                    )}
+                    {!m.downloaded && !isDownloading && (
+                      <button
+                        className="btn no-drag"
+                        onClick={() =>
+                          invoke("download_builtin_llm", { id: m.id }).catch((e) =>
+                            setError(String(e)),
+                          )
+                        }
+                      >
+                        下載
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </>
+        )}
 
         {llm?.provider === "apple" && (
           <Row
@@ -419,6 +524,101 @@ export default function Settings({
             )}
           </>
         )}
+      </Section>
+
+      <Section title="螢幕上下文">
+        <Row
+          label="讀取畫面詞彙"
+          sub="聽寫時讀取目前視窗的內容（app 名稱、標題、游標周邊文字），把出現過的術語餵給辨識與潤飾——中英混雜的正確率關鍵。內容只在記憶體、永不儲存；密碼欄永不讀取。"
+        >
+          <select
+            className="select no-drag"
+            value={status.context_enabled ? "on" : "off"}
+            onChange={(e) =>
+              invoke("set_context_enabled", { enabled: e.target.value === "on" })
+                .then(refresh)
+                .catch((err) => setError(String(err)))
+            }
+          >
+            <option value="on">開啟（建議）</option>
+            <option value="off">關閉</option>
+          </select>
+        </Row>
+      </Section>
+
+      <Section title="個人字典">
+        <Row
+          label="常用詞修正"
+          sub="左邊填常被認錯的寫法、右邊填正確寫法。正確詞彙也會直接提示語音模型，讓它下次少認錯。"
+        >
+          <span />
+        </Row>
+        {(dict ?? []).map((e, i) => (
+          <div className="row" key={i}>
+            <div className="flex items-center gap-2 flex-1">
+              <input
+                className="select no-drag"
+                style={{ minWidth: 140 }}
+                value={e.from}
+                onChange={(ev) => {
+                  const next = [...(dict ?? [])];
+                  next[i] = { ...next[i], from: ev.target.value };
+                  setDict(next);
+                }}
+                onBlur={() => saveDict(dict ?? [])}
+              />
+              <span style={{ color: "var(--faint)" }}>→</span>
+              <input
+                className="select no-drag"
+                style={{ minWidth: 140 }}
+                value={e.to}
+                onChange={(ev) => {
+                  const next = [...(dict ?? [])];
+                  next[i] = { ...next[i], to: ev.target.value };
+                  setDict(next);
+                }}
+                onBlur={() => saveDict(dict ?? [])}
+              />
+            </div>
+            <button
+              className="btn no-drag"
+              style={{ color: "var(--red)" }}
+              onClick={() => saveDict((dict ?? []).filter((_, j) => j !== i))}
+            >
+              刪除
+            </button>
+          </div>
+        ))}
+        <div className="row">
+          <div className="flex items-center gap-2 flex-1">
+            <input
+              className="select no-drag"
+              style={{ minWidth: 140 }}
+              placeholder="誤認詞（如 GBT）"
+              value={dictDraft.from}
+              onChange={(e) => setDictDraft({ ...dictDraft, from: e.target.value })}
+            />
+            <span style={{ color: "var(--faint)" }}>→</span>
+            <input
+              className="select no-drag"
+              style={{ minWidth: 140 }}
+              placeholder="正確詞（如 GPT）"
+              value={dictDraft.to}
+              onChange={(e) => setDictDraft({ ...dictDraft, to: e.target.value })}
+            />
+          </div>
+          <button
+            className="btn no-drag"
+            disabled={!dictDraft.from.trim() || !dictDraft.to.trim()}
+            onClick={() => {
+              saveDict([...(dict ?? []), dictDraft]);
+              setDictDraft({ from: "", to: "" });
+              onToast("已加入字典");
+            }}
+          >
+            加入
+          </button>
+        </div>
       </Section>
 
       <Section title="權限">

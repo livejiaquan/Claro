@@ -43,4 +43,11 @@ hound = "3.5"
 [target.'cfg(target_os = "macos")'.dependencies]
 # Whisper 家族走 transcribe-cpp（GGUF/ggml，Metal）；ONNX 家族（M2：SenseVoice 等）再加 transcribe-rs
 transcribe-cpp = { version = "0.1.1", default-features = false, features = ["metal"] }
+# 內建 LLM 潤飾（llm.rs）：llama.cpp in-process，Metal
+llama-cpp-2 = { version = "0.1.122", features = ["metal"] }
 macos-accessibility-client = "0.0.1"
+# AX 上下文擷取（context.rs）：CF 型別＋NSWorkspace 前景 app（版本對齊 tauri 依賴樹）
+core-foundation = "0.10"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication"] }
+objc2-foundation = "0.3"

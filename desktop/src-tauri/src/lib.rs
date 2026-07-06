@@ -1,7 +1,9 @@
 pub mod audio;
+pub mod context;
 pub mod history;
 pub mod hotkey;
 pub mod inject;
+pub mod llm;
 pub mod models;
 pub mod overlay_client;
 pub mod pipeline;
@@ -14,7 +16,7 @@ pub mod textproc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 
 use crate::audio::CaptureHandle;
@@ -24,6 +26,7 @@ use crate::stt::registry;
 struct AppState {
     core: Arc<pipeline::Core>,
     downloading: Arc<Mutex<Option<&'static str>>>,
+    llm_downloading: Arc<Mutex<Option<&'static str>>>,
     mic_test: Arc<Mutex<Option<CaptureHandle>>>,
 }
 
@@ -52,6 +55,7 @@ struct Status {
     default_input: Option<String>,
     input_devices: Vec<String>,
     dictation_state: &'static str,
+    context_enabled: bool,
 }
 
 #[tauri::command]
@@ -73,6 +77,7 @@ fn get_status(state: tauri::State<AppState>) -> Status {
         default_input: audio::default_input_name(),
         input_devices: audio::list_input_devices(),
         dictation_state,
+        context_enabled: settings::Settings::load().context_enabled(),
     }
 }
 
@@ -296,6 +301,109 @@ async fn list_provider_models(provider: String) -> Result<Vec<String>, String> {
     .map_err(|e| e.to_string())?
 }
 
+// ─── 內建 LLM 模型管理 ───────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct BuiltinLlmInfo {
+    id: &'static str,
+    label: &'static str,
+    desc: &'static str,
+    size_mb: u64,
+    recommended: bool,
+    downloaded: bool,
+    active: bool,
+    downloading: bool,
+}
+
+#[tauri::command]
+fn list_builtin_llms(state: tauri::State<AppState>) -> Vec<BuiltinLlmInfo> {
+    let s = settings::Settings::load();
+    let active = if s.llm_provider() == "builtin" {
+        let m = s.llm_model();
+        if m.is_empty() { "qwen3-4b-instruct-2507".to_string() } else { m }
+    } else {
+        String::new()
+    };
+    let downloading = *state.llm_downloading.lock().unwrap();
+    llm::LLM_MODELS
+        .iter()
+        .map(|m| BuiltinLlmInfo {
+            id: m.id,
+            label: m.label,
+            desc: m.desc,
+            size_mb: m.approx_bytes / 1_048_576,
+            recommended: m.recommended,
+            downloaded: llm::model_path(m).exists(),
+            active: m.id == active,
+            downloading: downloading == Some(m.id),
+        })
+        .collect()
+}
+
+/// 使用者在 UI 明確點擊後才會呼叫（絕不自動下載，SPEC §6）。
+/// 進度走 "llm-model-download" 事件（與 whisper 的 "model-download" 分流）。
+#[tauri::command]
+fn download_builtin_llm(
+    id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let spec = llm::find(&id).ok_or("未知的內建模型")?;
+    {
+        let mut guard = state.llm_downloading.lock().unwrap();
+        if guard.is_some() {
+            return Err("已有模型在下載中".into());
+        }
+        *guard = Some(spec.id);
+    }
+    let downloading = state.llm_downloading.clone();
+    std::thread::spawn(move || {
+        let dest = llm::model_path(spec);
+        let result = models::download(spec.url, &dest, None, |p| {
+            let _ = app.emit(
+                "llm-model-download",
+                DownloadProgress {
+                    model_id: spec.id,
+                    downloaded_mb: p.downloaded / 1_048_576,
+                    total_mb: p.total.map(|t| t / 1_048_576),
+                    done: false,
+                    error: None,
+                },
+            );
+        });
+        let payload = match result {
+            Ok(()) => DownloadProgress {
+                model_id: spec.id,
+                downloaded_mb: 0,
+                total_mb: None,
+                done: true,
+                error: None,
+            },
+            Err(e) => DownloadProgress {
+                model_id: spec.id,
+                downloaded_mb: 0,
+                total_mb: None,
+                done: false,
+                error: Some(e.to_string()),
+            },
+        };
+        let _ = app.emit("llm-model-download", payload);
+        *downloading.lock().unwrap() = None;
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_builtin_llm(id: String) -> Result<(), String> {
+    let spec = llm::find(&id).ok_or("未知的內建模型")?;
+    let s = settings::Settings::load();
+    if s.llm_provider() == "builtin" && s.llm_model() == spec.id {
+        return Err("使用中的模型不能刪除，先切換潤飾引擎或模型".into());
+    }
+    llm::unload_now();
+    std::fs::remove_file(llm::model_path(spec)).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn set_llm_config(provider: String, model: String, base_url: String) -> Result<(), String> {
     settings::update_config_keys(
@@ -324,6 +432,54 @@ async fn test_polish() -> Result<String, String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+// ─── 字典與上下文 ────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct DictEntry {
+    from: String,
+    to: String,
+}
+
+#[tauri::command]
+fn get_dictionary() -> Vec<DictEntry> {
+    settings::Settings::load()
+        .dictionary()
+        .into_iter()
+        .map(|(from, to)| DictEntry { from, to })
+        .collect()
+}
+
+/// 整份覆寫字典（UI 是小清單，整存最單純）；同步熱更新 pipeline。
+#[tauri::command]
+fn set_dictionary(entries: Vec<DictEntry>, state: tauri::State<AppState>) -> Result<(), String> {
+    let mut map = serde_json::Map::new();
+    for e in &entries {
+        let from = e.from.trim();
+        let to = e.to.trim();
+        if !from.is_empty() && !to.is_empty() {
+            map.insert(from.to_string(), serde_json::Value::String(to.to_string()));
+        }
+    }
+    settings::update_config_key(
+        &settings::config_path(),
+        "dictionary",
+        serde_json::Value::Object(map),
+    )
+    .map_err(|e| e.to_string())?;
+    *state.core.dict.lock().unwrap() = settings::Settings::load().dictionary();
+    Ok(())
+}
+
+#[tauri::command]
+fn set_context_enabled(enabled: bool) -> Result<(), String> {
+    settings::update_config_key(
+        &settings::config_path(),
+        "context_enabled",
+        serde_json::Value::Bool(enabled),
+    )
+    .map_err(|e| e.to_string())
 }
 
 // ─── 歷史與剪貼簿 ────────────────────────────────────────────────────────────
@@ -449,6 +605,7 @@ fn init_core(app: &tauri::AppHandle) {
     app.manage(AppState {
         core,
         downloading: Arc::new(Mutex::new(None)),
+        llm_downloading: Arc::new(Mutex::new(None)),
         mic_test: Arc::new(Mutex::new(None)),
     });
 }
@@ -477,6 +634,12 @@ pub fn run() {
             set_llm_key,
             list_provider_models,
             test_polish,
+            get_dictionary,
+            set_dictionary,
+            set_context_enabled,
+            list_builtin_llms,
+            download_builtin_llm,
+            delete_builtin_llm,
             get_history,
             copy_text,
             retry_hotkey
@@ -504,6 +667,7 @@ pub fn run() {
             tauri::RunEvent::Exit => {
                 if let Some(state) = app.try_state::<AppState>() {
                     state.core.overlay.stop();
+                    llm::unload_now();
                     // 主動釋放 whisper/Metal 資源：留給 atexit teardown 會 ggml_abort
                     // （SIGABRT + crash report）。背景載入/轉錄可能占著鎖，最多等 3s；
                     // 還是拿不到就跳過 atexit 直接收場（_exit），寧可少跑 teardown

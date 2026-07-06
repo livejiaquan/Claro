@@ -9,6 +9,7 @@ export interface Status {
   default_input: string | null;
   input_devices: string[];
   dictation_state: "idle" | "recording" | "processing";
+  context_enabled: boolean;
 }
 
 export interface ModelInfo {
@@ -29,6 +30,11 @@ export interface LlmConfig {
   has_key: boolean;
   /** Apple Intelligence 可用性：0=可用 1=裝置不支援 2=未開啟 3=模型下載中 4=系統過舊 5=其他 */
   apple_status: number;
+}
+
+export interface DictEntry {
+  from: string;
+  to: string;
 }
 
 export interface DownloadProgress {

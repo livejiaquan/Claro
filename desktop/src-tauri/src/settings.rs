@@ -14,6 +14,10 @@ pub fn default_config() -> Map<String, Value> {
         "whisper_model": "large-v3-turbo",
         "llm_model": "mlx-community/Qwen2.5-7B-Instruct-4bit",
         "llm_enabled": true,
+        // 個人字典（誤認詞 → 正確詞）：貼上前替換＋餵給語音模型做詞彙偏置
+        "dictionary": { "GBT": "GPT", "My Torch": "PyTorch" },
+        // 螢幕上下文（AX）：抓前景視窗詞彙給辨識與潤飾；內容永不落盤
+        "context_enabled": true,
     }) else {
         unreachable!()
     };
@@ -138,6 +142,29 @@ impl Settings {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string()
+    }
+
+    /// 個人字典（誤認詞 → 正確詞）。config 缺鍵時回預設字典。
+    pub fn dictionary(&self) -> Vec<(String, String)> {
+        self.raw
+            .get("dictionary")
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| {
+                        let to = v.as_str()?.trim();
+                        let from = k.trim();
+                        (!from.is_empty() && !to.is_empty())
+                            .then(|| (from.to_string(), to.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(crate::textproc::default_dict)
+    }
+
+    /// 螢幕上下文擷取開關（預設開；內容只在記憶體，永不落盤）
+    pub fn context_enabled(&self) -> bool {
+        self.raw.get("context_enabled").and_then(Value::as_bool).unwrap_or(true)
     }
 }
 

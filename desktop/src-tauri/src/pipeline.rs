@@ -33,7 +33,8 @@ pub struct Core {
     pub active_model: Mutex<&'static ModelSpec>,
     pub overlay: OverlayClient,
     pub injector: Box<dyn TextInjector>,
-    pub dict: Vec<(String, String)>,
+    /// 個人字典（設定 UI 可即時更新）
+    pub dict: Mutex<Vec<(String, String)>>,
     /// 熱鍵服務可能在授權後重試重建，所以是 Mutex
     pub esc_ctl: Mutex<crossbeam_channel::Sender<EscControl>>,
     pub msg_tx: crossbeam_channel::Sender<Msg>,
@@ -61,7 +62,7 @@ impl Core {
             active_model: Mutex::new(active_model),
             overlay,
             injector,
-            dict: textproc::default_dict(),
+            dict: Mutex::new(Settings::load().dictionary()),
             esc_ctl: Mutex::new(esc_ctl),
             msg_tx,
             input_device: Mutex::new(input_device),
@@ -245,13 +246,32 @@ fn process_session(core: &Arc<Core>, _session: u64, cancel: &AtomicBool) {
     let dur = samples.len() as f64 / audio::TARGET_RATE as f64;
     core.overlay.send("processing");
 
+    // 螢幕上下文（M3 前移）：AX 抓前景視窗詞彙，餵辨識偏置＋潤飾參考。
+    // 只在記憶體、永不落盤；使用者可在設定關閉。
+    let screen_ctx = if Settings::load().context_enabled() {
+        let t = Instant::now();
+        let ctx = crate::context::capture().unwrap_or_default();
+        if !ctx.is_empty() {
+            tracing::info!(
+                "🖥️ context: {} chars in {}ms",
+                ctx.chars().count(),
+                t.elapsed().as_millis()
+            );
+        }
+        ctx
+    } else {
+        String::new()
+    };
+
     let t0 = Instant::now();
+    let dict_pairs = core.dict.lock().unwrap().clone();
     let raw = {
-        let dict_terms: Vec<String> = core.dict.iter().map(|(_, right)| right.clone()).collect();
+        let dict_terms: Vec<String> = dict_pairs.iter().map(|(_, right)| right.clone()).collect();
+        let terms = crate::context::context_terms(&dict_terms, &screen_ctx, 15);
         let req = crate::stt::SttRequest {
             audio: &samples,
             language: Some("zh"),
-            initial_prompt: Some(crate::stt::build_initial_prompt(&dict_terms)),
+            initial_prompt: Some(crate::stt::build_initial_prompt(&terms)),
         };
         match core.engine.lock().unwrap().transcribe(&req) {
             Ok(t) => t,
@@ -278,13 +298,13 @@ fn process_session(core: &Arc<Core>, _session: u64, cancel: &AtomicBool) {
         return;
     }
 
-    let mut text = textproc::apply_dict(&raw, &core.dict);
+    let mut text = textproc::apply_dict(&raw, &dict_pairs);
 
     // LLM 潤飾（使用者在設定中選擇；失敗一律退回原文，聽寫不因 LLM 而失敗）
     let mut polish_ms: Option<u64> = None;
     if let Some(polisher) = polish::from_settings(&Settings::load()) {
         let t1 = Instant::now();
-        match polisher.polish(&text, "") {
+        match polisher.polish(&text, &screen_ctx) {
             Ok(p) => {
                 text = textproc::normalize_cjk_punct(&textproc::to_traditional(&p));
                 polish_ms = Some(t1.elapsed().as_millis() as u64);

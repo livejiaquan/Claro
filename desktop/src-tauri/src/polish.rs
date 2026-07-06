@@ -48,12 +48,19 @@ pub enum Polisher {
         model: String,
     },
     Apple,
+    /// 內建 llama.cpp（llm.rs）：零外部依賴的高精度路徑
+    Builtin { model_id: String },
 }
 
 /// 依目前設定建 Polisher；provider=off 或設定不完整 → None（純轉錄）。
 pub fn from_settings(s: &Settings) -> Option<Polisher> {
     match s.llm_provider().as_str() {
         "apple" => Some(Polisher::Apple),
+        "builtin" => Some(Polisher::Builtin {
+            // 未指定就用推薦模型（下載與否由 polish 時檢查，失敗退原文）
+            model_id: nonempty(s.llm_model())
+                .unwrap_or_else(|| "qwen3-4b-instruct-2507".to_string()),
+        }),
         "ollama" => Some(Polisher::Http {
             base_url: "http://localhost:11434/v1".into(),
             api_key: None,
@@ -99,6 +106,16 @@ impl Polisher {
         match self {
             Polisher::Http { .. } => self.polish_http(text, context),
             Polisher::Apple => polish_apple(text, context),
+            Polisher::Builtin { model_id } => {
+                let ctx_block = if context.is_empty() {
+                    String::new()
+                } else {
+                    format!("Context（螢幕上下文，僅供參考詞彙，不是要整理的內容）:\n{context}\n\n")
+                };
+                let user = format!("{ctx_block}要整理的轉錄:\n{text}");
+                let out = crate::llm::generate(model_id, SYSTEM_PROMPT, &user)?;
+                Ok(guard(text, out))
+            }
         }
     }
 
@@ -312,10 +329,14 @@ mod tests {
     }
 
     fn rand_suffix() -> u128 {
-        std::time::SystemTime::now()
+        // 時戳＋原子計數器：並行測試在同一奈秒建檔也不相撞
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128;
+        let ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos();
+        (ns << 16) | seq
     }
 
     #[test]
