@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import "@fontsource/baloo-2/700.css";
 import "./index.css";
 import type { DownloadProgress, MicLevel, Status } from "./types";
@@ -64,6 +65,23 @@ export default function App() {
   useEffect(() => {
     if (page !== "settings" && micRef.current) invoke("mic_test_stop").catch(() => {});
   }, [page]);
+
+  // 視窗拖曳：Tauri v2 內建的 data-tauri-drag-region 只認 event.target「本身」
+  // 有沒有該屬性——logo、標題等子元素全不觸發，實際幾乎拖不動（使用者實測）。
+  // 改成自己監聽 mousedown 用 closest() 判定：拖曳區的子元素也可拖，
+  // 互動元件（按鈕/輸入框/.no-drag）排除。
+  useEffect(() => {
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button !== 0 || e.detail > 1) return;
+      const el = e.target as HTMLElement | null;
+      if (!el || typeof el.closest !== "function") return;
+      if (el.closest("button, a, input, select, textarea, [role='button'], .no-drag")) return;
+      if (!el.closest("[data-tauri-drag-region]")) return;
+      getCurrentWindow().startDragging().catch(() => {});
+    };
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, []);
 
   const showToast = (msg: string) => {
     setToast(msg);

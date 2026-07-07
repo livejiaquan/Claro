@@ -555,6 +555,25 @@ fn open_accessibility_settings(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// 「已勾選卻仍顯示未啟用」的解法：無正式簽章的 app 每次重建簽章雜湊都變，
+/// macOS 的輔助使用授權綁簽章——舊條目看似勾選、實際對新版無效，重新勾選
+/// 也救不回來。tccutil 清掉本 app 的舊條目後重新觸發系統詢問；授權後
+/// init_core 的輪詢執行緒會自動接上熱鍵，不用重開 app。
+#[tauri::command]
+fn reset_accessibility(app: tauri::AppHandle) -> Result<(), String> {
+    let id = app.config().identifier.clone();
+    let out = std::process::Command::new("tccutil")
+        .args(["reset", "Accessibility", &id])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    #[cfg(target_os = "macos")]
+    let _ = macos_accessibility_client::accessibility::application_is_trusted_with_prompt();
+    Ok(())
+}
+
 /// 使用者授予輔助使用權限後，不用重啟就能啟用熱鍵。
 #[tauri::command]
 fn retry_hotkey(state: tauri::State<AppState>) -> Result<bool, String> {
@@ -706,6 +725,7 @@ pub fn run() {
             delete_builtin_llm,
             set_hotkey,
             open_accessibility_settings,
+            reset_accessibility,
             get_history,
             copy_text,
             retry_hotkey

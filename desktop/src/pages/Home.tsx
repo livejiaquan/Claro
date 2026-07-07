@@ -65,16 +65,26 @@ export default function Home({
               <div className="row-label">快捷鍵尚未啟用——需要「輔助使用」權限</div>
               <div className="row-sub">
                 macOS 要求語音輸入工具取得輔助使用權限才能監聽快捷鍵與貼上文字。
-                到 系統設定 → 隱私與安全性 → 輔助使用，勾選 Claro（若已在清單中請先移除再重新加入）。
-                授權後會<b>自動啟用</b>，不用重啟。
+                到 系統設定 → 隱私與安全性 → 輔助使用，勾選 Claro。授權後會<b>自動啟用</b>，不用重啟。
+                <br />
+                <b>清單裡已勾選卻仍看到這則訊息？</b>這是 app 更新後舊授權失效（權限綁定舊版簽章）——
+                按「重設授權」清掉舊條目，再到系統設定重新勾選即可。
               </div>
             </div>
-            <button
-              className="btn no-drag"
-              onClick={() => invoke("open_accessibility_settings").catch(() => {})}
-            >
-              打開系統設定
-            </button>
+            <div className="flex flex-col gap-2 shrink-0">
+              <button
+                className="btn no-drag"
+                onClick={() => invoke("open_accessibility_settings").catch(() => {})}
+              >
+                打開系統設定
+              </button>
+              <button
+                className="btn no-drag"
+                onClick={() => invoke("reset_accessibility").catch(() => {})}
+              >
+                重設授權
+              </button>
+            </div>
           </div>
         </div>
       )}
