@@ -96,7 +96,45 @@ fn guard(original: &str, cleaned: String) -> String {
         );
         return original.to_string();
     }
+    // 內容錨定：潤飾是保守糾錯，輸出必須與原文高度重疊。小模型偶爾把聽寫
+    // 當指令回答（Apple 端上模型實測：「幫我重構程式碼」會收到「好的，我會
+    // 按照您的指示……」），這種輸出長度正常、長度防呆擋不住。兩條規則：
+    // 1. 重疊度過低 → 離題回覆；
+    // 2. 輸出變長且大半內容是新增 → 答指令／洩漏提示詞（忠實潤飾只刪語助詞、
+    //    加標點，幾乎不會新增內容；複誦原文詞彙的指令回覆會被這條抓到）。
+    let (sim, novelty, grew) = content_metrics(original, &cleaned);
+    if sim < 0.3 || (grew && novelty > 0.5) {
+        tracing::warn!(
+            "polish output rejected by guard (similarity {sim:.2}, novelty {novelty:.2})"
+        );
+        return original.to_string();
+    }
     cleaned
+}
+
+/// 回傳 (Dice 相似度, 輸出新增內容比例, 輸出是否比原文長)，以字元雙連字計。
+/// 比對前先繁化＋小寫＋去空白：LLM 可能吐簡體（OpenCC 終盤繁化在潤飾之後），
+/// 不先正規化會把忠實輸出誤判成離題。
+fn content_metrics(a: &str, b: &str) -> (f64, f64, bool) {
+    fn norm(s: &str) -> Vec<char> {
+        crate::textproc::to_traditional(s)
+            .to_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+    fn bigrams(cs: &[char]) -> std::collections::HashSet<(char, char)> {
+        cs.windows(2).map(|w| (w[0], w[1])).collect()
+    }
+    let (a, b) = (norm(a), norm(b));
+    if a.len() < 4 || b.len() < 4 {
+        return (1.0, 0.0, false); // 太短沒統計意義，交給長度防呆
+    }
+    let (sa, sb) = (bigrams(&a), bigrams(&b));
+    let inter = sa.intersection(&sb).count() as f64;
+    let sim = 2.0 * inter / (sa.len() + sb.len()) as f64;
+    let novelty = 1.0 - inter / sb.len() as f64;
+    (sim, novelty, b.len() > a.len())
 }
 
 impl Polisher {
@@ -409,5 +447,47 @@ mod tests {
         let explosion = "很".repeat(short.len() * 3 + 201);
         assert_eq!(guard(short, explosion), short);
         assert_eq!(guard("原文本體", "整理後".to_string()), "整理後");
+    }
+
+    // Apple 端上模型實測的失敗樣態：指令型聽寫收到一段長度正常但完全離題的回覆
+    #[test]
+    fn guard_rejects_offtopic_reply() {
+        let input = "幫我把這段程式碼重構一下用 async await 改寫";
+        let reply = "我正在檢查你的文件，確保它們符合我們的格式要求。如果需要進一步的協助，請隨時告訴我。";
+        assert_eq!(guard(input, reply.to_string()), input);
+    }
+
+    // Apple 端上模型實測的另一樣態：複誦原文詞彙的「答應執行」回覆——
+    // 相似度不算低（0.36），靠「變長＋新增內容過半」規則擋
+    #[test]
+    fn guard_rejects_instruction_acknowledgement() {
+        let input = "幫我把這段程式碼重構一下用 async await 改寫";
+        let reply = "好的，我會按照您的指示重構程式碼並使用 async await 來實現。請告訴我您想要重構的程式碼內容，以便我能夠幫助您。";
+        assert_eq!(guard(input, reply.to_string()), input);
+    }
+
+    // 1.5B 級模型實測會把提示詞連同原文一起吐回——原文全在（相似度不低），
+    // 但輸出變長且新增內容過半
+    #[test]
+    fn guard_rejects_prompt_echo() {
+        let input = "我們用 PyTorch 跑訓練然後把模型存到 S3";
+        let reply = format!("Context（螢幕上下文，僅供參考詞彙，不是要整理的內容）:\n要整理的轉錄:\n{input}");
+        assert_eq!(guard(input, reply), input);
+    }
+
+    // 加標點會讓輸出變長，但新增內容比例低——不能被誤殺
+    #[test]
+    fn guard_accepts_punctuation_growth() {
+        let input = "今天開會記得帶筆電然後三點前把報告寄出去";
+        let out = "今天開會記得帶筆電，然後三點前把報告寄出去。".to_string();
+        assert_eq!(guard(input, out.clone()), out);
+    }
+
+    #[test]
+    fn guard_accepts_faithful_polish_across_scripts() {
+        // 忠實潤飾（去語助詞＋改詞）不能被誤殺——即使 LLM 吐簡體（繁化在後）
+        let input = "嗯我們用 hyTorch 那個跑訓練然後把模型存到 S3";
+        let out = "我们用 PyTorch 跑训练然后把模型存到 S3".to_string();
+        assert_eq!(guard(input, out.clone()), out);
     }
 }

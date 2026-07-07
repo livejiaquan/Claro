@@ -52,15 +52,63 @@ pub fn clean_transcript(text: &str) -> String {
     out
 }
 
-/// 個人字典替換：原樣與全小寫兩態（移植 `_apply_dict`）。
-/// M1 沿用 prototype 的內建預設；設定 UI 與持久化在 M2。
+/// 個人字典替換（寬鬆匹配）：忽略大小寫；條目裡的空白可對應文本中零或多個
+/// 空白——Whisper 對 CJK 夾雜的英文詞常把 "My Torch" 黏成 "MyTorch"，
+/// 字面比對會漏掉（實測踩到）。匹配到的字串全小寫時，替換值也轉小寫
+/// （沿用 prototype `_apply_dict` 的兩態行為）。
 pub fn apply_dict(text: &str, dict: &[(String, String)]) -> String {
     let mut t = text.to_string();
     for (wrong, right) in dict {
-        t = t.replace(wrong.as_str(), right);
-        t = t.replace(&wrong.to_lowercase(), &right.to_lowercase());
+        t = replace_loose(&t, wrong, right);
     }
     t
+}
+
+fn replace_loose(text: &str, key: &str, right: &str) -> String {
+    let kc: Vec<char> = key.trim().chars().collect();
+    if kc.is_empty() {
+        return text.to_string();
+    }
+    let tc: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < tc.len() {
+        match match_loose_at(&tc, i, &kc) {
+            Some(end) => {
+                let all_lower = tc[i..end].iter().all(|c| !c.is_uppercase());
+                if all_lower {
+                    out.push_str(&right.to_lowercase());
+                } else {
+                    out.push_str(right);
+                }
+                i = end;
+            }
+            None => {
+                out.push(tc[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// 從 tc[start] 起嘗試匹配 key：key 的空白 → 文本零或多個空白；其餘字元不分大小寫。
+/// 匹配成功回傳結束位置（exclusive）。
+fn match_loose_at(tc: &[char], start: usize, kc: &[char]) -> Option<usize> {
+    let mut i = start;
+    for &k in kc {
+        if k.is_whitespace() {
+            while i < tc.len() && tc[i].is_whitespace() {
+                i += 1;
+            }
+            continue;
+        }
+        if i >= tc.len() || tc[i].to_lowercase().ne(k.to_lowercase()) {
+            return None;
+        }
+        i += 1;
+    }
+    Some(i)
 }
 
 pub fn default_dict() -> Vec<(String, String)> {
@@ -151,6 +199,15 @@ mod tests {
         assert_eq!(apply_dict("我用 GBT 寫 code", &d), "我用 GPT 寫 code");
         assert_eq!(apply_dict("gbt 很好用", &d), "gpt 很好用");
         assert_eq!(apply_dict("My Torch 訓練", &d), "PyTorch 訓練");
+    }
+
+    // Whisper 把 CJK 夾雜的英文詞黏起來或改大小寫時仍要命中（transcribe_file 實測踩到）
+    #[test]
+    fn dict_matches_spaceless_and_mixed_case() {
+        let d = default_dict();
+        assert_eq!(apply_dict("我們用MyTorch跑訓練", &d), "我們用PyTorch跑訓練");
+        assert_eq!(apply_dict("用 my  torch 跑", &d), "用 pytorch 跑");
+        assert_eq!(apply_dict("Gbt 也可以", &d), "GPT 也可以");
     }
 
     #[test]
