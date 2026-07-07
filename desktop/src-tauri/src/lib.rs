@@ -636,7 +636,9 @@ fn init_core(app: &tauri::AppHandle) {
         std::thread::spawn(move || pipeline::run_dispatcher(core, msg_rx));
     }
 
-    // 模型預載（啟動即背景載入，首次聽寫不用等）
+    // 模型預載（啟動即背景載入，首次聽寫不用等）；
+    // 之後交給閒置看門狗——5 分鐘沒聽寫就卸載（待機記憶體預算，SPEC §12），
+    // 下次錄音開始時邊錄邊回載
     {
         let core = core.clone();
         let model_path = registry::model_path(spec);
@@ -650,6 +652,7 @@ fn init_core(app: &tauri::AppHandle) {
             }
         });
     }
+    pipeline::spawn_stt_idle_watcher(core.clone());
 
     // SIGTERM/SIGINT：走 AppHandle::exit 優雅收場（直接 exit 會觸發 crash reporter）
     {

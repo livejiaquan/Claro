@@ -44,6 +44,9 @@ pub struct Core {
     capture: Mutex<Option<CaptureHandle>>,
     recording_flag: Arc<AtomicBool>,
     cancel: Mutex<Arc<AtomicBool>>,
+    /// STT 最後使用時間——閒置看門狗據此卸載（large-v3-turbo 常駐 1.6GB，
+    /// 是待機記憶體的大頭；SPEC §12 待機 <300MB）
+    stt_last_used: Mutex<Instant>,
 }
 
 impl Core {
@@ -69,6 +72,26 @@ impl Core {
             capture: Mutex::new(None),
             recording_flag: Arc::new(AtomicBool::new(false)),
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
+            stt_last_used: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn touch_stt(&self) {
+        *self.stt_last_used.lock().unwrap() = Instant::now();
+    }
+
+    /// 確保 STT 引擎已載入（閒置卸載後的回載）。錄音一開始就在背景先跑，
+    /// 載入時間（large-v3-turbo 約 1.4s）被使用者說話的時間蓋掉。
+    pub fn ensure_stt_loaded(&self) {
+        let mut eng = self.engine.lock().unwrap();
+        if !eng.is_loaded() {
+            let t = Instant::now();
+            match eng.load() {
+                Ok(()) => {
+                    tracing::info!("stt engine reloaded in {:.1}s", t.elapsed().as_secs_f32())
+                }
+                Err(e) => tracing::warn!("stt reload failed: {e}"),
+            }
         }
     }
 
@@ -99,6 +122,37 @@ impl Core {
             }
         });
     }
+}
+
+/// STT 閒置卸載門檻（秒）。與 llm.rs 同款政策（閒置 5 分鐘）；
+/// 驗證時可用環境變數縮短，不必等真的五分鐘。
+fn stt_idle_secs() -> u64 {
+    std::env::var("CLARO_STT_IDLE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300)
+}
+
+/// STT 閒置看門狗：每 10s 檢查，IDLE 且閒置超過門檻就卸載引擎。
+/// 只在狀態機 IDLE 時動手；engine 用 try_lock，轉錄中直接跳過這一輪。
+/// 回載由 start_recording 的背景預載與 process_session 的同步補載負責。
+pub fn spawn_stt_idle_watcher(core: Arc<Core>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(10));
+        if core.sm.lock().unwrap().state() != State::Idle {
+            continue;
+        }
+        let idle = core.stt_last_used.lock().unwrap().elapsed();
+        if idle.as_secs() < stt_idle_secs() {
+            continue;
+        }
+        if let Ok(mut eng) = core.engine.try_lock() {
+            if eng.is_loaded() {
+                eng.unload();
+                tracing::info!("stt engine unloaded after {}s idle", idle.as_secs());
+            }
+        }
+    });
 }
 
 /// dispatcher 主迴圈：在專屬執行緒上跑，直到 msg channel 關閉。
@@ -174,6 +228,10 @@ fn start_recording(core: &Arc<Core>) {
             });
             *core.capture.lock().unwrap() = Some(handle);
             core.overlay.send("recording");
+            // 閒置卸載後的回載：邊錄邊載，載入時間被說話時間蓋掉
+            core.touch_stt();
+            let preload = core.clone();
+            std::thread::spawn(move || preload.ensure_stt_loaded());
             tracing::info!("recording... (release to paste, esc to cancel)");
         }
         Err(e) => {
@@ -285,7 +343,14 @@ fn process_session(core: &Arc<Core>, _session: u64, cancel: &AtomicBool) {
             language: Some("zh"),
             initial_prompt: Some(crate::stt::build_initial_prompt(&terms)),
         };
-        match core.engine.lock().unwrap().transcribe(&req) {
+        let res = {
+            let mut eng = core.engine.lock().unwrap();
+            // 背景預載可能還沒排到或失敗——同步補載，聽寫不能因卸載而失敗
+            if eng.is_loaded() { Ok(()) } else { eng.load() }
+                .and_then(|()| eng.transcribe(&req))
+        };
+        core.touch_stt();
+        match res {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("transcription failed: {e}");
