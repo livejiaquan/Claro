@@ -57,6 +57,15 @@ struct Status {
     dictation_state: &'static str,
     context_enabled: bool,
     hotkey: String,
+    setup_completed: bool,
+    /// 以下欄位讓首頁不必從 provider 名稱猜測隱私狀態；全部由 runtime gate 推導。
+    polish_mode: settings::PolishMode,
+    effective_mode: settings::PolishMode,
+    llm_provider: String,
+    local_only: bool,
+    execution_location: polish::ExecutionLocation,
+    endpoint_origin: Option<String>,
+    blocked_reason: Option<String>,
 }
 
 #[tauri::command]
@@ -67,10 +76,11 @@ fn get_status(state: tauri::State<AppState>) -> Status {
         State::Hold | State::Handsfree => "recording",
         State::Processing => "processing",
     };
+    let settings = settings::Settings::load();
     Status {
         model_id: spec.id.to_string(),
         model_label: spec.label.to_string(),
-        model_present: registry::model_path(spec).exists(),
+        model_present: registry::model_is_verified(spec),
         model_approx_mb: spec.approx_bytes / 1_048_576,
         accessibility: accessibility_trusted(),
         hotkey_active: HOTKEY_ACTIVE.load(Ordering::SeqCst),
@@ -78,8 +88,16 @@ fn get_status(state: tauri::State<AppState>) -> Status {
         default_input: audio::default_input_name(),
         input_devices: audio::list_input_devices(),
         dictation_state,
-        context_enabled: settings::Settings::load().context_enabled(),
-        hotkey: settings::Settings::load().hotkey_combo(),
+        context_enabled: settings.context_enabled(),
+        hotkey: settings.hotkey_combo(),
+        setup_completed: settings.setup_completed(),
+        polish_mode: settings.polish_mode(),
+        effective_mode: polish::effective_mode(&settings),
+        llm_provider: settings.llm_provider(),
+        local_only: settings.local_only(),
+        execution_location: polish::execution_location(&settings),
+        endpoint_origin: polish::endpoint_origin(&settings),
+        blocked_reason: polish::blocked_reason(&settings).map(str::to_string),
     }
 }
 
@@ -87,7 +105,11 @@ fn get_status(state: tauri::State<AppState>) -> Status {
 
 #[tauri::command]
 fn set_input_device(name: String, state: tauri::State<AppState>) -> Result<(), String> {
-    let selection = if name.is_empty() { None } else { Some(name.clone()) };
+    let selection = if name.is_empty() {
+        None
+    } else {
+        Some(name.clone())
+    };
     *state.core.input_device.lock().unwrap() = selection;
     settings::update_config_key(
         &settings::config_path(),
@@ -131,10 +153,22 @@ fn mic_test_start(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
                 }
                 break;
             }
-            let _ = app.emit("mic-level", MicLevel { level: level.get(), active: true });
+            let _ = app.emit(
+                "mic-level",
+                MicLevel {
+                    level: level.get(),
+                    active: true,
+                },
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let _ = app.emit("mic-level", MicLevel { level: 0.0, active: false });
+        let _ = app.emit(
+            "mic-level",
+            MicLevel {
+                level: 0.0,
+                active: false,
+            },
+        );
     });
     Ok(())
 }
@@ -172,7 +206,7 @@ fn list_models(state: tauri::State<AppState>) -> Vec<ModelInfo> {
             desc: m.desc,
             size_mb: m.approx_bytes / 1_048_576,
             recommended: m.recommended,
-            downloaded: registry::model_path(m).exists(),
+            downloaded: registry::model_is_verified(m),
             active: m.id == active,
             downloading: downloading == Some(m.id),
         })
@@ -244,9 +278,8 @@ fn download_model(
 #[tauri::command]
 fn set_model(id: String, state: tauri::State<AppState>) -> Result<(), String> {
     let spec = registry::find(&id).ok_or("未知的模型")?;
-    if !registry::model_path(spec).exists() {
-        return Err("請先下載這個模型".into());
-    }
+    models::verify_model_file(&registry::model_path(spec), spec.sha256)
+        .map_err(|e| format!("請先下載完整且驗證通過的模型：{e}"))?;
     if state.core.sm.lock().unwrap().state() != State::Idle {
         return Err("聽寫進行中，稍後再切換".into());
     }
@@ -279,18 +312,37 @@ struct LlmConfig {
     has_key: bool,
     /// Apple Intelligence 可用性：0=可用 1=裝置不支援 2=未開啟 3=模型下載中 4=系統過舊 5=其他
     apple_status: i32,
+    polish_mode: settings::PolishMode,
+    effective_mode: settings::PolishMode,
+    local_only: bool,
+    organize_consent_valid: bool,
+    cloud_consent_valid: bool,
+    execution_location: polish::ExecutionLocation,
+    endpoint_origin: Option<String>,
+    blocked_reason: Option<String>,
 }
 
-#[tauri::command]
-fn get_llm_config() -> LlmConfig {
-    let s = settings::Settings::load();
+fn llm_config_from_settings(s: &settings::Settings) -> LlmConfig {
     LlmConfig {
         provider: s.llm_provider(),
         model: s.llm_model(),
         base_url: s.llm_base_url(),
         has_key: polish::has_api_key(),
         apple_status: polish::apple_status(),
+        polish_mode: s.polish_mode(),
+        effective_mode: polish::effective_mode(s),
+        local_only: s.local_only(),
+        organize_consent_valid: s.organize_consent_valid(),
+        cloud_consent_valid: s.cloud_consent_valid(),
+        execution_location: polish::execution_location(s),
+        endpoint_origin: polish::endpoint_origin(s),
+        blocked_reason: polish::blocked_reason(s).map(str::to_string),
     }
+}
+
+#[tauri::command]
+fn get_llm_config() -> LlmConfig {
+    llm_config_from_settings(&settings::Settings::load())
 }
 
 /// 本機 LLM 服務（Ollama/LM Studio）目前可用的模型清單；連不上回 Err。
@@ -322,7 +374,11 @@ fn list_builtin_llms(state: tauri::State<AppState>) -> Vec<BuiltinLlmInfo> {
     let s = settings::Settings::load();
     let active = if s.llm_provider() == "builtin" {
         let m = s.llm_model();
-        if m.is_empty() { "qwen3-4b-instruct-2507".to_string() } else { m }
+        if m.is_empty() {
+            "qwen3-4b-instruct-2507".to_string()
+        } else {
+            m
+        }
     } else {
         String::new()
     };
@@ -335,7 +391,7 @@ fn list_builtin_llms(state: tauri::State<AppState>) -> Vec<BuiltinLlmInfo> {
             desc: m.desc,
             size_mb: m.approx_bytes / 1_048_576,
             recommended: m.recommended,
-            downloaded: llm::model_path(m).exists(),
+            downloaded: llm::model_is_verified(m),
             active: m.id == active,
             downloading: downloading == Some(m.id),
         })
@@ -361,7 +417,7 @@ fn download_builtin_llm(
     let downloading = state.llm_downloading.clone();
     std::thread::spawn(move || {
         let dest = llm::model_path(spec);
-        let result = models::download(spec.url, &dest, None, |p| {
+        let result = models::download(spec.url, &dest, spec.sha256, |p| {
             let _ = app.emit(
                 "llm-model-download",
                 DownloadProgress {
@@ -403,7 +459,11 @@ fn delete_builtin_llm(id: String) -> Result<(), String> {
         // 與 from_settings 同語意：model 未設定時實際使用的是預設模型
         let active = {
             let m = s.llm_model();
-            if m.is_empty() { "qwen3-4b-instruct-2507".to_string() } else { m }
+            if m.is_empty() {
+                "qwen3-4b-instruct-2507".to_string()
+            } else {
+                m
+            }
         };
         if active == spec.id {
             return Err("使用中的模型不能刪除，先切換潤飾引擎或模型".into());
@@ -414,7 +474,18 @@ fn delete_builtin_llm(id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_llm_config(provider: String, model: String, base_url: String) -> Result<(), String> {
+fn set_llm_config(
+    provider: String,
+    model: String,
+    base_url: String,
+    confirmed: bool,
+) -> Result<LlmConfig, String> {
+    if !["off", "apple", "builtin", "ollama", "lmstudio", "custom"].contains(&provider.as_str()) {
+        return Err("未知的處理引擎".into());
+    }
+    // confirmed 保留在 command contract，讓 UI 能明確表達敏感操作；雲端權限
+    // 只允許由 set_local_only 寫入，單純改 provider/URL 絕不順便解除隱私 gate。
+    let _ = confirmed;
     settings::update_config_keys(
         &settings::config_path(),
         vec![
@@ -423,7 +494,49 @@ fn set_llm_config(provider: String, model: String, base_url: String) -> Result<(
             ("llm_base_url".into(), base_url.into()),
         ],
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    Ok(get_llm_config())
+}
+
+#[tauri::command]
+fn set_polish_mode(mode: String, confirmed: bool) -> Result<LlmConfig, String> {
+    let mode = mode.parse::<settings::PolishMode>()?;
+    let current = settings::Settings::load();
+    if mode == settings::PolishMode::Organize && !current.organize_consent_valid() && !confirmed {
+        return Err("啟用 ORGANIZE 前必須明確確認它會重排句序與段落".into());
+    }
+    let mut pairs = vec![("polish_mode".into(), mode.as_str().into())];
+    if mode == settings::PolishMode::Organize && confirmed {
+        pairs.push((
+            "organize_consent_version".into(),
+            settings::ORGANIZE_CONSENT_VERSION.into(),
+        ));
+    }
+    settings::update_config_keys(&settings::config_path(), pairs).map_err(|e| e.to_string())?;
+    Ok(get_llm_config())
+}
+
+#[tauri::command]
+fn set_local_only(enabled: bool, confirmed: bool) -> Result<LlmConfig, String> {
+    let current = settings::Settings::load();
+    if !enabled && current.local_only() && !confirmed {
+        return Err("關閉「僅限本機」前必須明確確認雲端資料傳送".into());
+    }
+    let mut pairs = vec![("local_only".into(), enabled.into())];
+    if !enabled && confirmed {
+        pairs.push((
+            "cloud_consent_version".into(),
+            settings::CLOUD_CONSENT_VERSION.into(),
+        ));
+        pairs.push((
+            "cloud_consent_origin".into(),
+            polish::endpoint_origin(&current)
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        ));
+    }
+    settings::update_config_keys(&settings::config_path(), pairs).map_err(|e| e.to_string())?;
+    Ok(get_llm_config())
 }
 
 #[tauri::command]
@@ -435,9 +548,25 @@ fn set_llm_key(key: String) -> Result<(), String> {
 #[tauri::command]
 async fn test_polish() -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(|| {
-        let polisher = polish::from_settings(&settings::Settings::load())
-            .ok_or("尚未設定潤飾（選擇 Apple Intelligence、本機服務或自訂 API）")?;
-        polisher.self_test().map_err(|e| e.to_string())
+        let settings = settings::Settings::load();
+        if settings.polish_mode() == settings::PolishMode::Raw {
+            return Err("RAW 模式不會呼叫整理引擎；請先選擇 CLEAN 或 ORGANIZE".into());
+        }
+        if let Some(reason) = polish::blocked_reason(&settings) {
+            return Err(format!("目前安全退回 RAW：{reason}"));
+        }
+        let result = polish::transform(
+            &settings,
+            "嗯我們用 hyTorch，那個，跑訓練",
+            "PyTorch training pipeline",
+        );
+        if result.metadata.outcome == polish::PolishOutcome::Fallback {
+            return Err(format!(
+                "整理失敗，已安全退回原文：{:?}",
+                result.metadata.fallback_reason
+            ));
+        }
+        Ok(result.text)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -491,6 +620,25 @@ fn set_context_enabled(enabled: bool) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// 首次設定的持久化完成點。前端只會在本次麥克風測試通過後呼叫；
+/// 後端再獨立驗證輔助使用／熱鍵與模型完整性，不接受單純的 UI 旗標。
+#[tauri::command]
+fn complete_setup(state: tauri::State<AppState>) -> Result<(), String> {
+    if !accessibility_trusted() || !HOTKEY_ACTIVE.load(Ordering::SeqCst) {
+        return Err("輔助使用權限或快捷鍵尚未就緒".into());
+    }
+    let spec = *state.core.active_model.lock().unwrap();
+    if !registry::model_is_verified(spec) {
+        return Err("語音模型尚未下載或完整性驗證失敗".into());
+    }
+    settings::update_config_key(
+        &settings::config_path(),
+        "setup_completed",
+        serde_json::Value::Bool(true),
+    )
+    .map_err(|e| e.to_string())
+}
+
 // ─── 歷史與剪貼簿 ────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -539,7 +687,12 @@ fn set_hotkey(combo: String, state: tauri::State<AppState>) -> Result<(), String
     // 若正按著舊熱鍵錄音，先強制收尾——換鍵後舊鍵的 release 事件
     // 會因 id 不符被忽略，不收尾會卡在錄音狀態（review 抓到的情境）
     let _ = state.core.msg_tx.send(pipeline::Msg::ForceStop);
-    let _ = state.core.esc_ctl.lock().unwrap().send(hotkey::Ctl::SetMain(hk));
+    let _ = state
+        .core
+        .esc_ctl
+        .lock()
+        .unwrap()
+        .send(hotkey::Ctl::SetMain(hk));
     Ok(())
 }
 
@@ -604,8 +757,10 @@ fn init_core(app: &tauri::AppHandle) {
     tracing::info!("Claro starting — whisper model: {}", spec.id);
 
     #[cfg(target_os = "macos")]
-    let engine: Box<dyn stt::SttEngine> =
-        Box::new(stt::whisper::WhisperEngine::new(spec.id, registry::model_path(spec)));
+    let engine: Box<dyn stt::SttEngine> = Box::new(stt::whisper::WhisperEngine::new(
+        spec.id,
+        registry::model_path(spec),
+    ));
     #[cfg(not(target_os = "macos"))]
     let engine: Box<dyn stt::SttEngine> = unimplemented!("M1 is macOS-only");
 
@@ -660,14 +815,15 @@ fn init_core(app: &tauri::AppHandle) {
     // 下次錄音開始時邊錄邊回載
     {
         let core = core.clone();
-        let model_path = registry::model_path(spec);
         std::thread::spawn(move || {
-            if model_path.exists() {
+            if registry::model_is_verified(spec) {
                 if let Err(e) = core.engine.lock().unwrap().load() {
                     tracing::warn!("model preload failed: {e}");
                 }
             } else {
-                tracing::info!("model not downloaded yet — open the Claro window to download");
+                tracing::info!(
+                    "model missing or failed integrity verification — open the Claro window to download"
+                );
             }
         });
     }
@@ -695,7 +851,9 @@ fn init_core(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
 
     tauri::Builder::default()
         // 防雙開（雙實例會雙重貼上）；二度啟動時喚出既有視窗。必須是第一個 plugin。
@@ -714,12 +872,15 @@ pub fn run() {
             delete_model,
             get_llm_config,
             set_llm_config,
+            set_polish_mode,
+            set_local_only,
             set_llm_key,
             list_provider_models,
             test_polish,
             get_dictionary,
             set_dictionary,
             set_context_enabled,
+            complete_setup,
             list_builtin_llms,
             download_builtin_llm,
             delete_builtin_llm,
@@ -771,7 +932,9 @@ pub fn run() {
                             break;
                         }
                         if std::time::Instant::now() >= deadline {
-                            tracing::warn!("engine busy at exit — fast-exit to skip Metal teardown");
+                            tracing::warn!(
+                                "engine busy at exit — fast-exit to skip Metal teardown"
+                            );
                             unsafe { libc::_exit(0) };
                         }
                         std::thread::sleep(std::time::Duration::from_millis(50));

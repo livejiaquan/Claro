@@ -1,6 +1,6 @@
 //! 聽寫歷史（~/.claro/history.jsonl），自 prototype/history.py 移植。
-//! 格式不變：{"ts","duration_s","raw","text","status"}；M1 新增可選 "timings"
-//! （舊讀取器不受影響）。檔案 0600、目錄 0700。
+//! 核心格式不變：{"ts","duration_s","raw","text","status"}；新增欄位一律可選，
+//! 舊讀取器可直接忽略。檔案 0600、目錄 0700。
 
 use std::fs;
 use std::io::Write;
@@ -8,6 +8,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
+
+use crate::polish::PolishMetadata;
 
 pub fn history_path() -> PathBuf {
     dirs::home_dir()
@@ -23,6 +25,8 @@ pub struct NewEntry<'a> {
     pub status: &'a str,
     /// 各階段耗時（ms），例如 {"stt": 812, "polish": 1430}
     pub timings: Option<Value>,
+    /// 可選的後處理稽核資訊；舊 JSONL reader 會忽略這個新增欄位。
+    pub polish: Option<PolishMetadata>,
 }
 
 pub fn append_entry(entry: NewEntry, path: &Path) -> anyhow::Result<Value> {
@@ -31,7 +35,9 @@ pub fn append_entry(entry: NewEntry, path: &Path) -> anyhow::Result<Value> {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
 
-    let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string();
+    let ts = chrono::Local::now()
+        .format("%Y-%m-%dT%H:%M:%S%:z")
+        .to_string();
     let mut record = json!({
         "ts": ts,
         "duration_s": (entry.duration_s * 10.0).round() / 10.0,
@@ -41,6 +47,17 @@ pub fn append_entry(entry: NewEntry, path: &Path) -> anyhow::Result<Value> {
     });
     if let Some(t) = entry.timings {
         record["timings"] = t;
+    }
+    if let Some(metadata) = entry.polish {
+        // 扁平欄位方便 History UI 與外部 JSONL 工具取用；完整物件保留
+        // fallback reason / changed 等稽核資訊。兩者都不含螢幕上下文。
+        record["polish_mode"] = serde_json::to_value(metadata.mode)?;
+        record["polish_outcome"] = serde_json::to_value(metadata.outcome)?;
+        record["polish_changed"] = Value::Bool(metadata.changed);
+        if let Some(provider) = &metadata.provider {
+            record["polish_provider"] = Value::String(provider.clone());
+        }
+        record["polish"] = serde_json::to_value(metadata)?;
     }
 
     let mut f = fs::OpenOptions::new()
@@ -74,13 +91,17 @@ mod tests {
 
     fn temp_path() -> PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let d = std::env::temp_dir().join(format!(
-            "claro-hist-{}-{:?}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
-            std::thread::current().id()
-        ))
-        .with_extension("")
-        .join("history.jsonl");
+        let d = std::env::temp_dir()
+            .join(format!(
+                "claro-hist-{}-{:?}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                std::thread::current().id()
+            ))
+            .with_extension("")
+            .join("history.jsonl");
         d
     }
 
@@ -89,7 +110,14 @@ mod tests {
     fn append_creates_file_and_returns_entry() {
         let path = temp_path();
         let e = append_entry(
-            NewEntry { raw: "原始", text: "整理後", duration_s: 3.14, status: "pasted", timings: None },
+            NewEntry {
+                raw: "原始",
+                text: "整理後",
+                duration_s: 3.14,
+                status: "pasted",
+                timings: None,
+                polish: None,
+            },
             &path,
         )
         .unwrap();
@@ -108,7 +136,14 @@ mod tests {
         let path = temp_path();
         for i in 0..5 {
             append_entry(
-                NewEntry { raw: "", text: &format!("t{i}"), duration_s: 1.0, status: "pasted", timings: None },
+                NewEntry {
+                    raw: "",
+                    text: &format!("t{i}"),
+                    duration_s: 1.0,
+                    status: "pasted",
+                    timings: None,
+                    polish: None,
+                },
                 &path,
             )
             .unwrap();
@@ -130,7 +165,14 @@ mod tests {
     fn read_recent_skips_corrupt_lines() {
         let path = temp_path();
         append_entry(
-            NewEntry { raw: "", text: "good", duration_s: 1.0, status: "pasted", timings: None },
+            NewEntry {
+                raw: "",
+                text: "good",
+                duration_s: 1.0,
+                status: "pasted",
+                timings: None,
+                polish: None,
+            },
             &path,
         )
         .unwrap();
@@ -154,11 +196,46 @@ mod tests {
                 duration_s: 2.0,
                 status: "pasted",
                 timings: Some(json!({"stt": 812})),
+                polish: None,
             },
             &path,
         )
         .unwrap();
         let out = read_recent(1, &path);
         assert_eq!(out[0]["timings"]["stt"], 812);
+    }
+
+    #[test]
+    fn optional_polish_metadata_is_written_and_old_shape_stays_valid() {
+        use crate::polish::{PolishMetadata, PolishOutcome};
+        use crate::settings::PolishMode;
+
+        let path = temp_path();
+        append_entry(
+            NewEntry {
+                raw: "先講結論，再講原因",
+                text: "原因。結論。",
+                duration_s: 2.0,
+                status: "pasted",
+                timings: None,
+                polish: Some(PolishMetadata {
+                    mode: PolishMode::Organize,
+                    provider: Some("builtin".into()),
+                    changed: true,
+                    outcome: PolishOutcome::Changed,
+                    fallback_reason: None,
+                }),
+            },
+            &path,
+        )
+        .unwrap();
+        let out = read_recent(1, &path);
+        assert_eq!(out[0]["polish"]["mode"], "organize");
+        assert_eq!(out[0]["polish"]["provider"], "builtin");
+        assert_eq!(out[0]["polish"]["changed"], true);
+        assert_eq!(out[0]["polish"]["outcome"], "changed");
+        assert_eq!(out[0]["polish_mode"], "organize");
+        assert_eq!(out[0]["polish_provider"], "builtin");
+        assert_eq!(out[0]["polish_outcome"], "changed");
     }
 }

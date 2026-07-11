@@ -25,7 +25,11 @@ pub struct WhisperEngine {
 
 impl WhisperEngine {
     pub fn new(id: &str, model_path: PathBuf) -> Self {
-        Self { id: id.to_string(), model_path, session: None }
+        Self {
+            id: id.to_string(),
+            model_path,
+            session: None,
+        }
     }
 }
 
@@ -42,6 +46,15 @@ impl SttEngine for WhisperEngine {
         if self.session.is_some() {
             return Ok(());
         }
+        let spec = super::registry::find(&self.id)
+            .with_context(|| format!("unknown whisper model id '{}'", self.id))?;
+        crate::models::verify_model_file(&self.model_path, spec.sha256).with_context(|| {
+            format!(
+                "verify whisper model {} ({})",
+                spec.label,
+                self.model_path.display()
+            )
+        })?;
         init_backends_once();
         let t0 = std::time::Instant::now();
         let model = Model::load(&self.model_path)

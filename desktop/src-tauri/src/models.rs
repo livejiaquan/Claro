@@ -1,17 +1,334 @@
 //! 模型下載器（SPEC §6，規格照 Handy 實證）：
-//! `.partial` 暫存 + HTTP Range 續傳 + 進度回報 + sha256 校驗（目錄有值才驗）。
+//! `.partial` 暫存 + HTTP Range 續傳 + 進度回報 + 強制 sha256 校驗。
 //! 絕不自動下載——呼叫端（UI/CLI）必須先取得使用者同意。
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub struct Progress {
     pub downloaded: u64,
     pub total: Option<u64>,
+}
+
+/// 模型檔 fingerprint。除規格要求的 size/mtime 外，Unix 再納入 inode、device
+/// 與 ctime；原路徑替換檔案或試圖把 mtime 改回去也會讓 marker 失效。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FileFingerprint {
+    len: u64,
+    modified_secs: i64,
+    modified_nanos: i64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_secs: i64,
+    #[cfg(unix)]
+    changed_nanos: i64,
+}
+
+const VERIFICATION_MARKER_SCHEMA: u32 = 1;
+const VERIFIER_ID: &str = concat!(env!("CARGO_PKG_VERSION"), ":sha256-v1");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VerificationMarker {
+    schema: u32,
+    verifier_id: String,
+    expected_sha256: String,
+    fingerprint: FileFingerprint,
+}
+
+#[derive(Debug, Clone)]
+struct VerificationCacheEntry {
+    fingerprint: FileFingerprint,
+    expected_sha256: String,
+    actual_sha256: String,
+}
+
+static VERIFICATION_CACHE: OnceLock<Mutex<HashMap<PathBuf, VerificationCacheEntry>>> =
+    OnceLock::new();
+static VERIFICATION_GATE: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn verification_cache() -> &'static Mutex<HashMap<PathBuf, VerificationCacheEntry>> {
+    VERIFICATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn file_fingerprint(path: &Path) -> Result<FileFingerprint> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("read model metadata {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("model path is not a regular file: {}", path.display());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(FileFingerprint {
+            len: metadata.len(),
+            modified_secs: metadata.mtime(),
+            modified_nanos: metadata.mtime_nsec(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            changed_secs: metadata.ctime(),
+            changed_nanos: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        use std::time::UNIX_EPOCH;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok());
+        Ok(FileFingerprint {
+            len: metadata.len(),
+            modified_secs: modified
+                .as_ref()
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or_default(),
+            modified_nanos: modified
+                .map(|duration| duration.subsec_nanos() as i64)
+                .unwrap_or_default(),
+        })
+    }
+}
+
+fn verification_marker_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".claro-verified.json");
+    path.with_file_name(name)
+}
+
+fn marker_is_reusable(
+    marker: &VerificationMarker,
+    expected_sha256: &str,
+    fingerprint: &FileFingerprint,
+) -> bool {
+    marker.schema == VERIFICATION_MARKER_SCHEMA
+        && marker.verifier_id == VERIFIER_ID
+        && marker.expected_sha256.eq_ignore_ascii_case(expected_sha256)
+        && marker.fingerprint == *fingerprint
+}
+
+fn reusable_persistent_marker(
+    path: &Path,
+    expected_sha256: &str,
+    fingerprint: &FileFingerprint,
+) -> bool {
+    let marker_path = verification_marker_path(path);
+    let Ok(marker_metadata) = fs::symlink_metadata(&marker_path) else {
+        return false;
+    };
+    if !marker_metadata.is_file() || marker_metadata.file_type().is_symlink() {
+        return false;
+    }
+    // marker 很小；拒絕異常大檔，避免把不可信 sidecar 整個讀進記憶體。
+    if marker_metadata.len() > 4096 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Ok(model_metadata) = fs::metadata(path) else {
+            return false;
+        };
+        if marker_metadata.permissions().mode() & 0o777 != 0o600
+            || marker_metadata.uid() != model_metadata.uid()
+            || marker_metadata.nlink() != 1
+        {
+            return false;
+        }
+    }
+
+    let Ok(bytes) = fs::read(&marker_path) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_slice::<VerificationMarker>(&bytes) else {
+        return false;
+    };
+    marker_is_reusable(&marker, expected_sha256, fingerprint)
+}
+
+fn write_persistent_marker(
+    path: &Path,
+    expected_sha256: &str,
+    fingerprint: &FileFingerprint,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let marker = VerificationMarker {
+        schema: VERIFICATION_MARKER_SCHEMA,
+        verifier_id: VERIFIER_ID.to_string(),
+        expected_sha256: expected_sha256.to_ascii_lowercase(),
+        fingerprint: fingerprint.clone(),
+    };
+    let bytes = serde_json::to_vec(&marker)?;
+    let marker_path = verification_marker_path(path);
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut temp_name = marker_path.file_name().unwrap_or_default().to_os_string();
+    temp_name.push(format!(".tmp-{}-{nonce}-{sequence}", std::process::id()));
+    let temp_path = marker_path.with_file_name(temp_name);
+
+    let result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp_path)
+            .with_context(|| format!("create verification marker {}", temp_path.display()))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp_path, &marker_path)
+            .with_context(|| format!("atomically replace marker {}", marker_path.display()))?;
+        sync_parent_directory(&marker_path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        fs::remove_file(&temp_path).ok();
+    }
+    result
+}
+
+fn remove_persistent_marker(path: &Path) {
+    let marker_path = verification_marker_path(path);
+    match fs::remove_file(&marker_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            "could not remove stale model verification marker {}: {error}",
+            marker_path.display()
+        ),
+    }
+}
+
+fn cache_verification(
+    path: &Path,
+    fingerprint: FileFingerprint,
+    expected_sha256: &str,
+    actual_sha256: &str,
+) {
+    verification_cache().lock().unwrap().insert(
+        path.to_path_buf(),
+        VerificationCacheEntry {
+            fingerprint,
+            expected_sha256: expected_sha256.to_ascii_lowercase(),
+            actual_sha256: actual_sha256.to_ascii_lowercase(),
+        },
+    );
+}
+
+fn cached_digest(
+    path: &Path,
+    fingerprint: &FileFingerprint,
+    expected_sha256: &str,
+) -> Option<String> {
+    verification_cache()
+        .lock()
+        .unwrap()
+        .get(path)
+        .filter(|entry| {
+            entry.fingerprint == *fingerprint
+                && entry.expected_sha256.eq_ignore_ascii_case(expected_sha256)
+        })
+        .map(|entry| entry.actual_sha256.clone())
+}
+
+fn forget_verification(path: &Path) {
+    verification_cache().lock().unwrap().remove(path);
+}
+
+/// 驗證模型內容，並以檔案 identity/metadata 做雙層快取。
+///
+/// process cache 記住正確與錯誤的 digest；0600 persistent marker 只記錄成功
+/// 驗證，並綁定 app version/verifier schema。升級後第一次、marker 權限異常，
+/// 或檔案 fingerprint 改變都會重新 hash；UI polling 只需 stat。
+pub fn verify_model_file(path: &Path, expected_sha256: &str) -> Result<()> {
+    validate_expected_sha256(expected_sha256)?;
+    let before = file_fingerprint(path)?;
+    if let Some(actual) = cached_digest(path, &before, expected_sha256) {
+        return require_matching_digest(path, expected_sha256, &actual);
+    }
+
+    // get_status、list_models 與背景 preload 可能同時查同一檔。第一個 miss
+    // hash 時序列化，拿到 gate 後再查一次，避免並發重讀數 GB。
+    let _gate = VERIFICATION_GATE
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let current = file_fingerprint(path)?;
+    if let Some(actual) = cached_digest(path, &current, expected_sha256) {
+        return require_matching_digest(path, expected_sha256, &actual);
+    }
+    if reusable_persistent_marker(path, expected_sha256, &current) {
+        cache_verification(path, current, expected_sha256, expected_sha256);
+        return Ok(());
+    }
+
+    let (after, actual) = sha256_stable_file(path)?;
+    cache_verification(path, after.clone(), expected_sha256, &actual);
+    if actual.eq_ignore_ascii_case(expected_sha256) {
+        if let Err(error) = write_persistent_marker(path, expected_sha256, &after) {
+            // marker 是效能快取，不應把已完整驗過的模型判成失敗；本 process
+            // 仍有可信 cache，下次啟動會保守地重新 hash。
+            tracing::warn!(
+                "could not persist verification marker for {}: {error}",
+                path.display()
+            );
+        }
+    } else {
+        remove_persistent_marker(path);
+    }
+    require_matching_digest(path, expected_sha256, &actual)
+}
+
+fn require_matching_digest(path: &Path, expected_sha256: &str, actual: &str) -> Result<()> {
+    if !actual.eq_ignore_ascii_case(expected_sha256) {
+        bail!(
+            "sha256 mismatch for {}: expected {expected_sha256}, got {actual}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// UI/status 用：只有內容已通過 digest 驗證才算 downloaded。
+pub fn model_file_is_verified(path: &Path, expected_sha256: &str) -> bool {
+    verify_model_file(path, expected_sha256).is_ok()
+}
+
+/// 呼叫端已在同一 inode 上算過 digest 時，將該結果放入可信的 process cache。
+fn remember_computed_digest(path: &Path, expected_sha256: &str, actual_sha256: &str) -> Result<()> {
+    let fingerprint = file_fingerprint(path)?;
+    cache_verification(path, fingerprint.clone(), expected_sha256, actual_sha256);
+    if actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+        if let Err(error) = write_persistent_marker(path, expected_sha256, &fingerprint) {
+            tracing::warn!(
+                "could not persist verification marker for {}: {error}",
+                path.display()
+            );
+        }
+    } else {
+        remove_persistent_marker(path);
+    }
+    Ok(())
 }
 
 fn partial_path(dest: &Path) -> PathBuf {
@@ -20,21 +337,45 @@ fn partial_path(dest: &Path) -> PathBuf {
     dest.with_file_name(name)
 }
 
-/// 下載 url 到 dest。支援中斷續傳；expected_sha256 有值時完成後校驗。
+/// 下載 url 到 dest。支援中斷續傳，完成後強制校驗 sha256。
 /// progress 每 ~1MB 回呼一次。
 pub fn download(
     url: &str,
     dest: &Path,
-    expected_sha256: Option<&str>,
+    expected_sha256: &str,
     mut progress: impl FnMut(Progress),
 ) -> Result<()> {
+    validate_expected_sha256(expected_sha256)?;
     if dest.exists() {
-        return Ok(());
+        let (_, actual) = sha256_stable_file(dest)?;
+        remember_computed_digest(dest, expected_sha256, &actual)?;
+        if actual.eq_ignore_ascii_case(expected_sha256) {
+            return Ok(());
+        }
+        // download() 只會由使用者明確點擊後進入。既有檔 hash 不符代表
+        // 它不可載入，先移除才能以驗過的內容修復。
+        tracing::warn!(
+            "existing model {} failed sha256 verification; replacing it",
+            dest.display()
+        );
+        fs::remove_file(dest).context("remove corrupt model file")?;
+        forget_verification(dest);
+        remove_persistent_marker(dest);
     }
     if let Some(dir) = dest.parent() {
         fs::create_dir_all(dir)?;
     }
     let partial = partial_path(dest);
+    // 上次程序可能剛好在 hash 通過、rename 前退出。先驗證完整 partial，
+    // 成功就直接完成，不再做一次沒有意義的 Range request。
+    if partial.exists() {
+        let (_, actual) = sha256_stable_file(&partial)?;
+        if actual.eq_ignore_ascii_case(expected_sha256) {
+            finalize_verified_partial(&partial, dest)?;
+            remember_computed_digest(dest, expected_sha256, &actual)?;
+            return Ok(());
+        }
+    }
     let resume_from = partial.metadata().map(|m| m.len()).unwrap_or(0);
 
     let mut req = ureq::get(url);
@@ -46,11 +387,29 @@ pub fn download(
     let (mut offset, total) = match resp.status() {
         // 206：伺服器接受續傳
         206 => {
-            let total = resp
+            let content_range = resp
                 .header("Content-Range")
-                .and_then(|cr| cr.rsplit('/').next())
-                .and_then(|t| t.parse::<u64>().ok());
-            (resume_from, total)
+                .context("206 response missing Content-Range")?;
+            let range = parse_content_range(content_range)
+                .with_context(|| format!("invalid Content-Range '{content_range}'"))?;
+            if range.start != resume_from {
+                bail!(
+                    "resume offset mismatch: requested {resume_from}, server started at {}",
+                    range.start
+                );
+            }
+            if let Some(length) = resp
+                .header("Content-Length")
+                .and_then(|l| l.parse::<u64>().ok())
+            {
+                let range_len = range.end - range.start + 1;
+                if length != range_len {
+                    bail!(
+                        "Content-Length {length} does not match Content-Range length {range_len}"
+                    );
+                }
+            }
+            (resume_from, Some(range.total))
         }
         // 200：伺服器不理 Range（或本來就從頭），重新開始
         200 => {
@@ -84,15 +443,27 @@ pub fn download(
         }
         file.write_all(&buf[..n])?;
         offset += n as u64;
+        if total.is_some_and(|total| offset > total) {
+            drop(file);
+            fs::remove_file(&partial).ok();
+            bail!("download exceeded declared total size");
+        }
         since_report += n as u64;
         if since_report >= 1024 * 1024 {
             since_report = 0;
-            progress(Progress { downloaded: offset, total });
+            progress(Progress {
+                downloaded: offset,
+                total,
+            });
         }
     }
     file.flush()?;
+    file.sync_all()?;
     drop(file);
-    progress(Progress { downloaded: offset, total });
+    progress(Progress {
+        downloaded: offset,
+        total,
+    });
 
     if let Some(total) = total {
         if offset != total {
@@ -100,15 +471,65 @@ pub fn download(
         }
     }
 
-    if let Some(expected) = expected_sha256 {
-        let actual = sha256_file(&partial)?;
-        if !actual.eq_ignore_ascii_case(expected) {
-            fs::remove_file(&partial).ok();
-            bail!("sha256 mismatch: expected {expected}, got {actual}");
-        }
+    let (_, actual) = sha256_stable_file(&partial)?;
+    if !actual.eq_ignore_ascii_case(expected_sha256) {
+        fs::remove_file(&partial).ok();
+        bail!("sha256 mismatch: expected {expected_sha256}, got {actual}");
     }
 
-    fs::rename(&partial, dest).context("finalize model file")?;
+    finalize_verified_partial(&partial, dest)?;
+    remember_computed_digest(dest, expected_sha256, &actual)
+}
+
+/// partial 與目標檔位於同一目錄，rename 在同一 filesystem 內是 atomic；
+/// rename 後再同步父目錄，避免斷電時只落下檔案內容、沒落下目錄項目。
+fn finalize_verified_partial(partial: &Path, dest: &Path) -> Result<()> {
+    fs::rename(partial, dest).context("atomically finalize model file")?;
+    sync_parent_directory(dest).context("sync model directory")
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("model destination has no parent directory")?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ContentRange {
+    start: u64,
+    end: u64,
+    total: u64,
+}
+
+/// 只接受 `bytes START-END/TOTAL`；`*` 或數值不一致都不能續傳。
+fn parse_content_range(value: &str) -> Result<ContentRange> {
+    let rest = value.strip_prefix("bytes ").context("unit must be bytes")?;
+    let (range, total) = rest.split_once('/').context("missing total size")?;
+    let (start, end) = range.split_once('-').context("missing byte range")?;
+    let start = start.parse::<u64>().context("invalid range start")?;
+    let end = end.parse::<u64>().context("invalid range end")?;
+    let total = total.parse::<u64>().context("invalid total size")?;
+    if end < start {
+        bail!("range end precedes start");
+    }
+    if total == 0 || end >= total {
+        bail!("range end is outside total size");
+    }
+    Ok(ContentRange { start, end, total })
+}
+
+fn validate_expected_sha256(expected: &str) -> Result<()> {
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("expected_sha256 must be exactly 64 hexadecimal characters");
+    }
     Ok(())
 }
 
@@ -126,16 +547,311 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn sha256_stable_file(path: &Path) -> Result<(FileFingerprint, String)> {
+    let before = file_fingerprint(path)?;
+    let actual = sha256_file(path)?;
+    let after = file_fingerprint(path)?;
+    if before != after {
+        forget_verification(path);
+        bail!("model file changed while verifying: {}", path.display());
+    }
+    Ok((after, actual))
+}
+
 /// 給 CLI/測試用的簡單進度輸出
 pub fn print_progress(p: Progress) {
     match p.total {
         Some(t) if t > 0 => {
             let pct = p.downloaded as f64 / t as f64 * 100.0;
-            eprint!("\r  下載中 {:.1}% ({}/{} MB)", pct, p.downloaded / 1_048_576, t / 1_048_576);
+            eprint!(
+                "\r  下載中 {:.1}% ({}/{} MB)",
+                pct,
+                p.downloaded / 1_048_576,
+                t / 1_048_576
+            );
         }
         _ => eprint!("\r  下載中 {} MB", p.downloaded / 1_048_576),
     }
     if p.total == Some(p.downloaded) {
         eprintln!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parses_strict_content_range() {
+        assert_eq!(
+            parse_content_range("bytes 3-5/6").unwrap(),
+            ContentRange {
+                start: 3,
+                end: 5,
+                total: 6
+            }
+        );
+        assert!(parse_content_range("bytes */6").is_err());
+        assert!(parse_content_range("bytes 5-3/6").is_err());
+        assert!(parse_content_range("bytes 3-6/6").is_err());
+        assert!(parse_content_range("items 3-5/6").is_err());
+    }
+
+    #[test]
+    fn accepts_an_existing_file_only_when_hash_matches() {
+        let dir = tempdir();
+        let dest = dir.join("model.bin");
+        fs::write(&dest, b"already verified").unwrap();
+        let expected = digest(b"already verified");
+        download("not a URL", &dest, &expected, |_| {}).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"already verified");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn verification_cache_is_reused_until_file_identity_or_metadata_changes() {
+        let dir = tempdir();
+        let dest = dir.join("model.bin");
+        let original = b"trusted-model";
+        let replacement = b"altered-model";
+        assert_eq!(original.len(), replacement.len());
+        fs::write(&dest, original).unwrap();
+        let expected = digest(original);
+
+        forget_verification(&dest);
+        verify_model_file(&dest, &expected).unwrap();
+        let original_fingerprint = file_fingerprint(&dest).unwrap();
+        assert_eq!(
+            cached_digest(&dest, &original_fingerprint, &expected).as_deref(),
+            Some(expected.as_str())
+        );
+
+        // 即使大小相同，改寫也會改變 mtime/ctime，舊 cache 不得沿用。
+        fs::write(&dest, replacement).unwrap();
+        let changed_fingerprint = file_fingerprint(&dest).unwrap();
+        assert_ne!(original_fingerprint, changed_fingerprint);
+        assert!(cached_digest(&dest, &changed_fingerprint, &expected).is_none());
+        assert!(verify_model_file(&dest, &expected).is_err());
+        assert!(!model_file_is_verified(&dest, &expected));
+
+        // 修復同一路徑後，negative cache 也必須因 metadata 改變而失效。
+        fs::write(&dest, original).unwrap();
+        verify_model_file(&dest, &expected).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_marker_is_private_reusable_and_version_bound() {
+        let dir = tempdir();
+        let dest = dir.join("model.bin");
+        let bytes = b"persistently verified";
+        let expected = digest(bytes);
+        fs::write(&dest, bytes).unwrap();
+
+        forget_verification(&dest);
+        verify_model_file(&dest, &expected).unwrap();
+        let marker_path = verification_marker_path(&dest);
+        let marker_metadata = fs::symlink_metadata(&marker_path).unwrap();
+        assert!(marker_metadata.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(marker_metadata.permissions().mode() & 0o777, 0o600);
+        }
+        let fingerprint = file_fingerprint(&dest).unwrap();
+        assert!(reusable_persistent_marker(&dest, &expected, &fingerprint));
+
+        // 模擬 app 升級／verifier schema 變動：舊 marker 絕不能沿用。
+        let mut marker: VerificationMarker =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        marker.verifier_id = "older-app:sha256-v1".into();
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        forget_verification(&dest);
+        assert!(!reusable_persistent_marker(&dest, &expected, &fingerprint));
+        verify_model_file(&dest, &expected).unwrap();
+        let refreshed: VerificationMarker =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        assert_eq!(refreshed.verifier_id, VERIFIER_ID);
+
+        let temp_marker_count = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(temp_marker_count, 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_marker_is_invalidated_by_expected_hash_or_file_change() {
+        let dir = tempdir();
+        let dest = dir.join("model.bin");
+        let original = b"trusted-model";
+        let replacement = b"altered-model";
+        let expected = digest(original);
+        fs::write(&dest, original).unwrap();
+        verify_model_file(&dest, &expected).unwrap();
+
+        let fingerprint = file_fingerprint(&dest).unwrap();
+        let marker_path = verification_marker_path(&dest);
+        let marker: VerificationMarker =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        assert!(!marker_is_reusable(
+            &marker,
+            &digest(b"different expected artifact"),
+            &fingerprint
+        ));
+
+        assert_eq!(original.len(), replacement.len());
+        fs::write(&dest, replacement).unwrap();
+        let changed_fingerprint = file_fingerprint(&dest).unwrap();
+        assert!(!reusable_persistent_marker(
+            &dest,
+            &expected,
+            &changed_fingerprint
+        ));
+        assert!(verify_model_file(&dest, &expected).is_err());
+        assert!(!marker_path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_or_mismatched_file_is_never_reported_as_verified() {
+        let dir = tempdir();
+        let dest = dir.join("model.bin");
+        let expected = digest(b"expected");
+        assert!(!model_file_is_verified(&dest, &expected));
+
+        fs::write(&dest, b"unexpected").unwrap();
+        assert!(!model_file_is_verified(&dest, &expected));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replaces_a_corrupt_existing_file_with_verified_download() {
+        let dir = tempdir();
+        let dest = dir.join("model.bin");
+        fs::write(&dest, b"corrupt").unwrap();
+        let body = b"verified replacement";
+        let url = serve_once(format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        ));
+        download(&url, &dest, &digest(body), |_| {}).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resumes_only_from_the_exact_content_range_start() {
+        let dir = tempdir();
+        let dest = dir.join("model.bin");
+        fs::write(partial_path(&dest), b"abc").unwrap();
+        let url = serve_once(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/6\r\nContent-Length: 3\r\nConnection: close\r\n\r\ndef"
+                .to_string(),
+        );
+        download(&url, &dest, &digest(b"abcdef"), |_| {}).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"abcdef");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_mismatched_content_range_without_touching_partial() {
+        let dir = tempdir();
+        let dest = dir.join("model.bin");
+        let partial = partial_path(&dest);
+        fs::write(&partial, b"abc").unwrap();
+        let url = serve_once(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-5/6\r\nContent-Length: 2\r\nConnection: close\r\n\r\nef"
+                .to_string(),
+        );
+        let error = download(&url, &dest, &digest(b"abcdef"), |_| {}).unwrap_err();
+        assert!(error.to_string().contains("resume offset mismatch"));
+        assert_eq!(fs::read(&partial).unwrap(), b"abc");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_206_without_content_range_without_touching_partial() {
+        let dir = tempdir();
+        let dest = dir.join("model.bin");
+        let partial = partial_path(&dest);
+        fs::write(&partial, b"abc").unwrap();
+        let url = serve_once(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nConnection: close\r\n\r\ndef"
+                .to_string(),
+        );
+        let error = download(&url, &dest, &digest(b"abcdef"), |_| {}).unwrap_err();
+        assert!(error.to_string().contains("missing Content-Range"));
+        assert_eq!(fs::read(&partial).unwrap(), b"abc");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn finalization_atomically_renames_and_syncs_the_parent() {
+        let dir = tempdir();
+        let dest = dir.join("model.bin");
+        let partial = partial_path(&dest);
+        fs::write(&partial, b"verified bytes").unwrap();
+
+        finalize_verified_partial(&partial, &dest).unwrap();
+
+        assert!(!partial.exists());
+        assert_eq!(fs::read(&dest).unwrap(), b"verified bytes");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn already_complete_partial_is_finalized_without_network() {
+        let dir = tempdir();
+        let dest = dir.join("model.bin");
+        let partial = partial_path(&dest);
+        let bytes = b"completed before rename";
+        fs::write(&partial, bytes).unwrap();
+
+        download("not a URL", &dest, &digest(bytes), |_| {}).unwrap();
+
+        assert!(!partial.exists());
+        assert_eq!(fs::read(&dest).unwrap(), bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
+    }
+
+    fn tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "claro-model-test-{}-{nonce}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn serve_once(response: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://{address}/model")
     }
 }

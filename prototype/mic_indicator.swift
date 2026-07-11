@@ -6,14 +6,7 @@ let SOUND_START = "/System/Library/Sounds/Ping.aiff"
 let SOUND_SUCCESS = "/System/Library/Sounds/Pop.aiff"
 let SOUND_ERROR = "/System/Library/Sounds/Basso.aiff"
 let CLARO_DIR = NSHomeDirectory() + "/.claro"
-let CONFIG_PATH = CLARO_DIR + "/config.json"
 let HISTORY_PATH = CLARO_DIR + "/history.jsonl"
-
-private let DEFAULT_CONFIG: [String: Any] = [
-    "whisper_model": "large-v3-mlx",
-    "llm_model": "mlx-community/Qwen2.5-7B-Instruct-4bit",
-    "llm_enabled": true,
-]
 
 private let PILL_W: CGFloat = 150
 private let PILL_H: CGFloat = 38
@@ -478,11 +471,7 @@ class MenuBarController: NSObject, NSMenuDelegate {
     private let statusLine = NSMenuItem(title: "Claro — 待命", action: nil, keyEquivalent: "")
     private let statsLine = NSMenuItem(title: "今日 0 次・0 字", action: nil, keyEquivalent: "")
     private let recentMenu = NSMenu()
-    private var whisperItems: [NSMenuItem] = []
-    private var llmItems: [NSMenuItem] = []
     private var currentStateText = "待命"
-    private var showingRestartMessage = false
-    private var restartMessageToken = 0
 
     override init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -507,13 +496,14 @@ class MenuBarController: NSObject, NSMenuDelegate {
         recentItem.submenu = recentMenu
         menu.addItem(recentItem)
 
+        let openItem = NSMenuItem(title: "開啟 Claro", action: #selector(openClaro(_:)), keyEquivalent: "")
+        openItem.target = self
+        menu.addItem(openItem)
+
         let historyItem = NSMenuItem(title: "開啟歷史紀錄", action: #selector(openHistory(_:)), keyEquivalent: "")
         historyItem.target = self
         menu.addItem(historyItem)
 
-        menu.addItem(.separator())
-        menu.addItem(makeWhisperMenu())
-        menu.addItem(makeLLMMenu())
         menu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: "結束 Claro", action: #selector(quitClaro(_:)), keyEquivalent: "")
@@ -535,120 +525,15 @@ class MenuBarController: NSObject, NSMenuDelegate {
         refreshMenu()
     }
 
-    private func makeWhisperMenu() -> NSMenuItem {
-        let parent = NSMenuItem(title: "Whisper 模型", action: nil, keyEquivalent: "")
-        let submenu = NSMenu()
-        let options = [
-            ("large-v3-mlx", "large-v3-mlx"),
-            ("large-v3-turbo（首次需下載 1.6GB）", "large-v3-turbo"),
-        ]
-        for (title, value) in options {
-            let item = NSMenuItem(title: title, action: #selector(selectWhisperModel(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = value
-            submenu.addItem(item)
-            whisperItems.append(item)
-        }
-        parent.submenu = submenu
-        return parent
-    }
-
-    private func makeLLMMenu() -> NSMenuItem {
-        let parent = NSMenuItem(title: "LLM 潤飾", action: nil, keyEquivalent: "")
-        let submenu = NSMenu()
-        let options: [(String, String?, Bool)] = [
-            ("Qwen2.5-7B（品質佳）", "mlx-community/Qwen2.5-7B-Instruct-4bit", true),
-            ("Qwen2.5-1.5B（較快）", "mlx-community/Qwen2.5-1.5B-Instruct-4bit", true),
-            ("關閉", nil, false),
-        ]
-        for (title, modelID, enabled) in options {
-            let item = NSMenuItem(title: title, action: #selector(selectLLMOption(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = ["model": modelID ?? "", "enabled": enabled]
-            submenu.addItem(item)
-            llmItems.append(item)
-        }
-        parent.submenu = submenu
-        return parent
-    }
-
     private func refreshMenu() {
         updateStatusLine()
         let history = readHistory()
         statsLine.title = "今日 \(history.todayCount) 次・\(history.todayChars) 字"
         rebuildRecentMenu(texts: history.recentTexts)
-        refreshCheckmarks(config: readConfig())
     }
 
     private func updateStatusLine() {
-        guard !showingRestartMessage else { return }
         statusLine.title = "Claro — \(currentStateText)"
-    }
-
-    private func showRestartRequired() {
-        showingRestartMessage = true
-        restartMessageToken += 1
-        let token = restartMessageToken
-        statusLine.title = "重啟後生效"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-            guard self.restartMessageToken == token else { return }
-            self.showingRestartMessage = false
-            self.updateStatusLine()
-        }
-    }
-
-    private func readConfig() -> [String: Any] {
-        var config = DEFAULT_CONFIG
-        guard let data = FileManager.default.contents(atPath: CONFIG_PATH) else {
-            return config
-        }
-        guard let obj = try? JSONSerialization.jsonObject(with: data),
-              let dict = obj as? [String: Any] else {
-            return config
-        }
-        for (key, value) in dict {
-            config[key] = value
-        }
-        return config
-    }
-
-    private func writeConfig(_ config: [String: Any]) {
-        let fm = FileManager.default
-        try? fm.createDirectory(
-            atPath: CLARO_DIR,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: CLARO_DIR)
-
-        guard JSONSerialization.isValidJSONObject(config),
-              let data = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted]) else {
-            return
-        }
-        try? data.write(to: URL(fileURLWithPath: CONFIG_PATH), options: .atomic)
-        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: CONFIG_PATH)
-    }
-
-    private func refreshCheckmarks(config: [String: Any]) {
-        let currentWhisper = config["whisper_model"] as? String
-        for item in whisperItems {
-            item.state = (item.representedObject as? String == currentWhisper) ? .on : .off
-        }
-
-        let llmEnabled = config["llm_enabled"] as? Bool ?? true
-        let currentLLM = config["llm_model"] as? String
-        for item in llmItems {
-            guard let payload = item.representedObject as? [String: Any],
-                  let enabled = payload["enabled"] as? Bool else {
-                item.state = .off
-                continue
-            }
-            if !enabled {
-                item.state = llmEnabled ? .off : .on
-            } else {
-                item.state = (llmEnabled && payload["model"] as? String == currentLLM) ? .on : .off
-            }
-        }
     }
 
     private func readHistory() -> (todayCount: Int, todayChars: Int, recentTexts: [String]) {
@@ -721,28 +606,16 @@ class MenuBarController: NSObject, NSMenuDelegate {
         NSWorkspace.shared.open(URL(fileURLWithPath: HISTORY_PATH))
     }
 
-    @objc private func selectWhisperModel(_ sender: NSMenuItem) {
-        guard let model = sender.representedObject as? String else { return }
-        var config = readConfig()
-        config["whisper_model"] = model
-        writeConfig(config)
-        refreshCheckmarks(config: config)
-        showRestartRequired()
-    }
-
-    @objc private func selectLLMOption(_ sender: NSMenuItem) {
-        guard let payload = sender.representedObject as? [String: Any],
-              let enabled = payload["enabled"] as? Bool else {
-            return
-        }
-        var config = readConfig()
-        config["llm_enabled"] = enabled
-        if enabled, let model = payload["model"] as? String {
-            config["llm_model"] = model
-        }
-        writeConfig(config)
-        refreshCheckmarks(config: config)
-        showRestartRequired()
+    @objc private func openClaro(_ sender: NSMenuItem) {
+        let executable = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        let appURL = executable
+            .deletingLastPathComponent() // MacOS
+            .deletingLastPathComponent() // Contents
+            .deletingLastPathComponent() // Claro.app
+        guard appURL.pathExtension == "app" else { return }
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        NSWorkspace.shared.openApplication(at: appURL, configuration: config, completionHandler: nil)
     }
 
     @objc private func quitClaro(_ sender: NSMenuItem) {
@@ -761,7 +634,7 @@ class SocketServer {
 
     init(path: String) { self.path = path }
 
-    func start(indicator: IndicatorWindow, menu: MenuBarController) {
+    func start(indicator: IndicatorWindow, menu: MenuBarController) -> Bool {
         let claroDir = CLARO_DIR
         try? FileManager.default.createDirectory(
             atPath: claroDir,
@@ -774,13 +647,13 @@ class SocketServer {
         )
         unlink(path)
         sock = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard sock >= 0 else { return }
+        guard sock >= 0 else { return false }
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let bytes = path.utf8CString
         let maxPath = MemoryLayout.size(ofValue: addr.sun_path)
-        guard bytes.count - 1 < maxPath else { close(sock); sock = -1; return }
+        guard bytes.count - 1 < maxPath else { close(sock); sock = -1; return false }
 
         withUnsafeMutablePointer(to: &addr.sun_path.0) { dst in
             bytes.withUnsafeBufferPointer { src in
@@ -793,14 +666,20 @@ class SocketServer {
                 Darwin.bind(sock, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        guard ok == 0 else { close(sock); sock = -1; return }
+        guard ok == 0 else { close(sock); sock = -1; return false }
 
         chmod(path, 0o600)
-        listen(sock, 5)
+        guard listen(sock, 5) == 0 else {
+            close(sock)
+            sock = -1
+            unlink(path)
+            return false
+        }
 
         DispatchQueue.global(qos: .background).async { [weak self] in
             self?.acceptLoop(indicator: indicator, menu: menu)
         }
+        return true
     }
 
     private func acceptLoop(indicator: IndicatorWindow, menu: MenuBarController) {
@@ -858,13 +737,43 @@ class SocketServer {
     }
 }
 
+final class ParentWatcher {
+    private var source: DispatchSourceProcess?
+
+    init?(pid: pid_t) {
+        guard pid > 1, kill(pid, 0) == 0 || errno != ESRCH else { return nil }
+        let source = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
+        source.setEventHandler {
+            NSApplication.shared.terminate(nil)
+        }
+        source.resume()
+        self.source = source
+    }
+}
+
 // Entry
+
+try? FileManager.default.createDirectory(
+    atPath: CLARO_DIR,
+    withIntermediateDirectories: true,
+    attributes: [.posixPermissions: 0o700]
+)
+let lockFD = Darwin.open(CLARO_DIR + "/indicator.lock", O_CREAT | O_RDWR, 0o600)
+guard lockFD >= 0, flock(lockFD, LOCK_EX | LOCK_NB) == 0 else {
+    exit(0)
+}
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let indicator = IndicatorWindow()
 let menuBar = MenuBarController()
 let server = SocketServer(path: CLARO_DIR + "/indicator.sock")
-server.start(indicator: indicator, menu: menuBar)
+guard server.start(indicator: indicator, menu: menuBar) else {
+    exit(1)
+}
+let parentWatcher: ParentWatcher? = {
+    guard CommandLine.arguments.count > 1, let pid = pid_t(CommandLine.arguments[1]) else { return nil }
+    return ParentWatcher(pid: pid)
+}()
 atexit { server.stop() }
 app.run()

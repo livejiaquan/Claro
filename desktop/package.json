@@ -4,8 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
+    "build:indicator": "bash scripts/build-indicator.sh",
+    "dev": "npm run build:indicator && vite",
+    "build": "npm run build:indicator && tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },

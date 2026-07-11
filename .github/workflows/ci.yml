@@ -11,15 +11,15 @@ jobs:
   desktop:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable, 2026-06-30
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
           workspaces: desktop/src-tauri
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -37,6 +37,19 @@ jobs:
 
       # debug bundle：驗證打包鏈（Info.plist 合併、icon、capabilities）不會等到發版才炸；
       # debug profile 與上面測試共用編譯快取，成本可控
-      - name: Tauri bundle (debug)
+      - name: Tauri app bundle (debug)
         working-directory: desktop
-        run: npm run tauri build -- --debug
+        run: npm run tauri build -- --debug --bundles app
+
+      - name: Assert macOS bundle contract
+        run: |
+          APP="desktop/src-tauri/target/debug/bundle/macos/Claro.app"
+          SIDECAR="$APP/Contents/MacOS/mic_indicator"
+          test -d "$APP"
+          test -x "$SIDECAR"
+          test "$(plutil -extract LSMinimumSystemVersion raw "$APP/Contents/Info.plist")" = "11.0"
+          [[ "$(file "$SIDECAR")" =~ arm64|x86_64 ]]
+          MAIN_LOAD_COMMANDS="$(otool -l "$APP/Contents/MacOS/claro")"
+          SIDECAR_LOAD_COMMANDS="$(otool -l "$SIDECAR")"
+          grep -q 'minos 11.0' <<< "$MAIN_LOAD_COMMANDS"
+          grep -q 'minos 11.0' <<< "$SIDECAR_LOAD_COMMANDS"

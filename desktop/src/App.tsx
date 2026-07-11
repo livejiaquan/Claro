@@ -7,20 +7,23 @@ import "./index.css";
 import type { DownloadProgress, MicLevel, Status } from "./types";
 import Home from "./pages/Home";
 import History from "./pages/History";
+import Onboarding from "./pages/Onboarding";
 import Settings from "./pages/Settings";
-import { IconHistory, IconHome, IconSettings } from "./ui";
+import { IconHistory, IconHome, IconSettings, IconSetup } from "./ui";
 
-type Page = "home" | "history" | "settings";
+type Page = "home" | "history" | "setup" | "settings";
 
 const NAV: { id: Page; label: string; icon: () => React.ReactElement }[] = [
   { id: "home", label: "首頁", icon: IconHome },
   { id: "history", label: "歷史紀錄", icon: IconHistory },
+  { id: "setup", label: "首次設定", icon: IconSetup },
   { id: "settings", label: "設定", icon: IconSettings },
 ];
 
 export default function App() {
   const [page, setPage] = useState<Page>("home");
   const [status, setStatus] = useState<Status | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [llmProgress, setLlmProgress] = useState<DownloadProgress | null>(null);
   const [mic, setMic] = useState<MicLevel>({ level: 0, active: false });
@@ -31,8 +34,11 @@ export default function App() {
 
   const refresh = () =>
     invoke<Status>("get_status")
-      .then(setStatus)
-      .catch(() => {});
+      .then((next) => {
+        setStatus(next);
+        setStatusError(null);
+      })
+      .catch((reason) => setStatusError(String(reason)));
 
   useEffect(() => {
     refresh();
@@ -61,9 +67,9 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 離開設定頁自動停止麥克風測試
+  // 離開設定／首次設定頁自動停止麥克風測試
   useEffect(() => {
-    if (page !== "settings" && micRef.current) invoke("mic_test_stop").catch(() => {});
+    if (page !== "settings" && page !== "setup" && micRef.current) invoke("mic_test_stop").catch(() => {});
   }, [page]);
 
   // 視窗拖曳：Tauri v2 內建的 data-tauri-drag-region 只認 event.target「本身」
@@ -89,16 +95,22 @@ export default function App() {
     toastTimer.current = window.setTimeout(() => setToast(null), 1800);
   };
 
-  const ready = status && status.model_present && status.accessibility && status.hotkey_active;
-  const needsSetup = status && !ready;
+  const ready = Boolean(
+    status &&
+    status.model_present &&
+    status.accessibility &&
+    status.hotkey_active &&
+    status.setup_completed,
+  );
+  const needsSetup = Boolean(status && !ready);
 
   return (
-    <div className="flex h-screen">
+    <div className="app-shell flex h-screen">
       {/* 側欄 */}
       {/* data-tauri-drag-region：Tauri 的拖曳靠這個屬性（-webkit-app-region 是 Electron 的，無效） */}
       <aside
         data-tauri-drag-region
-        className="w-[210px] shrink-0 flex flex-col px-3 pb-4 pt-11 titlebar-drag"
+        className="app-sidebar w-[210px] shrink-0 flex flex-col px-3 pb-4 pt-11 titlebar-drag"
         style={{ borderRight: "1px solid var(--hairline)" }}
       >
         <div data-tauri-drag-region className="flex items-center px-2 mb-6">
@@ -110,17 +122,18 @@ export default function App() {
           <span className="wordmark">Claro</span>
         </div>
 
-        <nav className="space-y-1">
+        <nav className="space-y-1" aria-label="主要導覽">
           {NAV.map(({ id, label, icon: Icon }) => (
             <button
               key={id}
               className={`nav-item no-drag ${page === id ? "active" : ""}`}
               onClick={() => setPage(id)}
+              aria-current={page === id ? "page" : undefined}
             >
               <Icon />
               {label}
-              {id === "settings" && needsSetup && (
-                <span className="dot ml-auto" style={{ background: "var(--amber)" }} />
+              {id === "setup" && needsSetup && (
+                <span className="dot ml-auto" style={{ background: "var(--amber)" }} aria-label="尚未就緒" />
               )}
             </button>
           ))}
@@ -158,10 +171,16 @@ export default function App() {
       </aside>
 
       {/* 內容 */}
-      <main className="flex-1 overflow-y-auto">
+      <main className="app-main flex-1 overflow-y-auto" id="main-content">
         <div data-tauri-drag-region className="titlebar-drag h-9 sticky top-0 z-10" />
         <div className="px-9 pb-10 max-w-[880px]">
-          {!status ? (
+          {!status && statusError ? (
+            <div className="page-in status-fatal" role="alert">
+              <h1>無法讀取 Claro 狀態</h1>
+              <p>{statusError}</p>
+              <button className="btn-primary no-drag" onClick={refresh}>重新載入</button>
+            </div>
+          ) : !status ? (
             <div className="page-in space-y-4 pt-2" aria-busy>
               <div className="h-8 w-64 rounded-lg" style={{ background: "rgba(0,0,0,0.06)" }} />
               <div className="h-4 w-96 rounded-lg" style={{ background: "rgba(0,0,0,0.05)" }} />
@@ -172,9 +191,30 @@ export default function App() {
               </div>
             </div>
           ) : page === "home" ? (
-            <Home status={status} onCopied={() => showToast("已複製")} gotoHistory={() => setPage("history")} />
+            <Home
+              status={status}
+              onCopied={() => showToast("已複製")}
+              gotoHistory={() => setPage("history")}
+              gotoSetup={() => setPage("setup")}
+            />
           ) : page === "history" ? (
             <History onCopied={() => showToast("已複製")} />
+          ) : page === "setup" ? (
+            <Onboarding
+              status={status}
+              mic={mic}
+              progress={progress}
+              refresh={refresh}
+              onToast={showToast}
+              onDone={() =>
+                invoke("complete_setup")
+                  .then(() => {
+                    refresh();
+                    setPage("home");
+                  })
+                  .catch((reason) => showToast(`無法完成設定：${String(reason)}`))
+              }
+            />
           ) : (
             <Settings
               status={status}
@@ -183,12 +223,13 @@ export default function App() {
               llmProgress={llmProgress}
               refresh={refresh}
               onToast={showToast}
+              onOpenSetup={() => setPage("setup")}
             />
           )}
         </div>
       </main>
 
-      {toast && <div className="toast">{toast}</div>}
+      {toast && <div className="toast" role="status" aria-live="polite">{toast}</div>}
     </div>
   );
 }

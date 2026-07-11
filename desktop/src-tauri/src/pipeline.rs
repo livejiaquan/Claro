@@ -15,7 +15,7 @@ use crate::hotkey::{Ctl, HotkeyMsg};
 use crate::inject::TextInjector;
 use crate::overlay_client::OverlayClient;
 use crate::polish;
-use crate::settings::Settings;
+use crate::settings::{PolishMode, Settings};
 use crate::state_machine::{DictationStateMachine, SmAction, State};
 use crate::stt::registry::ModelSpec;
 use crate::stt::SttEngine;
@@ -218,7 +218,9 @@ fn start_recording(core: &Arc<Core>) {
             std::thread::spawn(move || {
                 let mut force_sent = false;
                 while flag.load(Ordering::SeqCst) {
-                    overlay_core.overlay.send(&format!("level {:.4}", level.get()));
+                    overlay_core
+                        .overlay
+                        .send(&format!("level {:.4}", level.get()));
                     if !force_sent && started.elapsed().as_secs_f64() > audio::MAX_RECORDING_S {
                         let _ = msg_tx.send(Msg::ForceStop);
                         force_sent = true;
@@ -254,7 +256,14 @@ fn collect_audio(core: &Arc<Core>, cancelled: bool) -> Option<Vec<f32>> {
             if !cancelled {
                 core.overlay.send("error");
                 let _ = history::append_entry(
-                    NewEntry { raw: "", text: "", duration_s: 0.0, status: "error", timings: None },
+                    NewEntry {
+                        raw: "",
+                        text: "",
+                        duration_s: 0.0,
+                        status: "error",
+                        timings: None,
+                        polish: None,
+                    },
                     &history::history_path(),
                 );
             }
@@ -275,7 +284,14 @@ fn collect_audio(core: &Arc<Core>, cancelled: bool) -> Option<Vec<f32>> {
             core.overlay.send("error");
         }
         let _ = history::append_entry(
-            NewEntry { raw: "", text: "", duration_s: dur, status, timings: None },
+            NewEntry {
+                raw: "",
+                text: "",
+                duration_s: dur,
+                status,
+                timings: None,
+                polish: None,
+            },
             &history::history_path(),
         );
         return None;
@@ -303,12 +319,15 @@ fn process_session(core: &Arc<Core>, _session: u64, cancel: &AtomicBool) {
     };
     let dur = samples.len() as f64 / audio::TARGET_RATE as f64;
     core.overlay.send("processing");
+    // 單一 session 只讀一次設定，避免使用者在轉錄途中切模式造成 provider、
+    // consent 與 history metadata 彼此不一致。
+    let settings = Settings::load();
 
     // 螢幕上下文（M3 前移）：AX 抓前景視窗詞彙，餵辨識偏置＋潤飾參考。
     // 只在記憶體、永不落盤；使用者可在設定關閉。
     // 放到帶超時的執行緒：AX 有 messaging timeout＋BFS 牆鐘預算雙保險，
     // 但聽寫 session 絕不容許被卡——2 秒等不到就不用上下文。
-    let screen_ctx = if Settings::load().context_enabled() {
+    let screen_ctx = if settings.context_enabled() {
         let t = Instant::now();
         let (tx, rx) = crossbeam_channel::bounded(1);
         std::thread::spawn(move || {
@@ -346,8 +365,7 @@ fn process_session(core: &Arc<Core>, _session: u64, cancel: &AtomicBool) {
         let res = {
             let mut eng = core.engine.lock().unwrap();
             // 背景預載可能還沒排到或失敗——同步補載，聽寫不能因卸載而失敗
-            if eng.is_loaded() { Ok(()) } else { eng.load() }
-                .and_then(|()| eng.transcribe(&req))
+            if eng.is_loaded() { Ok(()) } else { eng.load() }.and_then(|()| eng.transcribe(&req))
         };
         core.touch_stt();
         match res {
@@ -356,7 +374,14 @@ fn process_session(core: &Arc<Core>, _session: u64, cancel: &AtomicBool) {
                 tracing::error!("transcription failed: {e}");
                 core.overlay.send("error");
                 let _ = history::append_entry(
-                    NewEntry { raw: "", text: "", duration_s: dur, status: "error", timings: None },
+                    NewEntry {
+                        raw: "",
+                        text: "",
+                        duration_s: dur,
+                        status: "error",
+                        timings: None,
+                        polish: None,
+                    },
                     &history::history_path(),
                 );
                 return;
@@ -365,68 +390,80 @@ fn process_session(core: &Arc<Core>, _session: u64, cancel: &AtomicBool) {
     };
     let stt_ms = t0.elapsed().as_millis() as u64;
 
-    let raw = textproc::normalize_cjk_punct(&textproc::to_traditional(&textproc::clean_transcript(&raw)));
+    let raw =
+        textproc::normalize_cjk_punct(&textproc::to_traditional(&textproc::clean_transcript(&raw)));
     if raw.is_empty() {
         core.overlay.send("error");
         let _ = history::append_entry(
-            NewEntry { raw: "", text: "", duration_s: dur, status: "silent", timings: None },
+            NewEntry {
+                raw: "",
+                text: "",
+                duration_s: dur,
+                status: "silent",
+                timings: None,
+                polish: None,
+            },
             &history::history_path(),
         );
         return;
     }
 
-    let mut text = textproc::apply_dict(&raw, &dict_pairs);
+    let base_text = textproc::apply_dict(&raw, &dict_pairs);
 
-    // LLM 潤飾（使用者在設定中選擇；失敗一律退回原文，聽寫不因 LLM 而失敗）
-    let mut polish_ms: Option<u64> = None;
-    if let Some(polisher) = polish::from_settings(&Settings::load()) {
-        let t1 = Instant::now();
-        match polisher.polish(&text, &screen_ctx) {
-            Ok(p) => {
-                text = textproc::normalize_cjk_punct(&textproc::to_traditional(&p));
-                polish_ms = Some(t1.elapsed().as_millis() as u64);
-            }
-            Err(e) => tracing::warn!("polish failed, using raw transcript: {e}"),
-        }
-        // 潤飾期間使用者可能按了 Esc
-        if cancel.load(Ordering::SeqCst) {
-            let _ = history::append_entry(
-                NewEntry {
-                    raw: &raw,
-                    text: &text,
-                    duration_s: dur,
-                    status: "cancelled",
-                    timings: Some(json!({ "stt_ms": stt_ms, "polish_ms": polish_ms })),
-                },
-                &history::history_path(),
-            );
-            return;
-        }
-    }
+    // RAW / CLEAN / ORGANIZE 共用同一入口。provider 不可用、未同意或 guard
+    // 拒絕時 transform 一律回 deterministic base text，並留下可稽核 metadata。
+    let t1 = Instant::now();
+    let polish::PolishResult {
+        text: output,
+        metadata: polish_metadata,
+    } = polish::transform(&settings, &base_text, &screen_ctx);
+    let polish_ms =
+        (settings.polish_mode() != PolishMode::Raw).then(|| t1.elapsed().as_millis() as u64);
+    let text = textproc::normalize_cjk_punct(&textproc::to_traditional(&output));
 
     let timings = Some(json!({ "stt_ms": stt_ms, "polish_ms": polish_ms }));
 
     if cancel.load(Ordering::SeqCst) {
         let _ = history::append_entry(
-            NewEntry { raw: &raw, text: &text, duration_s: dur, status: "cancelled", timings },
+            NewEntry {
+                raw: &raw,
+                text: &text,
+                duration_s: dur,
+                status: "cancelled",
+                timings,
+                polish: Some(polish_metadata),
+            },
             &history::history_path(),
         );
         return;
     }
 
-    tracing::info!("📝 {text}");
     if let Err(e) = core.injector.inject(&text) {
         tracing::error!("paste failed: {e}");
         core.overlay.send("error");
         let _ = history::append_entry(
-            NewEntry { raw: &raw, text: &text, duration_s: dur, status: "error", timings },
+            NewEntry {
+                raw: &raw,
+                text: &text,
+                duration_s: dur,
+                status: "error",
+                timings,
+                polish: Some(polish_metadata),
+            },
             &history::history_path(),
         );
         return;
     }
     core.overlay.send("success");
     let _ = history::append_entry(
-        NewEntry { raw: &raw, text: &text, duration_s: dur, status: "pasted", timings },
+        NewEntry {
+            raw: &raw,
+            text: &text,
+            duration_s: dur,
+            status: "pasted",
+            timings,
+            polish: Some(polish_metadata),
+        },
         &history::history_path(),
     );
 }
@@ -450,10 +487,21 @@ fn cancel_recording(core: &Arc<Core>) {
             .lock()
             .unwrap()
             .transcribe(&req)
-            .map(|t| textproc::normalize_cjk_punct(&textproc::to_traditional(&textproc::clean_transcript(&t))))
+            .map(|t| {
+                textproc::normalize_cjk_punct(&textproc::to_traditional(
+                    &textproc::clean_transcript(&t),
+                ))
+            })
             .unwrap_or_default();
         let _ = history::append_entry(
-            NewEntry { raw: &raw, text: &raw, duration_s: dur, status: "cancelled", timings: None },
+            NewEntry {
+                raw: &raw,
+                text: &raw,
+                duration_s: dur,
+                status: "cancelled",
+                timings: None,
+                polish: None,
+            },
             &history::history_path(),
         );
     });

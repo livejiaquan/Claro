@@ -1,6 +1,14 @@
 fn main() {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    build_apple_intelligence_bridge();
+    // build.rs 的 compile-time cfg 是「build host」，不是 Cargo 正在編的
+    // target。交叉編譯／universal 必須讀 Cargo 注入的 target env，
+    // 否則 Intel host 編 arm64 會漏連 bridge，arm64 host 編 x86_64 則會錯連 arm64 object。
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if target_os == "macos" && target_arch == "aarch64" {
+        build_apple_intelligence_bridge();
+    }
 
     tauri_build::build()
 }
@@ -8,7 +16,6 @@ fn main() {
 /// 把 swift/apple_intelligence.swift 編成靜態庫連進 binary（Handy 實證模式）。
 /// SDK 沒有 FoundationModels 時改編 stub，並靠 -weak_framework 讓 app 在
 /// 沒有該 framework 的舊 macOS 也能啟動（runtime 由 @available 把關）。
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn build_apple_intelligence_bridge() {
     use std::env;
     use std::path::{Path, PathBuf};
@@ -44,7 +51,9 @@ fn build_apple_intelligence_bridge() {
     let source_file = if has_foundation_models {
         REAL_SWIFT_FILE
     } else {
-        println!("cargo:warning=FoundationModels SDK not found — building Apple Intelligence stub.");
+        println!(
+            "cargo:warning=FoundationModels SDK not found — building Apple Intelligence stub."
+        );
         STUB_SWIFT_FILE
     };
 
@@ -101,7 +110,10 @@ fn build_apple_intelligence_bridge() {
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=claro_apple_ai");
-    println!("cargo:rustc-link-search=native={}", toolchain_swift_lib.display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        toolchain_swift_lib.display()
+    );
     println!("cargo:rustc-link-search=native={}", sdk_swift_lib.display());
     println!("cargo:rustc-link-lib=framework=Foundation");
     if has_foundation_models {

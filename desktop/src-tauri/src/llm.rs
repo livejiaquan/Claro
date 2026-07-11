@@ -19,6 +19,7 @@ pub struct LlmModelSpec {
     pub desc: &'static str,
     pub file: &'static str,
     pub url: &'static str,
+    pub sha256: &'static str,
     pub approx_bytes: u64,
     pub recommended: bool,
 }
@@ -30,7 +31,8 @@ pub const LLM_MODELS: &[LlmModelSpec] = &[
         label: "Qwen3 4B Instruct",
         desc: "中英混排最穩，繁中品質佳（Q4 量化）",
         file: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
-        url: "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+        url: "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+        sha256: "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
         approx_bytes: 2_497_281_120,
         recommended: true,
     },
@@ -39,7 +41,8 @@ pub const LLM_MODELS: &[LlmModelSpec] = &[
         label: "Gemma 3 4B",
         desc: "Google 多語模型，另一種校正風格（Q4 量化）",
         file: "google_gemma-3-4b-it-Q4_K_M.gguf",
-        url: "https://huggingface.co/bartowski/google_gemma-3-4b-it-GGUF/resolve/main/google_gemma-3-4b-it-Q4_K_M.gguf",
+        url: "https://huggingface.co/bartowski/google_gemma-3-4b-it-GGUF/resolve/71506238f970075ca85125cd749c28b1b0eee84e/google_gemma-3-4b-it-Q4_K_M.gguf",
+        sha256: "4996030242583a40aa151ff93f49ed787ac8c25e4120c3ae4588b2e2a7d1ae94",
         approx_bytes: 2_489_758_112,
         recommended: false,
     },
@@ -58,6 +61,34 @@ pub fn models_dir() -> PathBuf {
 
 pub fn model_path(spec: &LlmModelSpec) -> PathBuf {
     models_dir().join(spec.file)
+}
+
+/// 只有內容通過 registry 內固定的 SHA-256 才能視為已下載。
+pub fn model_is_verified(spec: &LlmModelSpec) -> bool {
+    crate::models::model_file_is_verified(&model_path(spec), spec.sha256)
+}
+
+fn require_complete_generation(reached_eog: bool) -> Result<()> {
+    if !reached_eog {
+        bail!("內建模型輸出達 token 上限，拒絕使用可能截斷的內容");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn builtin_models_are_pinned_and_hashed() {
+        for model in LLM_MODELS {
+            assert!(model.url.starts_with("https://huggingface.co/"));
+            assert!(model.url.ends_with(model.file));
+            assert!(!model.url.contains("/resolve/main/"));
+            assert_eq!(model.sha256.len(), 64);
+            assert!(model.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+    }
 }
 
 // ─── 引擎（macOS/Metal） ─────────────────────────────────────────────────────
@@ -131,9 +162,8 @@ mod engine {
     pub fn generate(model_id: &str, system: &str, user: &str) -> Result<String> {
         let spec = find(model_id).with_context(|| format!("未知的內建模型 {model_id}"))?;
         let path = model_path(spec);
-        if !path.exists() {
-            bail!("模型尚未下載：{}", spec.label);
-        }
+        crate::models::verify_model_file(&path, spec.sha256)
+            .with_context(|| format!("模型尚未下載或完整性驗證失敗：{}", spec.label))?;
 
         let backend = backend()?;
         let mut guard = STATE.lock().unwrap();
@@ -150,7 +180,11 @@ mod engine {
                 spec.id,
                 t0.elapsed().as_secs_f32()
             );
-            *guard = Some(Loaded { id: model_id.to_string(), model, last_used: Instant::now() });
+            *guard = Some(Loaded {
+                id: model_id.to_string(),
+                model,
+                last_used: Instant::now(),
+            });
             spawn_watcher();
         }
         let loaded = guard.as_mut().expect("loaded above");
@@ -194,10 +228,12 @@ mod engine {
         let mut sampler = LlamaSampler::greedy();
         let mut generated: Vec<llama_cpp_2::token::LlamaToken> = Vec::new();
         let mut n_cur = tokens.len() as i32;
+        let mut reached_eog = false;
         for _ in 0..MAX_OUTPUT_TOKENS {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(token);
             if model.is_eog_token(token) {
+                reached_eog = true;
                 break;
             }
             generated.push(token);
@@ -206,6 +242,7 @@ mod engine {
             n_cur += 1;
             ctx.decode(&mut batch).context("decode step")?;
         }
+        require_complete_generation(reached_eog)?;
         let out = model
             .tokens_to_str(&generated, Special::Plaintext)
             .context("detokenize output")?;
@@ -224,4 +261,15 @@ pub fn generate(_model_id: &str, _system: &str, _user: &str) -> Result<String> {
 #[cfg(not(target_os = "macos"))]
 pub fn unload_now() -> bool {
     true
+}
+
+#[cfg(test)]
+mod generation_stop_tests {
+    use super::*;
+
+    #[test]
+    fn token_limit_without_eog_is_rejected() {
+        assert!(require_complete_generation(false).is_err());
+        assert!(require_complete_generation(true).is_ok());
+    }
 }

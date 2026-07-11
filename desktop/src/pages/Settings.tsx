@@ -1,17 +1,59 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
-import type { DictEntry, DownloadProgress, LlmConfig, MicLevel, ModelInfo, Status } from "../types";
+import {
+  resolveLlmConfig,
+  type DictEntry,
+  type DownloadProgress,
+  type LlmConfig,
+  type MicLevel,
+  type ModelInfo,
+  type PolishMode,
+  type ResolvedLlmConfig,
+  type Status,
+} from "../types";
 import { Hotkey, LevelBar, Row, Section } from "../ui";
 
 /** 自訂 API 的常用服務 preset：帶入 Base URL 與建議模型（都走 OpenAI 相容介面） */
 const CUSTOM_PRESETS = [
   { id: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
-  { id: "anthropic", label: "Anthropic", baseUrl: "https://api.anthropic.com/v1", model: "claude-haiku-4-5" },
   { id: "groq", label: "Groq", baseUrl: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
   { id: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" },
   { id: "gemini", label: "Google Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-2.5-flash" },
   { id: "openrouter", label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", model: "openai/gpt-4o-mini" },
 ];
+
+const POLISH_MODES: { id: PolishMode; title: string; tag?: string; description: string }[] = [
+  {
+    id: "raw",
+    title: "RAW 原樣轉錄",
+    description: "不使用 LLM；只套用繁體、個人字典與標點等確定性規則。",
+  },
+  {
+    id: "clean",
+    title: "CLEAN 保守校訂",
+    tag: "預設",
+    description: "移除語助詞與自我更正，修正誤字、術語和標點；不跨句重排、不濃縮。",
+  },
+  {
+    id: "organize",
+    title: "ORGANIZE 條理整理",
+    tag: "需確認",
+    description: "鎖定姓名、數字、時間、否定與其他事實後，允許跨句重排與合併重複內容。",
+  },
+];
+
+const OUTCOME_LABEL: Record<string, string> = {
+  provider_missing: "尚未選擇處理引擎",
+  provider_off: "尚未選擇處理引擎",
+  provider_incomplete: "處理引擎設定尚未完成",
+  provider_unavailable: "處理引擎目前不可用",
+  model_missing: "整理模型尚未下載",
+  organize_consent_required: "尚未確認條理整理的行為差異",
+  cloud_consent_required: "尚未確認雲端資料傳送",
+  local_only: "僅限本機已阻擋雲端引擎",
+  invalid_endpoint: "自訂端點格式不正確",
+  invalid_custom_url: "自訂端點格式不正確",
+};
 
 export default function Settings({
   status,
@@ -20,6 +62,7 @@ export default function Settings({
   llmProgress,
   refresh,
   onToast,
+  onOpenSetup,
 }: {
   status: Status;
   mic: MicLevel;
@@ -27,13 +70,18 @@ export default function Settings({
   llmProgress: DownloadProgress | null;
   refresh: () => void;
   onToast: (msg: string) => void;
+  onOpenSetup: () => void;
 }) {
   const [error, setError] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [llm, setLlm] = useState<LlmConfig | null>(null);
+  const [llm, setLlm] = useState<ResolvedLlmConfig | null>(null);
   const [keyDraft, setKeyDraft] = useState("");
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
+  const [pendingMode, setPendingMode] = useState<PolishMode | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const [confirmCloud, setConfirmCloud] = useState(false);
+  const [confirmDisableLocalOnly, setConfirmDisableLocalOnly] = useState(false);
   // 清單/錯誤都綁 provider：偵測回應晚到時不能污染已切換的 provider（race）
   const [localModels, setLocalModels] = useState<{ provider: string; models: string[] } | null>(null);
   const [localModelsErr, setLocalModelsErr] = useState<{ provider: string; msg: string } | null>(null);
@@ -43,7 +91,10 @@ export default function Settings({
   const [dictDraft, setDictDraft] = useState<DictEntry>({ from: "", to: "" });
 
   const loadModels = () => invoke<ModelInfo[]>("list_models").then(setModels).catch(() => {});
-  const loadLlm = () => invoke<LlmConfig>("get_llm_config").then(setLlm).catch(() => {});
+  const loadLlm = () =>
+    invoke<LlmConfig>("get_llm_config")
+      .then((config) => setLlm(resolveLlmConfig(config)))
+      .catch((e) => setError(String(e)));
   const loadBuiltinLlms = () =>
     invoke<ModelInfo[]>("list_builtin_llms").then(setBuiltinLlms).catch(() => {});
   const loadDict = () => invoke<DictEntry[]>("get_dictionary").then(setDict).catch(() => {});
@@ -102,10 +153,10 @@ export default function Settings({
   // 連續操作（選 preset 後馬上改欄位）的兩道防線：
   // 1) llmRef 即時反映最新值——閉包裡的舊 llm 不會把欄位倒退
   // 2) 寫入請求串行化——舊請求不會晚到蓋掉新請求
-  const llmRef = useRef<LlmConfig | null>(null);
+  const llmRef = useRef<ResolvedLlmConfig | null>(null);
   llmRef.current = llm;
   const llmSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
-  const saveLlm = (next: Partial<LlmConfig>) => {
+  const saveLlm = (next: Partial<ResolvedLlmConfig>, confirmed = false) => {
     const cur = llmRef.current;
     if (!cur) return;
     const merged = { ...cur, ...next };
@@ -113,12 +164,59 @@ export default function Settings({
     setLlm(merged);
     setTestResult(null);
     llmSaveQueue.current = llmSaveQueue.current.then(() =>
-      invoke("set_llm_config", {
+      invoke<LlmConfig | null>("set_llm_config", {
         provider: merged.provider,
         model: merged.model,
         baseUrl: merged.base_url,
-      }).catch((e) => setError(String(e))),
+        confirmed,
+      })
+        .then((updated) => {
+          if (updated) setLlm(resolveLlmConfig(updated));
+          else loadLlm();
+          if (confirmed) {
+            setConfirmCloud(false);
+            onToast("已確認此雲端端點");
+          }
+        })
+        .catch((e) => {
+          setError(String(e));
+          loadLlm();
+        }),
     );
+  };
+
+  const applyMode = (mode: PolishMode, confirmed: boolean) => {
+    setError(null);
+    invoke<LlmConfig | null>("set_polish_mode", { mode, confirmed })
+      .then((updated) => {
+        if (updated) setLlm(resolveLlmConfig(updated));
+        else loadLlm();
+        setPendingMode(null);
+        onToast(mode === "raw" ? "已切換為原樣轉錄" : mode === "clean" ? "已切換為保守校訂" : "已啟用條理整理");
+      })
+      .catch((e) => setError(String(e)));
+  };
+
+  const requestMode = (mode: PolishMode) => {
+    if (!llm || mode === llm.polish_mode) return;
+    if (mode === "organize" && !llm.organize_consent_valid) {
+      setPendingMode("organize");
+      return;
+    }
+    applyMode(mode, false);
+  };
+
+  const applyLocalOnly = (enabled: boolean, confirmed: boolean) => {
+    setError(null);
+    invoke<LlmConfig | null>("set_local_only", { enabled, confirmed })
+      .then((updated) => {
+        if (updated) setLlm(resolveLlmConfig(updated));
+        else loadLlm();
+        setConfirmDisableLocalOnly(false);
+        setConfirmCloud(false);
+        onToast(enabled ? "已限制為僅限本機" : "已允許使用雲端端點");
+      })
+      .catch((e) => setError(String(e)));
   };
 
   const saveKey = () => {
@@ -127,6 +225,16 @@ export default function Settings({
         setKeyDraft("");
         loadLlm();
         onToast("API Key 已存入鑰匙圈");
+      })
+      .catch((e) => setError(String(e)));
+  };
+
+  const deleteKey = () => {
+    invoke("set_llm_key", { key: "" })
+      .then(() => {
+        setKeyDraft("");
+        loadLlm();
+        onToast("API Key 已從鑰匙圈刪除");
       })
       .catch((e) => setError(String(e)));
   };
@@ -153,10 +261,21 @@ export default function Settings({
   };
 
   const permsOk = status.accessibility && status.hotkey_active;
+  const setupReady = permsOk && status.model_present && status.setup_completed;
 
   return (
     <div className="page-in">
       <h1 className="text-[24px] font-bold tracking-tight mb-6">設定</h1>
+
+      <div className={`setup-compact ${setupReady ? "ready" : "pending"}`}>
+        <div>
+          <b>{setupReady ? "聽寫必要條件已就緒" : "首次設定尚未完成"}</b>
+          <span>{setupReady ? "可隨時重新測試麥克風、權限與語音模型。" : "用引導頁逐項完成權限、麥克風與語音模型。"}</span>
+        </div>
+        <button className="btn no-drag" onClick={onOpenSetup}>{setupReady ? "重新檢查" : "繼續設定"}</button>
+      </div>
+
+      {error && <div className="config-error mb-5" role="alert">{error}</div>}
 
       <Section title="聽寫">
         <Row label="快捷鍵" sub="按住說話、放開出字；快點一下＝免持模式。改完立即生效。">
@@ -270,13 +389,30 @@ export default function Settings({
                     <button className="btn no-drag" onClick={() => call("set_model", { id: m.id })}>
                       使用
                     </button>
-                    <button
-                      className="btn no-drag"
-                      style={{ color: "var(--red)" }}
-                      onClick={() => call("delete_model", { id: m.id }, () => onToast("已刪除"))}
-                    >
-                      刪除
-                    </button>
+                    {pendingDelete === `stt:${m.id}` ? (
+                      <>
+                        <button className="btn no-drag" onClick={() => setPendingDelete(null)}>取消</button>
+                        <button
+                          className="btn danger-quiet no-drag"
+                          aria-label={`確認刪除 ${m.label}`}
+                          onClick={() =>
+                            call("delete_model", { id: m.id }, () => {
+                              setPendingDelete(null);
+                              onToast("已刪除");
+                            })
+                          }
+                        >
+                          確認刪除
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        className="btn danger-quiet no-drag"
+                        onClick={() => setPendingDelete(`stt:${m.id}`)}
+                      >
+                        刪除
+                      </button>
+                    )}
                   </>
                 )}
                 {!m.downloaded && !isDownloading && (
@@ -291,25 +427,136 @@ export default function Settings({
       </Section>
 
       <Section title="AI 潤飾">
+        <fieldset className="mode-picker" disabled={!llm}>
+          <legend>文字整理模式</legend>
+          <p className="mode-picker-help">模式決定 Claro 可以怎麼改文字；處理引擎與資料位置在下方另外選擇。</p>
+          <div className="mode-grid">
+            {POLISH_MODES.map((mode) => (
+              <label
+                className={`mode-card ${llm?.polish_mode === mode.id ? "selected" : ""}`}
+                key={mode.id}
+              >
+                <input
+                  type="radio"
+                  name="polish-mode"
+                  value={mode.id}
+                  checked={llm?.polish_mode === mode.id}
+                  onChange={() => requestMode(mode.id)}
+                />
+                <span className="mode-card-title">
+                  {mode.title}
+                  {mode.tag && <span className={`pill ${mode.id === "organize" ? "amber" : "blue"}`}>{mode.tag}</span>}
+                </span>
+                <span className="mode-card-description">{mode.description}</span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
+
+        {pendingMode === "organize" && (
+          <section className="consent-panel" aria-labelledby="organize-confirm-title">
+            <div>
+              <div id="organize-confirm-title" className="consent-title">啟用「條理整理」？</div>
+              <p>這個模式不只校訂，會改變句子順序與段落結構。重要內容仍應由你檢查。</p>
+              <ul>
+                <li><b>可能改變：</b>句序、段落與重複內容。</li>
+                <li><b>必須保留：</b>姓名、術語、數字、時間、否定、條件、因果與待辦。</li>
+                <li><b>絕不允許：</b>新增原文沒有的資訊、猜測或替你回答。</li>
+              </ul>
+            </div>
+            <div className="consent-actions">
+              <button className="btn no-drag" onClick={() => setPendingMode(null)}>取消</button>
+              <button className="btn-primary no-drag" onClick={() => applyMode("organize", true)}>
+                我了解，啟用條理整理
+              </button>
+            </div>
+          </section>
+        )}
+
         <Row
-          label="潤飾引擎"
-          sub="聽寫後做保守糾錯（去填充詞、修同音錯字、補標點）。文字只送到你選的引擎，預設關閉。"
+          label="處理引擎"
+          sub={llm?.polish_mode === "raw" ? "RAW 不會呼叫引擎；這個選擇會保留給 CLEAN 或 ORGANIZE 使用。" : "引擎只決定在哪裡處理，不會改變上方模式的行為界線。"}
         >
           <select
             className="select no-drag"
+            aria-label="處理引擎"
             value={llm?.provider ?? "off"}
             onChange={(e) => saveLlm({ provider: e.target.value })}
           >
-            <option value="off">關閉（純轉錄）</option>
+            <option value="off" disabled>尚未選擇引擎</option>
             <option value="apple" disabled={!!llm && [1, 4].includes(llm.apple_status)}>
               Apple Intelligence（免安裝{llm?.apple_status === 0 ? "・推薦" : ""}）
             </option>
-            <option value="builtin">內建模型（免安裝・高精度）</option>
+            <option value="builtin">Claro 內建模型（首次需下載）</option>
             <option value="ollama">Ollama（本機服務）</option>
             <option value="lmstudio">LM Studio（本機服務）</option>
             <option value="custom">自訂 API（OpenAI 相容）</option>
           </select>
         </Row>
+
+        <Row
+          label="僅限本機"
+          sub="開啟後硬性阻擋所有雲端整理；模式與雲端設定會保留，但不會送出資料。"
+        >
+          <label className="local-only-control">
+            <input
+              type="checkbox"
+              checked={llm?.local_only ?? false}
+              disabled={!llm}
+              onChange={(e) => {
+                if (!e.target.checked) setConfirmDisableLocalOnly(true);
+                else applyLocalOnly(true, true);
+              }}
+            />
+            <span>{llm?.local_only ? "已開啟" : "已關閉"}</span>
+          </label>
+        </Row>
+
+        {confirmDisableLocalOnly && (
+          <section className="consent-panel" aria-labelledby="network-confirm-title">
+            <div>
+              <div id="network-confirm-title" className="consent-title">允許使用雲端端點？</div>
+              <p>
+                關閉「僅限本機」後，當 CLEAN 或 ORGANIZE 使用外部 API 時，轉錄文字與已啟用的畫面上下文可能送到
+                {llm?.execution_location === "cloud" && (llm.endpoint_origin || llm.base_url) ? (
+                  <b> {llm.endpoint_origin || llm.base_url}</b>
+                ) : (
+                  "你之後明確設定的雲端端點"
+                )}
+                ；音訊不會傳送。雲端同意只對當前端點有效，更換端點後會再次詢問。
+              </p>
+            </div>
+            <div className="consent-actions">
+              <button className="btn no-drag" onClick={() => setConfirmDisableLocalOnly(false)}>保持僅限本機</button>
+              <button className="btn-primary no-drag" onClick={() => applyLocalOnly(false, true)}>我了解，允許雲端端點</button>
+            </div>
+          </section>
+        )}
+
+        {llm && llm.polish_mode !== "raw" && llm.effective_mode === "raw" && llm.blocked_reason && (
+          <div className="config-warning" role="status">
+            <span><b>目前安全退回 RAW：</b>{OUTCOME_LABEL[llm.blocked_reason] ?? "整理設定尚未就緒"}，不會送出雲端資料。</span>
+            {llm.blocked_reason === "cloud_consent_required" && (
+              <button className="btn no-drag" onClick={() => setConfirmCloud(true)}>檢視並允許</button>
+            )}
+          </div>
+        )}
+
+        {confirmCloud && llm?.execution_location === "cloud" && (
+          <section className="consent-panel" aria-labelledby="cloud-endpoint-confirm-title">
+            <div>
+              <div id="cloud-endpoint-confirm-title" className="consent-title">允許雲端整理？</div>
+              <p>
+                CLEAN 或 ORGANIZE 會把轉錄文字{status.context_enabled ? "與目前視窗上下文" : ""}送到
+                <b> {llm.endpoint_origin ?? llm.base_url}</b>；音訊不會傳送。允許後仍可隨時重新開啟「僅限本機」。
+              </p>
+            </div>
+            <div className="consent-actions">
+              <button className="btn no-drag" onClick={() => setConfirmCloud(false)}>取消</button>
+              <button className="btn-primary no-drag" onClick={() => applyLocalOnly(false, true)}>我了解，允許此端點</button>
+            </div>
+          </section>
+        )}
 
         {llm?.provider === "builtin" && (
           <>
@@ -356,20 +603,33 @@ export default function Settings({
                         <button className="btn no-drag" onClick={() => saveLlm({ model: m.id })}>
                           使用
                         </button>
-                        <button
-                          className="btn no-drag"
-                          style={{ color: "var(--red)" }}
-                          onClick={() =>
-                            invoke("delete_builtin_llm", { id: m.id })
-                              .then(() => {
-                                loadBuiltinLlms();
-                                onToast("已刪除");
-                              })
-                              .catch((e) => setError(String(e)))
-                          }
-                        >
-                          刪除
-                        </button>
+                        {pendingDelete === `llm:${m.id}` ? (
+                          <>
+                            <button className="btn no-drag" onClick={() => setPendingDelete(null)}>取消</button>
+                            <button
+                              className="btn danger-quiet no-drag"
+                              aria-label={`確認刪除 ${m.label}`}
+                              onClick={() =>
+                                invoke("delete_builtin_llm", { id: m.id })
+                                  .then(() => {
+                                    setPendingDelete(null);
+                                    loadBuiltinLlms();
+                                    onToast("已刪除");
+                                  })
+                                  .catch((e) => setError(String(e)))
+                              }
+                            >
+                              確認刪除
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            className="btn danger-quiet no-drag"
+                            onClick={() => setPendingDelete(`llm:${m.id}`)}
+                          >
+                            刪除
+                          </button>
+                        )}
                       </>
                     )}
                     {!m.downloaded && !isDownloading && (
@@ -477,6 +737,7 @@ export default function Settings({
             <Row label="常用服務" sub="選一個自動帶入端點與建議模型，或維持自訂。">
               <select
                 className="select no-drag"
+                aria-label="常用雲端服務"
                 value={CUSTOM_PRESETS.find((p) => p.baseUrl === llm.base_url)?.id ?? ""}
                 onChange={(e) => {
                   const p = CUSTOM_PRESETS.find((x) => x.id === e.target.value);
@@ -494,6 +755,7 @@ export default function Settings({
             <Row label="Base URL" sub="OpenAI 相容端點">
               <input
                 className="select no-drag"
+                aria-label="自訂 API Base URL"
                 style={{ minWidth: 260 }}
                 value={llm.base_url}
                 placeholder="https://api.openai.com/v1"
@@ -503,6 +765,7 @@ export default function Settings({
             <Row label="模型名稱" sub="該服務的模型 ID">
               <input
                 className="select no-drag"
+                aria-label="自訂 API 模型名稱"
                 style={{ minWidth: 200 }}
                 value={llm.model}
                 placeholder="gpt-4o-mini"
@@ -516,6 +779,7 @@ export default function Settings({
               <div className="flex items-center gap-2">
                 <input
                   className="select no-drag"
+                  aria-label="API Key"
                   style={{ minWidth: 180 }}
                   type="password"
                   value={keyDraft}
@@ -525,6 +789,11 @@ export default function Settings({
                 <button className="btn no-drag" onClick={saveKey} disabled={!keyDraft}>
                   儲存
                 </button>
+                {llm.has_key && (
+                  <button className="btn danger-quiet no-drag" onClick={deleteKey}>
+                    刪除 Key
+                  </button>
+                )}
               </div>
             </Row>
           </>
@@ -580,6 +849,7 @@ export default function Settings({
             <div className="flex items-center gap-2 flex-1">
               <input
                 className="select no-drag"
+                aria-label={`誤認詞 ${i + 1}`}
                 style={{ minWidth: 140 }}
                 value={e.from}
                 onChange={(ev) => {
@@ -591,6 +861,7 @@ export default function Settings({
               <span style={{ color: "var(--faint)" }}>→</span>
               <input
                 className="select no-drag"
+                aria-label={`正確詞 ${i + 1}`}
                 style={{ minWidth: 140 }}
                 value={e.to}
                 onChange={(ev) => {
@@ -613,6 +884,7 @@ export default function Settings({
           <div className="flex items-center gap-2 flex-1">
             <input
               className="select no-drag"
+              aria-label="新增誤認詞"
               style={{ minWidth: 140 }}
               placeholder="誤認詞（如 GBT）"
               value={dictDraft.from}
@@ -621,6 +893,7 @@ export default function Settings({
             <span style={{ color: "var(--faint)" }}>→</span>
             <input
               className="select no-drag"
+              aria-label="新增正確詞"
               style={{ minWidth: 140 }}
               placeholder="正確詞（如 GPT）"
               value={dictDraft.to}
@@ -673,18 +946,13 @@ export default function Settings({
       </Section>
 
       <Section title="關於">
-        <Row label="Claro" sub="全程本地處理；只有你自己開啟的潤飾端點會收到文字。">
+        <Row label="Claro" sub="語音辨識在本機完成；只有你明確允許的雲端整理端點會收到轉錄文字與已啟用的畫面上下文。">
           <span className="text-[12.5px]" style={{ color: "var(--faint)" }}>
             v0.1.0
           </span>
         </Row>
       </Section>
 
-      {error && (
-        <p className="text-[13px] -mt-2" style={{ color: "var(--red)" }}>
-          {error}
-        </p>
-      )}
     </div>
   );
 }

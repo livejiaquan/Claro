@@ -1,0 +1,86 @@
+[
+  {
+    "id": "organize_reorders_complete_thoughts",
+    "mode": "organize",
+    "input": "嗯先說結論，明天不上線。那個原因是測試尚未完成。",
+    "candidate": "原因是測試尚未完成。先說結論，明天不上線。",
+    "accepted": true
+  },
+  {
+    "id": "organize_preserves_time_and_number",
+    "mode": "organize",
+    "input": "先通知團隊，會議改到下午3點。原因是上午有客戶會議。",
+    "candidate": "原因是上午有客戶會議。先通知團隊，會議改到下午3點。",
+    "accepted": true
+  },
+  {
+    "id": "organize_rejects_lost_negation",
+    "mode": "organize",
+    "input": "明天不上線，因為測試尚未完成。",
+    "candidate": "因為測試尚未完成，明天上線。",
+    "accepted": false
+  },
+  {
+    "id": "organize_rejects_changed_number",
+    "mode": "organize",
+    "input": "會議改到下午3點，請通知3位同事。",
+    "candidate": "請通知4位同事，會議改到下午4點。",
+    "accepted": false
+  },
+  {
+    "id": "organize_rejects_added_conclusion",
+    "mode": "organize",
+    "input": "測試尚未完成，明天不上線。",
+    "candidate": "測試尚未完成，所以明天不上線，這是最安全的決定。",
+    "accepted": false
+  },
+  {
+    "id": "clean_accepts_punctuation_only",
+    "mode": "clean",
+    "input": "今天開會記得帶筆電然後三點前把報告寄出去",
+    "candidate": "今天開會記得帶筆電，然後三點前把報告寄出去。",
+    "accepted": true
+  },
+  {
+    "id": "clean_rejects_instruction_answer",
+    "mode": "clean",
+    "input": "幫我把這段程式碼重構成async await",
+    "candidate": "好的，我會協助你重構程式碼，請先提供完整內容。",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_lost_negation",
+    "mode": "clean",
+    "input": "明天不要發布，後天才發布。",
+    "candidate": "明天發布，後天才發布。",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_changed_number",
+    "mode": "clean",
+    "input": "請在下午3點前通知3位同事。",
+    "candidate": "請在下午4點前通知4位同事。",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_changed_relative_date",
+    "mode": "clean",
+    "input": "明天下午開會討論方案。",
+    "candidate": "後天下午開會討論方案。",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_removed_condition",
+    "mode": "clean",
+    "input": "如果測試完成，我們就會上線。",
+    "candidate": "測試完成，我們就會上線。",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_excessive_truncation",
+    "mode": "clean",
+    "input": "我們先確認需求與設計，再完成實作與測試，最後部署並通知團隊。",
+    "candidate": "我們先確認需求與設計。",
+    "accepted": false
+  }
+]

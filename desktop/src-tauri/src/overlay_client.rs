@@ -10,21 +10,15 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 pub fn socket_path() -> PathBuf {
-    dirs::home_dir().expect("no home dir").join(".claro").join("indicator.sock")
+    dirs::home_dir()
+        .expect("no home dir")
+        .join(".claro")
+        .join("indicator.sock")
 }
 
-/// 依序尋找 mic_indicator 二進位：
-/// 1. CLARO_INDICATOR_PATH 環境變數
-/// 2. 執行檔同目錄
-/// 3. repo 內 prototype/（開發模式）
-/// 4. /usr/local/bin/mic_indicator
+/// 正式版只接受 Tauri `externalBin` 放在主程式同目錄的 sidecar，不能依賴
+/// repo 或 `/usr/local/bin`。debug build 才允許環境變數與 source tree fallback。
 fn find_indicator() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CLARO_INDICATOR_PATH") {
-        let p = PathBuf::from(p);
-        if p.exists() {
-            return Some(p);
-        }
-    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let p = dir.join("mic_indicator");
@@ -33,14 +27,33 @@ fn find_indicator() -> Option<PathBuf> {
             }
         }
     }
-    // 開發模式：desktop/src-tauri → repo 根 → prototype/
-    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../prototype/mic_indicator");
-    if dev.exists() {
-        return Some(dev);
+
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(p) = std::env::var("CLARO_INDICATOR_PATH") {
+            let p = PathBuf::from(p);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+
+        // `beforeDevCommand` 產生的 target-triple sidecar。
+        let built = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries")
+            .join(format!("mic_indicator-{}", env!("TAURI_ENV_TARGET_TRIPLE")));
+        if built.exists() {
+            return Some(built);
+        }
+
+        // 保留給直接 `cargo run` 的開發流程；正式 binary 不會編入這條路徑。
+        let prototype =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../prototype/mic_indicator");
+        if prototype.exists() {
+            return Some(prototype);
+        }
     }
-    let usr = PathBuf::from("/usr/local/bin/mic_indicator");
-    usr.exists().then_some(usr)
+
+    None
 }
 
 pub struct OverlayClient {
@@ -63,7 +76,9 @@ impl OverlayClient {
                 None
             }
         };
-        Self { child: std::sync::Mutex::new(child) }
+        Self {
+            child: std::sync::Mutex::new(child),
+        }
     }
 
     /// 送命令；任何錯誤都吞掉（overlay 掛了不影響聽寫）。

@@ -5,11 +5,13 @@ use claro_lib::models;
 use claro_lib::stt::registry;
 
 fn main() -> anyhow::Result<()> {
-    let id = std::env::args().nth(1).unwrap_or_else(|| "large-v3-turbo".into());
+    let id = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "large-v3-turbo".into());
     let spec = registry::resolve(&id);
     let dest = registry::model_path(spec);
-    if dest.exists() {
-        eprintln!("已存在：{}", dest.display());
+    if models::model_file_is_verified(&dest, spec.sha256) {
+        eprintln!("已存在且驗證通過：{}", dest.display());
         return Ok(());
     }
     eprintln!(

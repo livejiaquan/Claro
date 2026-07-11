@@ -49,5 +49,11 @@ macos-accessibility-client = "0.0.1"
 # AX 上下文擷取（context.rs）：CF 型別＋NSWorkspace 前景 app（版本對齊 tauri 依賴樹）
 core-foundation = "0.10"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSPasteboard",
+    "NSPasteboardItem",
+    "NSRunningApplication",
+    "NSWorkspace",
+] }
 objc2-foundation = "0.3"

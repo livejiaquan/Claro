@@ -1,13 +1,22 @@
-import { ReactNode } from "react";
+import { Children, cloneElement, isValidElement, useId, type ReactElement, type ReactNode } from "react";
 
 /* ── 共用小元件與 icons ──────────────────────────────────────────────── */
 
 export function Section({ title, children }: { title?: string; children: ReactNode }) {
+  const titleId = useId();
   return (
-    <section className="mb-6">
-      {title && <div className="section-title">{title}</div>}
+    <section className="mb-6" aria-labelledby={title ? titleId : undefined}>
+      {title && <h2 id={titleId} className="section-title">{title}</h2>}
       <div className="card">{children}</div>
     </section>
+  );
+}
+
+function isNativeFormControl(child: ReactNode): child is ReactElement<Record<string, unknown>> {
+  return (
+    isValidElement<Record<string, unknown>>(child) &&
+    typeof child.type === "string" &&
+    ["input", "select", "textarea"].includes(child.type)
   );
 }
 
@@ -22,13 +31,28 @@ export function Row({
   children?: ReactNode;
   alignTop?: boolean;
 }) {
+  const labelId = useId();
+  const childList = Children.toArray(children);
+  const hasSingleDirectControl = childList.length === 1 && isNativeFormControl(childList[0]);
+  const labelledChildren = childList.map((child) => {
+    if (!isNativeFormControl(child)) return child;
+    if (child.props["aria-label"] || child.props["aria-labelledby"]) return child;
+    return cloneElement(child, { "aria-labelledby": labelId });
+  });
+
   return (
     <div className="row" style={alignTop ? { alignItems: "flex-start" } : undefined}>
       <div className="flex-1 min-w-0">
-        <div className="row-label">{label}</div>
+        <div className="row-label" id={labelId}>{label}</div>
         {sub && <div className="row-sub">{sub}</div>}
       </div>
-      {children}
+      <div
+        className="row-control"
+        role={hasSingleDirectControl ? undefined : "group"}
+        aria-labelledby={hasSingleDirectControl ? undefined : labelId}
+      >
+        {labelledChildren}
+      </div>
     </div>
   );
 }
@@ -68,15 +92,27 @@ export function Hotkey({ combo = "Opt+Shift+C" }: { combo?: string }) {
 
 export function LevelBar({ level, active }: { level: number; active: boolean }) {
   const pct = active ? Math.min(100, level * 400) : 0;
+  const stateText = !active ? "麥克風測試未啟動" : level > 0.01 ? "收音正常" : "音量偏低";
   return (
-    <div className="level-track">
-      {/* 靜音門檻 0.01 → 4% */}
-      <div className="level-thresh" style={{ left: "4%" }} />
+    <>
       <div
-        className={`level-fill ${level > 0.01 ? "hot" : ""}`}
-        style={{ width: `${active ? Math.max(pct, 1.5) : 0}%` }}
-      />
-    </div>
+        className="level-track"
+        role="meter"
+        aria-label="麥克風音量"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(pct)}
+        aria-valuetext={stateText}
+      >
+        {/* 靜音門檻 0.01 → 4% */}
+        <div className="level-thresh" style={{ left: "4%" }} />
+        <div
+          className={`level-fill ${level > 0.01 ? "hot" : ""}`}
+          style={{ width: `${active ? Math.max(pct, 1.5) : 0}%` }}
+        />
+      </div>
+      <span className="sr-only" role="status" aria-live="polite">{stateText}</span>
+    </>
   );
 }
 
@@ -115,6 +151,12 @@ export const IconHistory = () => (
   <svg viewBox="0 0 20 20" {...S}>
     <circle cx="10" cy="10" r="6.7" />
     <path d="M10 6.6V10l2.4 1.6" />
+  </svg>
+);
+export const IconSetup = () => (
+  <svg viewBox="0 0 20 20" {...S}>
+    <path d="M5 4.2h10a1.3 1.3 0 0 1 1.3 1.3v9a1.3 1.3 0 0 1-1.3 1.3H5a1.3 1.3 0 0 1-1.3-1.3v-9A1.3 1.3 0 0 1 5 4.2Z" />
+    <path d="m6.4 8.1 1.2 1.2 2-2.1M11.4 8.3h2.3M6.4 12.4h7.3" />
   </svg>
 );
 export const IconSettings = () => (
