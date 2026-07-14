@@ -10,8 +10,15 @@ on:
 jobs:
   desktop:
     runs-on: macos-latest
+    env:
+      # llama-cpp-sys-2 0.1.150 的 vendored llama.cpp 編 cpp-httplib（SSL），
+      # macOS 系統沒有 OpenSSL 標頭——指向 Homebrew 的 openssl@3
+      OPENSSL_ROOT_DIR: /opt/homebrew/opt/openssl@3
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Ensure OpenSSL headers (llama.cpp cpp-httplib)
+        run: brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
 
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable, 2026-06-30
 
