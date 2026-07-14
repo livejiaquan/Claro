@@ -108,6 +108,10 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # 與 ci.yml 一致：Claro 不用 llama.cpp 的 HTTPS 下載，確定性編
+          # 無 SSL 的 cpp-httplib（runner 沒有 OpenSSL 標頭；發行產物也
+          # 不該因 builder 有無 openssl 而異）
+          CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: "TRUE"
         run: |
           export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/workspace --remap-path-prefix=$HOME/.cargo=/cargo"
           npm run tauri build -- --target "${{ inputs.target }}" --bundles app,dmg
