@@ -1070,6 +1070,27 @@ fn init_core(app: &tauri::AppHandle) {
     }
     pipeline::spawn_stt_idle_watcher(core.clone());
 
+    // 模型檔背景預校驗：還沒有持久 marker 的既有模型檔（升級後第一次啟動、
+    // 或校驗器版本變更）第一次 verify 要整檔 SHA-256，數 GB 會卡住第一個
+    // 碰到它的路徑——聽寫中載入內建 LLM、設定頁模型列表都會扛到。
+    // 啟動時先在背景把所有已下載模型的 marker 補齊；之後的 verify 都是
+    // 讀 marker 的 O(1)。上面 whisper 預載已順路校驗使用中模型，這裡補
+    // 內建 LLM 與其餘已下載的 whisper 變體。
+    std::thread::spawn(|| {
+        for spec in llm::LLM_MODELS {
+            let path = llm::model_path(spec);
+            if path.exists() && !models::model_file_is_verified(&path, spec.sha256) {
+                tracing::warn!("llm model failed integrity pre-verification: {}", spec.id);
+            }
+        }
+        for spec in registry::MODELS {
+            let path = registry::model_path(spec);
+            if path.exists() && !models::model_file_is_verified(&path, spec.sha256) {
+                tracing::warn!("stt model failed integrity pre-verification: {}", spec.id);
+            }
+        }
+    });
+
     // SIGTERM/SIGINT：走 AppHandle::exit 優雅收場（直接 exit 會觸發 crash reporter）
     {
         let core = core.clone();
