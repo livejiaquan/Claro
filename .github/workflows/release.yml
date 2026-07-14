@@ -108,7 +108,9 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        run: npm run tauri build -- --target "${{ inputs.target }}" --bundles app,dmg
+        run: |
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/workspace --remap-path-prefix=$HOME/.cargo=/cargo"
+          npm run tauri build -- --target "${{ inputs.target }}" --bundles app,dmg
 
       - name: Verify app, sidecar, minimum OS, signature, and notarization
         run: |
@@ -116,27 +118,58 @@ jobs:
           DMG="$(find desktop/src-tauri/target -type f -path '*/release/bundle/dmg/*.dmg' -print -quit)"
           test -n "$APP"
           test -n "$DMG"
+          MAIN="$APP/Contents/MacOS/claro"
           SIDECAR="$APP/Contents/MacOS/mic_indicator"
+          test -x "$MAIN"
           test -x "$SIDECAR"
           test "$(plutil -extract LSMinimumSystemVersion raw "$APP/Contents/Info.plist")" = "11.0"
-          MAIN_LOAD_COMMANDS="$(otool -l "$APP/Contents/MacOS/claro")"
+          MAIN_LOAD_COMMANDS="$(otool -l "$MAIN")"
           SIDECAR_LOAD_COMMANDS="$(otool -l "$SIDECAR")"
           grep -q 'minos 11.0' <<< "$MAIN_LOAD_COMMANDS"
           grep -q 'minos 11.0' <<< "$SIDECAR_LOAD_COMMANDS"
+          check_runtime_deps() {
+            local binary="$1"
+            otool -L "$binary" | tail -n +2 | awk '{print $1}' | while IFS= read -r dependency; do
+              case "$dependency" in
+                /System/Library/*|/usr/lib/*|@rpath/*|@loader_path/*|@executable_path/*) ;;
+                *) echo "Unexpected non-system runtime dependency in $binary: $dependency" >&2; exit 1 ;;
+              esac
+            done
+          }
+          check_runtime_deps "$MAIN"
+          check_runtime_deps "$SIDECAR"
+          if strings "$MAIN" | grep -F "$GITHUB_WORKSPACE"; then
+            echo "Main binary leaks the GitHub workspace path" >&2
+            exit 1
+          fi
+          if strings "$MAIN" | grep -F "$HOME/.cargo"; then
+            echo "Main binary leaks the Cargo home path" >&2
+            exit 1
+          fi
 
-          ARCHS="$(lipo -archs "$SIDECAR")"
+          MAIN_ARCHS="$(lipo -archs "$MAIN")"
+          SIDECAR_ARCHS="$(lipo -archs "$SIDECAR")"
           case "${{ inputs.target }}" in
-            aarch64-apple-darwin) test "$ARCHS" = "arm64" ;;
-            x86_64-apple-darwin) test "$ARCHS" = "x86_64" ;;
+            aarch64-apple-darwin)
+              test "$MAIN_ARCHS" = "arm64"
+              test "$SIDECAR_ARCHS" = "arm64"
+              ;;
+            x86_64-apple-darwin)
+              test "$MAIN_ARCHS" = "x86_64"
+              test "$SIDECAR_ARCHS" = "x86_64"
+              ;;
             universal-apple-darwin)
-              grep -qw arm64 <<< "$ARCHS"
-              grep -qw x86_64 <<< "$ARCHS"
+              grep -qw arm64 <<< "$MAIN_ARCHS"
+              grep -qw x86_64 <<< "$MAIN_ARCHS"
+              grep -qw arm64 <<< "$SIDECAR_ARCHS"
+              grep -qw x86_64 <<< "$SIDECAR_ARCHS"
               ;;
           esac
 
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign --verify --strict --verbose=2 "$SIDECAR"
           spctl --assess --type execute --verbose=4 "$APP"
+          spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG"
           xcrun stapler validate "$APP"
           xcrun stapler validate "$DMG"
 

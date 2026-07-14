@@ -63,8 +63,9 @@ pub fn resample_to_16k(samples: &[f32], from_rate: u32) -> Result<Vec<f32>> {
     use rubato::{FftFixedIn, Resampler};
 
     const CHUNK: usize = 1024;
-    let mut resampler = FftFixedIn::<f32>::new(from_rate as usize, TARGET_RATE as usize, CHUNK, 2, 1)
-        .context("create resampler")?;
+    let mut resampler =
+        FftFixedIn::<f32>::new(from_rate as usize, TARGET_RATE as usize, CHUNK, 2, 1)
+            .context("create resampler")?;
     let mut out: Vec<f32> = Vec::with_capacity(
         (samples.len() as f64 * TARGET_RATE as f64 / from_rate as f64) as usize + CHUNK,
     );
@@ -192,7 +193,9 @@ pub fn start_capture(preferred_device: Option<String>) -> Result<CaptureHandle> 
         let rate = config.sample_rate().0;
         let channels = config.channels() as usize;
 
-        let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+        // 預留 30 秒 mono native-rate 容量；一般聽寫 callback 不需反覆擴充 Vec。
+        let samples: Arc<Mutex<Vec<f32>>> =
+            Arc::new(Mutex::new(Vec::with_capacity(rate as usize * 30)));
         let samples_cb = samples.clone();
         let level_cb = level_thread.clone();
 
@@ -209,8 +212,7 @@ pub fn start_capture(preferred_device: Option<String>) -> Result<CaptureHandle> 
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &config.into(),
                 move |data: &[i16], _| {
-                    let f: Vec<f32> = data.iter().map(|s| *s as f32 / 32768.0).collect();
-                    push_mono(&f, channels, &samples_cb, &level_cb);
+                    push_i16_mono(data, channels, &samples_cb, &level_cb);
                 },
                 err_fn,
                 None,
@@ -235,24 +237,72 @@ pub fn start_capture(preferred_device: Option<String>) -> Result<CaptureHandle> 
 
     // 等 stream 真的開起來（或失敗），失敗要立刻讓 caller 知道
     match ready_rx.recv_timeout(Duration::from_secs(3)) {
-        Ok(Ok(())) => Ok(CaptureHandle { stop_tx, join, level, started: Instant::now() }),
+        Ok(Ok(())) => Ok(CaptureHandle {
+            stop_tx,
+            join,
+            level,
+            started: Instant::now(),
+        }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(anyhow!("audio thread did not start in time")),
     }
 }
 
 fn push_mono(data: &[f32], channels: usize, samples: &Mutex<Vec<f32>>, level: &AtomicLevel) {
-    let mono: Vec<f32> = if channels <= 1 {
-        data.to_vec()
+    let mut output = samples.lock().unwrap();
+    let mut sum_sq = 0.0f64;
+    let mut count = 0usize;
+    if channels <= 1 {
+        output.extend_from_slice(data);
+        for sample in data {
+            sum_sq += (*sample as f64) * (*sample as f64);
+        }
+        count = data.len();
     } else {
-        data.chunks(channels)
-            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-            .collect()
-    };
+        for frame in data.chunks_exact(channels) {
+            let mono = frame.iter().sum::<f32>() / channels as f32;
+            output.push(mono);
+            sum_sq += (mono as f64) * (mono as f64);
+            count += 1;
+        }
+    }
     // 平滑：level*0.6 + rms*0.4（prototype 語意）
-    let r = rms(&mono);
+    let r = if count == 0 {
+        0.0
+    } else {
+        (sum_sq / count as f64).sqrt() as f32
+    };
     level.set(level.get() * 0.6 + r * 0.4);
-    samples.lock().unwrap().extend_from_slice(&mono);
+}
+
+fn push_i16_mono(data: &[i16], channels: usize, samples: &Mutex<Vec<f32>>, level: &AtomicLevel) {
+    let mut output = samples.lock().unwrap();
+    let mut sum_sq = 0.0f64;
+    let mut count = 0usize;
+    if channels <= 1 {
+        output.reserve(data.len());
+        for sample in data {
+            let mono = *sample as f32 / 32768.0;
+            output.push(mono);
+            sum_sq += (mono as f64) * (mono as f64);
+            count += 1;
+        }
+    } else {
+        output.reserve(data.len() / channels);
+        for frame in data.chunks_exact(channels) {
+            let mono =
+                frame.iter().map(|sample| *sample as f32).sum::<f32>() / channels as f32 / 32768.0;
+            output.push(mono);
+            sum_sq += (mono as f64) * (mono as f64);
+            count += 1;
+        }
+    }
+    let r = if count == 0 {
+        0.0
+    } else {
+        (sum_sq / count as f64).sqrt() as f32
+    };
+    level.set(level.get() * 0.6 + r * 0.4);
 }
 
 #[cfg(test)]
@@ -264,6 +314,22 @@ mod tests {
         assert_eq!(rms(&[0.0; 100]), 0.0);
         assert!((rms(&[1.0; 100]) - 1.0).abs() < 1e-6);
         assert_eq!(rms(&[]), 0.0);
+    }
+
+    #[test]
+    fn realtime_downmix_paths_do_not_need_temporary_buffers() {
+        let f32_out = Mutex::new(Vec::new());
+        let f32_level = AtomicLevel::default();
+        push_mono(&[1.0, -1.0, 0.5, 0.5], 2, &f32_out, &f32_level);
+        assert_eq!(*f32_out.lock().unwrap(), vec![0.0, 0.5]);
+
+        let i16_out = Mutex::new(Vec::new());
+        let i16_level = AtomicLevel::default();
+        push_i16_mono(&[32767, 32767, -32768, -32768], 2, &i16_out, &i16_level);
+        let samples = i16_out.lock().unwrap();
+        assert_eq!(samples.len(), 2);
+        assert!(samples[0] > 0.99);
+        assert_eq!(samples[1], -1.0);
     }
 
     #[test]

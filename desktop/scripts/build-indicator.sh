@@ -31,6 +31,8 @@ compile_arch() {
   local output="$2"
   swiftc "$SOURCE" \
     -o "$output" \
+    -O \
+    -gnone \
     -target "${swift_arch}-apple-macosx${DEPLOYMENT_TARGET}" \
     -framework Cocoa \
     -framework AVFoundation

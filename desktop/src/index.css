@@ -1026,6 +1026,21 @@ input {
   }
 }
 
+.context-audit-text {
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.025);
+  color: var(--muted);
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
 ::-webkit-scrollbar {
   width: 8px;
 }

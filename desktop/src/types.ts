@@ -12,6 +12,9 @@ export interface Status {
   context_enabled: boolean;
   hotkey: string;
   setup_completed: boolean;
+  successful_pastes_this_launch: number;
+  history_enabled: boolean;
+  mic_test_passed_this_launch: boolean;
   polish_mode?: PolishMode;
   effective_mode?: PolishMode;
   llm_provider?: string;
@@ -19,6 +22,31 @@ export interface Status {
   execution_location?: ExecutionLocation;
   endpoint_origin?: string | null;
   blocked_reason?: PolishBlockedReason;
+}
+
+export interface HardwareProfile {
+  architecture: string;
+  memory_gb: number;
+  tier: "compact" | "balanced" | "performance";
+  low_memory_mode: boolean;
+  keep_models_warm: boolean;
+  recommended_stt: string;
+  recommended_llm_provider: "apple" | "builtin";
+  recommended_llm_model: string;
+  reason: string;
+}
+
+export interface ContextAudit {
+  text: string;
+  app_id: string;
+  app_name: string;
+  surface: "email" | "message" | "technical" | "document" | "neutral";
+}
+
+export interface PendingResult {
+  raw: string;
+  text: string;
+  reason: "focus_changed" | "paste_failed";
 }
 
 export interface ModelInfo {
@@ -165,6 +193,9 @@ export interface DownloadProgress {
 export interface MicLevel {
   level: number;
   active: boolean;
+  generation: number;
+  passed: boolean;
+  timed_out: boolean;
 }
 
 export interface HistoryEntry {

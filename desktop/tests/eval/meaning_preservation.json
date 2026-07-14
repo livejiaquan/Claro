@@ -2,7 +2,7 @@
   {
     "id": "organize_reorders_complete_thoughts",
     "mode": "organize",
-    "input": "嗯先說結論，明天不上線。那個原因是測試尚未完成。",
+    "input": "嗯先說結論，明天不上線。那個，原因是測試尚未完成。",
     "candidate": "原因是測試尚未完成。先說結論，明天不上線。",
     "accepted": true
   },
@@ -33,6 +33,41 @@
     "input": "測試尚未完成，明天不上線。",
     "candidate": "測試尚未完成，所以明天不上線，這是最安全的決定。",
     "accepted": false
+  },
+  {
+    "id": "organize_accepts_explicit_late_time_correction",
+    "mode": "organize",
+    "input": "會議明天7am，不對，明天3pm。",
+    "candidate": "會議明天3pm。",
+    "accepted": true
+  },
+  {
+    "id": "organize_preserves_stable_negation_around_correction",
+    "mode": "organize",
+    "input": "不要通知客戶。會議7am，不對，會議3pm。",
+    "candidate": "會議3pm。不要通知客戶。",
+    "accepted": true
+  },
+  {
+    "id": "organize_rejects_dropped_stable_negation_around_correction",
+    "mode": "organize",
+    "input": "不要通知客戶。會議7am，不對，會議3pm。",
+    "candidate": "會議3pm。通知客戶。",
+    "accepted": false
+  },
+  {
+    "id": "organize_accepts_exact_duplicate_merge",
+    "mode": "organize",
+    "input": "提醒團隊。提醒團隊。",
+    "candidate": "提醒團隊。",
+    "accepted": true
+  },
+  {
+    "id": "organize_accepts_explicit_list_formatting",
+    "mode": "organize",
+    "input": "購物清單，牛奶、雞蛋、蘋果。",
+    "candidate": "購物清單：\n• 牛奶\n• 雞蛋\n• 蘋果",
+    "accepted": true
   },
   {
     "id": "clean_accepts_punctuation_only",
@@ -81,6 +116,242 @@
     "mode": "clean",
     "input": "我們先確認需求與設計，再完成實作與測試，最後部署並通知團隊。",
     "candidate": "我們先確認需求與設計。",
+    "accepted": false
+  },
+  {
+    "id": "clean_accepts_explicit_time_correction",
+    "mode": "clean",
+    "input": "會議明天7am，不對，明天3pm。",
+    "candidate": "會議明天3pm。",
+    "accepted": true
+  },
+  {
+    "id": "clean_keeps_unrelated_negation_during_correction",
+    "mode": "clean",
+    "input": "不要通知客戶。會議7am，不對，會議3pm。",
+    "candidate": "不要通知客戶。會議3pm。",
+    "accepted": true
+  },
+  {
+    "id": "clean_rejects_dropped_unrelated_negation_during_correction",
+    "mode": "clean",
+    "input": "不要通知客戶。會議7am，不對，會議3pm。",
+    "candidate": "通知客戶。會議3pm。",
+    "accepted": false
+  },
+  {
+    "id": "clean_does_not_treat_change_request_as_correction_marker",
+    "mode": "clean",
+    "input": "不要改成紅色",
+    "candidate": "改成紅色",
+    "accepted": false
+  },
+  {
+    "id": "organize_does_not_treat_change_request_as_correction_marker",
+    "mode": "organize",
+    "input": "不要改成紅色",
+    "candidate": "改成紅色",
+    "accepted": false
+  },
+  {
+    "id": "clean_does_not_treat_budui_inside_word_as_correction",
+    "mode": "clean",
+    "input": "版本 2.0 不對外公開",
+    "candidate": "版本 2.0 對外公開",
+    "accepted": false
+  },
+  {
+    "id": "clean_accepts_multiple_explicit_corrections",
+    "mode": "clean",
+    "input": "會議7點，不對，5點，不對，3點。",
+    "candidate": "會議3點。",
+    "accepted": true
+  },
+  {
+    "id": "clean_preserves_comma_separated_negation_before_correction",
+    "mode": "clean",
+    "input": "不要通知客戶，會議7點，不對，3點。",
+    "candidate": "通知客戶，會議3點。",
+    "accepted": false
+  },
+  {
+    "id": "organize_preserves_comma_separated_negation_before_correction",
+    "mode": "organize",
+    "input": "不要通知客戶，會議7點，不對，3點。",
+    "candidate": "通知客戶，會議3點。",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_opposite_action_with_same_context",
+    "mode": "clean",
+    "input": "明天請開啟通知功能",
+    "candidate": "明天請關閉通知功能",
+    "accepted": false
+  },
+  {
+    "id": "organize_rejects_subject_object_role_swap",
+    "mode": "organize",
+    "input": "Alice 寄給 Bob",
+    "candidate": "Bob 寄給 Alice",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_dropped_coordinated_object",
+    "mode": "clean",
+    "input": "請通知甲和乙",
+    "candidate": "請通知甲",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_demonstrative_as_filler",
+    "mode": "clean",
+    "input": "那個人不要通知",
+    "candidate": "人不要通知",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_embedded_english_filler_substring",
+    "mode": "clean",
+    "input": "Summer release",
+    "candidate": "Smer release",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_unrelated_short_rewrite",
+    "mode": "clean",
+    "input": "原文本體",
+    "candidate": "整理後",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_grounded_similar_name_role_swap",
+    "mode": "clean",
+    "input": "Martin 寄給 Marvin",
+    "candidate": "Marvin 寄給 Martin",
+    "context": "Martin Marvin",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_grounded_english_action_flip",
+    "mode": "clean",
+    "input": "Please enable notifications",
+    "candidate": "Please disable notifications",
+    "context": "disable notifications",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_changed_emoji",
+    "mode": "clean",
+    "input": "收到👍",
+    "candidate": "收到👎",
+    "accepted": false
+  },
+  {
+    "id": "organize_rejects_changed_emoji",
+    "mode": "organize",
+    "input": "收到👍。稍後回覆。",
+    "candidate": "稍後回覆。收到👎。",
+    "accepted": false
+  },
+  {
+    "id": "organize_rejects_short_segment_absorbed_by_longer_segment",
+    "mode": "organize",
+    "input": "甲。甲乙。",
+    "candidate": "甲乙。",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_unpunctuated_correction_scope",
+    "mode": "clean",
+    "input": "不要通知客戶 會議 7am 不對 3pm",
+    "candidate": "通知客戶 會議 3pm",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_subject_dropped_with_numeric_correction",
+    "mode": "clean",
+    "input": "請通知甲會議7點，不對，3點。",
+    "candidate": "3點。",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_grounded_normal_word_substitution",
+    "mode": "clean",
+    "input": "Please ship code",
+    "candidate": "Please skip code",
+    "context": "skip code",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_suffix_dropped_with_numeric_correction",
+    "mode": "clean",
+    "input": "7點請通知甲，不對，3點。",
+    "candidate": "3點。",
+    "accepted": false
+  },
+  {
+    "id": "clean_accepts_numeric_correction_with_stable_suffix",
+    "mode": "clean",
+    "input": "7點請通知甲，不對，3點。",
+    "candidate": "3點請通知甲。",
+    "accepted": true
+  },
+  {
+    "id": "clean_rejects_suffix_dropped_with_location_correction",
+    "mode": "clean",
+    "input": "台北開會，不對，台中。",
+    "candidate": "台中。",
+    "accepted": false
+  },
+  {
+    "id": "clean_accepts_location_correction_with_stable_suffix",
+    "mode": "clean",
+    "input": "台北開會，不對，台中。",
+    "candidate": "台中開會。",
+    "accepted": true
+  },
+  {
+    "id": "clean_rejects_context_grounded_token_replacement",
+    "mode": "clean",
+    "input": "我們用 hyTorch 跑訓練",
+    "candidate": "我們用 PyTorch 跑訓練",
+    "context": "PyTorch training pipeline",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_context_grounded_identifier_change",
+    "mode": "clean",
+    "input": "Use ModelA",
+    "candidate": "Use ModelB",
+    "context": "ModelB",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_added_question_intent",
+    "mode": "clean",
+    "input": "你要去",
+    "candidate": "你要去？",
+    "accepted": false
+  },
+  {
+    "id": "organize_rejects_removed_question_intent",
+    "mode": "organize",
+    "input": "你要去？稍後告訴我。",
+    "candidate": "稍後告訴我。你要去。",
+    "accepted": false
+  },
+  {
+    "id": "clean_rejects_identifier_case_change",
+    "mode": "clean",
+    "input": "Use myVar",
+    "candidate": "Use myvar",
+    "accepted": false
+  },
+  {
+    "id": "organize_rejects_identifier_case_change",
+    "mode": "organize",
+    "input": "Use myVar。Keep APIClient。",
+    "candidate": "Keep APIClient。Use myvar。",
     "accepted": false
   }
 ]

@@ -106,6 +106,7 @@ mod engine {
     const IDLE_UNLOAD: Duration = Duration::from_secs(300); // Handy 預設 5 分鐘
     const MAX_OUTPUT_TOKENS: usize = 512;
     const N_CTX: u32 = 4096;
+    const MAX_GENERATION_TIME: Duration = Duration::from_secs(6);
 
     struct Loaded {
         id: String,
@@ -158,8 +159,24 @@ mod engine {
         }
     }
 
+    /// 低記憶體模型交接用。只從 pipeline 的背景執行緒呼叫；等待正在收尾的
+    /// watcher／生成鎖後完整 drop LLM，再載入 STT，避免兩個 Metal 模型重疊。
+    pub fn unload_blocking() {
+        let mut guard = STATE.lock().unwrap();
+        *guard = None;
+    }
+
     /// 用內建模型跑一次 chat completion（greedy，最保守）。
-    pub fn generate(model_id: &str, system: &str, user: &str) -> Result<String> {
+    pub fn generate_with_cancel(
+        model_id: &str,
+        system: &str,
+        user: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<String> {
+        let deadline = Instant::now() + MAX_GENERATION_TIME;
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("內建整理已取消");
+        }
         let spec = find(model_id).with_context(|| format!("未知的內建模型 {model_id}"))?;
         let path = model_path(spec);
         crate::models::verify_model_file(&path, spec.sha256)
@@ -186,6 +203,12 @@ mod engine {
                 last_used: Instant::now(),
             });
             spawn_watcher();
+        }
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("內建整理已取消");
+        }
+        if Instant::now() >= deadline {
+            bail!("內建整理逾時");
         }
         let loaded = guard.as_mut().expect("loaded above");
         loaded.last_used = Instant::now();
@@ -221,6 +244,12 @@ mod engine {
             batch.add(*t, i as i32, &[0], i == last)?;
         }
         ctx.decode(&mut batch).context("decode prompt")?;
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("內建整理已取消");
+        }
+        if Instant::now() >= deadline {
+            bail!("內建整理逾時");
+        }
 
         // greedy：糾錯任務要最保守、可重現的輸出。
         // 注意：CJK 一個字常拆成多個 token（半個 UTF-8 序列），
@@ -230,6 +259,12 @@ mod engine {
         let mut n_cur = tokens.len() as i32;
         let mut reached_eog = false;
         for _ in 0..MAX_OUTPUT_TOKENS {
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                bail!("內建整理已取消");
+            }
+            if Instant::now() >= deadline {
+                bail!("內建整理逾時");
+            }
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(token);
             if model.is_eog_token(token) {
@@ -248,13 +283,28 @@ mod engine {
             .context("detokenize output")?;
         Ok(out.trim().to_string())
     }
+
+    pub fn generate(model_id: &str, system: &str, user: &str) -> Result<String> {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        generate_with_cancel(model_id, system, user, &cancel)
+    }
 }
 
 #[cfg(target_os = "macos")]
-pub use engine::{generate, unload_now};
+pub use engine::{generate, generate_with_cancel, unload_blocking, unload_now};
 
 #[cfg(not(target_os = "macos"))]
 pub fn generate(_model_id: &str, _system: &str, _user: &str) -> Result<String> {
+    bail!("內建模型目前只支援 macOS")
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn generate_with_cancel(
+    _model_id: &str,
+    _system: &str,
+    _user: &str,
+    _cancel: &std::sync::atomic::AtomicBool,
+) -> Result<String> {
     bail!("內建模型目前只支援 macOS")
 }
 
@@ -263,13 +313,25 @@ pub fn unload_now() -> bool {
     true
 }
 
+#[cfg(not(target_os = "macos"))]
+pub fn unload_blocking() {}
+
 #[cfg(test)]
 mod generation_stop_tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn token_limit_without_eog_is_rejected() {
         assert!(require_complete_generation(false).is_err());
         assert!(require_complete_generation(true).is_ok());
+    }
+
+    #[test]
+    fn cancelled_generation_stops_before_model_lookup_or_load() {
+        let cancel = AtomicBool::new(true);
+        let error = generate_with_cancel("missing-model", "system", "user", &cancel)
+            .expect_err("cancelled generation must stop");
+        assert!(error.to_string().contains("取消"));
     }
 }

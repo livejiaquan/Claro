@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod context;
+pub mod hardware;
 pub mod history;
 pub mod hotkey;
 pub mod inject;
@@ -13,7 +14,7 @@ pub mod state_machine;
 pub mod stt;
 pub mod textproc;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -25,9 +26,13 @@ use crate::stt::registry;
 
 struct AppState {
     core: Arc<pipeline::Core>,
+    /// STT 與 LLM 共用同一下載閘門，避免兩個大型檔案同時通過各自的磁碟預檢。
+    download_gate: Arc<Mutex<Option<&'static str>>>,
     downloading: Arc<Mutex<Option<&'static str>>>,
     llm_downloading: Arc<Mutex<Option<&'static str>>>,
     mic_test: Arc<Mutex<Option<CaptureHandle>>>,
+    mic_test_passed: Arc<AtomicBool>,
+    mic_test_generation: Arc<AtomicU64>,
 }
 
 fn accessibility_trusted() -> bool {
@@ -58,6 +63,9 @@ struct Status {
     context_enabled: bool,
     hotkey: String,
     setup_completed: bool,
+    successful_pastes_this_launch: u64,
+    history_enabled: bool,
+    mic_test_passed_this_launch: bool,
     /// 以下欄位讓首頁不必從 provider 名稱猜測隱私狀態；全部由 runtime gate 推導。
     polish_mode: settings::PolishMode,
     effective_mode: settings::PolishMode,
@@ -91,6 +99,9 @@ fn get_status(state: tauri::State<AppState>) -> Status {
         context_enabled: settings.context_enabled(),
         hotkey: settings.hotkey_combo(),
         setup_completed: settings.setup_completed(),
+        successful_pastes_this_launch: state.core.successful_pastes.load(Ordering::SeqCst),
+        history_enabled: settings.history_enabled(),
+        mic_test_passed_this_launch: state.mic_test_passed.load(Ordering::SeqCst),
         polish_mode: settings.polish_mode(),
         effective_mode: polish::effective_mode(&settings),
         llm_provider: settings.llm_provider(),
@@ -103,14 +114,38 @@ fn get_status(state: tauri::State<AppState>) -> Status {
 
 // ─── 輸入裝置與麥克風測試 ────────────────────────────────────────────────────
 
+fn emit_mic_inactive(app: &tauri::AppHandle, generation: u64, passed: bool) {
+    let _ = app.emit(
+        "mic-level",
+        MicLevel {
+            level: 0.0,
+            active: false,
+            generation,
+            passed,
+            timed_out: false,
+        },
+    );
+}
+
 #[tauri::command]
-fn set_input_device(name: String, state: tauri::State<AppState>) -> Result<(), String> {
+fn set_input_device(
+    name: String,
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let _audio_gate = state.core.audio_start_gate.lock().unwrap();
     let selection = if name.is_empty() {
         None
     } else {
         Some(name.clone())
     };
+    let generation = state.mic_test_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Some(handle) = state.mic_test.lock().unwrap().take() {
+        let _ = handle.stop();
+    }
     *state.core.input_device.lock().unwrap() = selection;
+    state.mic_test_passed.store(false, Ordering::SeqCst);
+    emit_mic_inactive(&app, generation, false);
     settings::update_config_key(
         &settings::config_path(),
         "input_device",
@@ -123,10 +158,14 @@ fn set_input_device(name: String, state: tauri::State<AppState>) -> Result<(), S
 struct MicLevel {
     level: f32,
     active: bool,
+    generation: u64,
+    passed: bool,
+    timed_out: bool,
 }
 
 #[tauri::command]
 fn mic_test_start(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+    let _audio_gate = state.core.audio_start_gate.lock().unwrap();
     if state.core.sm.lock().unwrap().state() != State::Idle {
         return Err("聽寫進行中，無法測試麥克風".into());
     }
@@ -137,29 +176,67 @@ fn mic_test_start(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
     let device = state.core.input_device.lock().unwrap().clone();
     let handle = audio::start_capture(device).map_err(|e| e.to_string())?;
     let level = handle.level_handle();
+    let mic_test_passed = state.mic_test_passed.clone();
+    mic_test_passed.store(false, Ordering::SeqCst);
+    let mic_test_generation = state.mic_test_generation.clone();
+    let generation = mic_test_generation.fetch_add(1, Ordering::SeqCst) + 1;
     *guard = Some(handle);
     drop(guard);
 
     let mic_test = state.mic_test.clone();
+    let core = state.core.clone();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
+        let mut passed = false;
+        let mut timed_out = false;
         loop {
+            if mic_test_generation.load(Ordering::SeqCst) != generation {
+                break;
+            }
             if mic_test.lock().unwrap().is_none() {
                 break;
             }
             if started.elapsed().as_secs() >= 30 {
+                let _audio_gate = core.audio_start_gate.lock().unwrap();
                 if let Some(h) = mic_test.lock().unwrap().take() {
                     let _ = h.stop();
                 }
+                timed_out = true;
+                break;
+            }
+            let current_level = level.get();
+            if current_level > 0.01 {
+                if mic_test_generation.load(Ordering::SeqCst) == generation {
+                    mic_test_passed.store(true, Ordering::SeqCst);
+                    passed = true;
+                    if mic_test_generation.load(Ordering::SeqCst) != generation {
+                        mic_test_passed.store(false, Ordering::SeqCst);
+                        passed = false;
+                    }
+                }
+            }
+            if mic_test_generation.load(Ordering::SeqCst) != generation {
                 break;
             }
             let _ = app.emit(
                 "mic-level",
                 MicLevel {
-                    level: level.get(),
+                    level: current_level,
                     active: true,
+                    generation,
+                    passed,
+                    timed_out: false,
                 },
             );
+            // 一確認收音就自動釋放裝置，避免使用者切到 TextEdit 做首次聽寫時
+            // mic test 與正式錄音同時佔用 USB／Bluetooth input stream。
+            if passed {
+                let _audio_gate = core.audio_start_gate.lock().unwrap();
+                if let Some(h) = mic_test.lock().unwrap().take() {
+                    let _ = h.stop();
+                }
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let _ = app.emit(
@@ -167,6 +244,9 @@ fn mic_test_start(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
             MicLevel {
                 level: 0.0,
                 active: false,
+                generation,
+                passed,
+                timed_out,
             },
         );
     });
@@ -174,10 +254,17 @@ fn mic_test_start(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
 }
 
 #[tauri::command]
-fn mic_test_stop(state: tauri::State<AppState>) {
+fn mic_test_stop(app: tauri::AppHandle, state: tauri::State<AppState>) {
+    let _audio_gate = state.core.audio_start_gate.lock().unwrap();
+    let generation = state.mic_test_generation.fetch_add(1, Ordering::SeqCst) + 1;
     if let Some(h) = state.mic_test.lock().unwrap().take() {
         let _ = h.stop();
     }
+    emit_mic_inactive(
+        &app,
+        generation,
+        state.mic_test_passed.load(Ordering::SeqCst),
+    );
 }
 
 // ─── 模型管理 ─────────────────────────────────────────────────────────────────
@@ -198,6 +285,7 @@ struct ModelInfo {
 fn list_models(state: tauri::State<AppState>) -> Vec<ModelInfo> {
     let active = state.core.active_model.lock().unwrap().id;
     let downloading = *state.downloading.lock().unwrap();
+    let recommended = hardware::profile(polish::apple_status()).recommended_stt;
     registry::MODELS
         .iter()
         .map(|m| ModelInfo {
@@ -205,12 +293,17 @@ fn list_models(state: tauri::State<AppState>) -> Vec<ModelInfo> {
             label: m.label,
             desc: m.desc,
             size_mb: m.approx_bytes / 1_048_576,
-            recommended: m.recommended,
+            recommended: m.id == recommended,
             downloaded: registry::model_is_verified(m),
             active: m.id == active,
             downloading: downloading == Some(m.id),
         })
         .collect()
+}
+
+#[tauri::command]
+fn get_hardware_profile() -> hardware::HardwareProfile {
+    hardware::profile(polish::apple_status())
 }
 
 #[derive(Serialize, Clone)]
@@ -222,14 +315,35 @@ struct DownloadProgress {
     error: Option<String>,
 }
 
+fn reserve_download(gate: &Mutex<Option<&'static str>>, id: &'static str) -> Result<(), String> {
+    let mut active = gate.lock().unwrap();
+    if active.is_some() {
+        return Err("已有另一個模型在下載中，完成後再試".into());
+    }
+    *active = Some(id);
+    Ok(())
+}
+
+fn release_download(gate: &Mutex<Option<&'static str>>) {
+    *gate.lock().unwrap() = None;
+}
+
 /// 使用者在 UI 明確點擊後才會呼叫（絕不自動下載，SPEC §6）
 #[tauri::command]
 fn download_model(
     id: String,
+    activate: Option<bool>,
     app: tauri::AppHandle,
     state: tauri::State<AppState>,
 ) -> Result<(), String> {
     let spec = registry::find(&id).ok_or("未知的模型")?;
+    reserve_download(&state.download_gate, spec.id)?;
+    if let Err(error) =
+        models::ensure_download_capacity(&registry::model_path(spec), spec.approx_bytes)
+    {
+        release_download(&state.download_gate);
+        return Err(error.to_string());
+    }
     {
         let mut guard = state.downloading.lock().unwrap();
         if guard.is_some() {
@@ -238,6 +352,9 @@ fn download_model(
         *guard = Some(spec.id);
     }
     let downloading = state.downloading.clone();
+    let download_gate = state.download_gate.clone();
+    let core = state.core.clone();
+    let activate_after_download = activate.unwrap_or(false);
     std::thread::spawn(move || {
         let dest = registry::model_path(spec);
         let result = models::download(spec.url, &dest, spec.sha256, |p| {
@@ -251,6 +368,17 @@ fn download_model(
                     error: None,
                 },
             );
+        })
+        .and_then(|()| {
+            if activate_after_download {
+                settings::update_config_key(
+                    &settings::config_path(),
+                    "whisper_model",
+                    serde_json::Value::String(spec.id.to_string()),
+                )?;
+                core.swap_model(spec);
+            }
+            Ok(())
         });
         let payload = match result {
             Ok(()) => DownloadProgress {
@@ -270,6 +398,7 @@ fn download_model(
         };
         let _ = app.emit("model-download", payload);
         *downloading.lock().unwrap() = None;
+        release_download(&download_gate);
     });
     Ok(())
 }
@@ -407,6 +536,12 @@ fn download_builtin_llm(
     state: tauri::State<AppState>,
 ) -> Result<(), String> {
     let spec = llm::find(&id).ok_or("未知的內建模型")?;
+    reserve_download(&state.download_gate, spec.id)?;
+    if let Err(error) = models::ensure_download_capacity(&llm::model_path(spec), spec.approx_bytes)
+    {
+        release_download(&state.download_gate);
+        return Err(error.to_string());
+    }
     {
         let mut guard = state.llm_downloading.lock().unwrap();
         if guard.is_some() {
@@ -415,6 +550,7 @@ fn download_builtin_llm(
         *guard = Some(spec.id);
     }
     let downloading = state.llm_downloading.clone();
+    let download_gate = state.download_gate.clone();
     std::thread::spawn(move || {
         let dest = llm::model_path(spec);
         let result = models::download(spec.url, &dest, spec.sha256, |p| {
@@ -447,6 +583,7 @@ fn download_builtin_llm(
         };
         let _ = app.emit("llm-model-download", payload);
         *downloading.lock().unwrap() = None;
+        release_download(&download_gate);
     });
     Ok(())
 }
@@ -502,9 +639,7 @@ fn set_llm_config(
 fn set_polish_mode(mode: String, confirmed: bool) -> Result<LlmConfig, String> {
     let mode = mode.parse::<settings::PolishMode>()?;
     let current = settings::Settings::load();
-    if mode == settings::PolishMode::Organize && !current.organize_consent_valid() && !confirmed {
-        return Err("啟用 ORGANIZE 前必須明確確認它會重排句序與段落".into());
-    }
+    validate_polish_mode_consent(mode, current.organize_consent_valid(), confirmed)?;
     let mut pairs = vec![("polish_mode".into(), mode.as_str().into())];
     if mode == settings::PolishMode::Organize && confirmed {
         pairs.push((
@@ -514,6 +649,18 @@ fn set_polish_mode(mode: String, confirmed: bool) -> Result<LlmConfig, String> {
     }
     settings::update_config_keys(&settings::config_path(), pairs).map_err(|e| e.to_string())?;
     Ok(get_llm_config())
+}
+
+fn validate_polish_mode_consent(
+    mode: settings::PolishMode,
+    organize_consent_valid: bool,
+    confirmed: bool,
+) -> Result<(), String> {
+    if mode == settings::PolishMode::Organize && !organize_consent_valid && !confirmed {
+        Err("啟用 ORGANIZE 前必須明確確認它會重排句序與段落".into())
+    } else {
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -557,7 +704,7 @@ async fn test_polish() -> Result<String, String> {
         }
         let result = polish::transform(
             &settings,
-            "嗯我們用 hyTorch，那個，跑訓練",
+            "嗯我們用 PyTorch，那個，跑訓練",
             "PyTorch training pipeline",
         );
         if result.metadata.outcome == polish::PolishOutcome::Fallback {
@@ -611,13 +758,27 @@ fn set_dictionary(entries: Vec<DictEntry>, state: tauri::State<AppState>) -> Res
 }
 
 #[tauri::command]
-fn set_context_enabled(enabled: bool) -> Result<(), String> {
+fn set_context_enabled(enabled: bool, state: tauri::State<AppState>) -> Result<(), String> {
+    if !enabled {
+        *state.core.last_context.lock().unwrap() = None;
+        *state.core.context_capture.lock().unwrap() = None;
+    }
     settings::update_config_key(
         &settings::config_path(),
         "context_enabled",
         serde_json::Value::Bool(enabled),
     )
     .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_context_audit(state: tauri::State<AppState>) -> Option<context::ContextSnapshot> {
+    state.core.last_context.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn clear_context_audit(state: tauri::State<AppState>) {
+    *state.core.last_context.lock().unwrap() = None;
 }
 
 /// 首次設定的持久化完成點。前端只會在本次麥克風測試通過後呼叫；
@@ -631,6 +792,18 @@ fn complete_setup(state: tauri::State<AppState>) -> Result<(), String> {
     if !registry::model_is_verified(spec) {
         return Err("語音模型尚未下載或完整性驗證失敗".into());
     }
+    let current = settings::Settings::load();
+    if let Err(reason) = validate_setup_polish(&current) {
+        return Err(format!(
+            "文字整理尚未就緒（{reason}）；請選擇本機整理或明確使用 RAW"
+        ));
+    }
+    if !current.setup_completed() && !state.mic_test_passed.load(Ordering::SeqCst) {
+        return Err("本次尚未完成麥克風收音測試".into());
+    }
+    if !current.setup_completed() && state.core.successful_pastes.load(Ordering::SeqCst) == 0 {
+        return Err("請先在任意輸入框完成一次真正的聽寫與貼上".into());
+    }
     settings::update_config_key(
         &settings::config_path(),
         "setup_completed",
@@ -639,11 +812,48 @@ fn complete_setup(state: tauri::State<AppState>) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+fn validate_setup_polish(current: &settings::Settings) -> Result<(), &'static str> {
+    if current.polish_mode() == settings::PolishMode::Raw {
+        Ok(())
+    } else if let Some(reason) = polish::blocked_reason(current) {
+        Err(reason)
+    } else {
+        Ok(())
+    }
+}
+
 // ─── 歷史與剪貼簿 ────────────────────────────────────────────────────────────
 
 #[tauri::command]
 fn get_history(n: usize) -> Vec<serde_json::Value> {
     history::read_recent(n.min(500), &history::history_path())
+}
+
+#[tauri::command]
+fn get_pending_result(state: tauri::State<AppState>) -> Option<pipeline::PendingResult> {
+    state.core.pending_results.lock().unwrap().front().cloned()
+}
+
+#[tauri::command]
+fn clear_pending_result(state: tauri::State<AppState>) {
+    state.core.pending_results.lock().unwrap().pop_front();
+}
+
+#[tauri::command]
+fn clear_history(state: tauri::State<AppState>) -> Result<(), String> {
+    history::clear(&history::history_path()).map_err(|error| error.to_string())?;
+    state.core.pending_results.lock().unwrap().clear();
+    Ok(())
+}
+
+#[tauri::command]
+fn set_history_enabled(enabled: bool) -> Result<(), String> {
+    settings::update_config_key(
+        &settings::config_path(),
+        "history_enabled",
+        serde_json::Value::Bool(enabled),
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -686,7 +896,8 @@ fn set_hotkey(combo: String, state: tauri::State<AppState>) -> Result<(), String
     .map_err(|e| e.to_string())?;
     // 若正按著舊熱鍵錄音，先強制收尾——換鍵後舊鍵的 release 事件
     // 會因 id 不符被忽略，不收尾會卡在錄音狀態（review 抓到的情境）
-    let _ = state.core.msg_tx.send(pipeline::Msg::ForceStop);
+    let session = state.core.sm.lock().unwrap().session();
+    let _ = state.core.msg_tx.send(pipeline::Msg::ForceStop(session));
     let _ = state
         .core
         .esc_ctl
@@ -706,6 +917,17 @@ fn open_accessibility_settings(app: tauri::AppHandle) -> Result<(), String> {
             None::<String>,
         )
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn open_microphone_settings(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+            None::<String>,
+        )
+        .map_err(|error| error.to_string())
 }
 
 /// 「已勾選卻仍顯示未啟用」的解法：無正式簽章的 app 每次重建簽章雜湊都變，
@@ -769,11 +991,30 @@ fn init_core(app: &tauri::AppHandle) {
     let (dummy_esc, _keep) = crossbeam_channel::unbounded();
     std::mem::forget(_keep); // 佔位 receiver；wire_hotkey 成功後會被真的 sender 換掉
 
+    let mic_test: Arc<Mutex<Option<CaptureHandle>>> = Arc::new(Mutex::new(None));
+    let mic_test_passed = Arc::new(AtomicBool::new(false));
+    let mic_test_generation = Arc::new(AtomicU64::new(0));
+    let stop_mic_test = {
+        let mic_test = mic_test.clone();
+        let passed = mic_test_passed.clone();
+        let generation = mic_test_generation.clone();
+        let app = app.clone();
+        Box::new(move || {
+            let handle = mic_test.lock().unwrap().take();
+            if let Some(handle) = handle {
+                let current_generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = handle.stop();
+                emit_mic_inactive(&app, current_generation, passed.load(Ordering::SeqCst));
+            }
+        }) as Box<dyn Fn() + Send + Sync>
+    };
+
     let core = Arc::new(pipeline::Core::new(
         engine,
         spec,
         overlay,
         Box::new(inject::MacPasteInjector),
+        stop_mic_test,
         dummy_esc,
         msg_tx.clone(),
         cfg.input_device(),
@@ -843,10 +1084,52 @@ fn init_core(app: &tauri::AppHandle) {
 
     app.manage(AppState {
         core,
+        download_gate: Arc::new(Mutex::new(None)),
         downloading: Arc::new(Mutex::new(None)),
         llm_downloading: Arc::new(Mutex::new(None)),
-        mic_test: Arc::new(Mutex::new(None)),
+        mic_test,
+        mic_test_passed,
+        mic_test_generation,
     });
+}
+
+#[cfg(test)]
+mod product_gate_tests {
+    use super::*;
+
+    fn settings_with(values: &[(&str, serde_json::Value)]) -> settings::Settings {
+        let mut raw = settings::default_config();
+        for (key, value) in values {
+            raw.insert((*key).to_string(), value.clone());
+        }
+        settings::Settings { raw }
+    }
+
+    #[test]
+    fn fresh_user_can_choose_raw_or_clean_before_provider_is_ready() {
+        assert!(validate_polish_mode_consent(settings::PolishMode::Raw, false, false).is_ok());
+        assert!(validate_polish_mode_consent(settings::PolishMode::Clean, false, false).is_ok());
+        assert!(
+            validate_polish_mode_consent(settings::PolishMode::Organize, false, false).is_err()
+        );
+    }
+
+    #[test]
+    fn setup_requires_explicit_raw_or_a_ready_provider() {
+        let fresh = settings_with(&[]);
+        assert_eq!(validate_setup_polish(&fresh), Err("provider_missing"));
+        let raw = settings_with(&[("polish_mode", serde_json::json!("raw"))]);
+        assert_eq!(validate_setup_polish(&raw), Ok(()));
+    }
+
+    #[test]
+    fn model_downloads_share_one_global_gate() {
+        let gate = Mutex::new(None);
+        assert!(reserve_download(&gate, "stt").is_ok());
+        assert!(reserve_download(&gate, "llm").is_err());
+        release_download(&gate);
+        assert!(reserve_download(&gate, "llm").is_ok());
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -863,6 +1146,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_status,
+            get_hardware_profile,
             set_input_device,
             mic_test_start,
             mic_test_stop,
@@ -880,14 +1164,21 @@ pub fn run() {
             get_dictionary,
             set_dictionary,
             set_context_enabled,
+            get_context_audit,
+            clear_context_audit,
             complete_setup,
             list_builtin_llms,
             download_builtin_llm,
             delete_builtin_llm,
             set_hotkey,
             open_accessibility_settings,
+            open_microphone_settings,
             reset_accessibility,
             get_history,
+            get_pending_result,
+            clear_pending_result,
+            clear_history,
+            set_history_enabled,
             copy_text,
             retry_hotkey
         ])
@@ -901,9 +1192,30 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
-                api.prevent_close();
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+                tauri::WindowEvent::Focused(false) => {
+                    // 首次設定會請使用者切到 TextEdit 試聽寫；視窗失焦時先釋放
+                    // mic test，避免正式錄音與測試同時佔用 USB／Bluetooth 裝置。
+                    if let Some(state) = window.app_handle().try_state::<AppState>() {
+                        let _audio_gate = state.core.audio_start_gate.lock().unwrap();
+                        let handle = state.mic_test.lock().unwrap().take();
+                        if let Some(handle) = handle {
+                            let generation =
+                                state.mic_test_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                            let _ = handle.stop();
+                            emit_mic_inactive(
+                                window.app_handle(),
+                                generation,
+                                state.mic_test_passed.load(Ordering::SeqCst),
+                            );
+                        }
+                    }
+                }
+                _ => {}
             }
         })
         .build(tauri::generate_context!())

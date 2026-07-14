@@ -58,6 +58,7 @@ fn find_indicator() -> Option<PathBuf> {
 
 pub struct OverlayClient {
     child: std::sync::Mutex<Option<Child>>,
+    stream: std::sync::Mutex<Option<UnixStream>>,
 }
 
 impl OverlayClient {
@@ -78,25 +79,43 @@ impl OverlayClient {
         };
         Self {
             child: std::sync::Mutex::new(child),
+            stream: std::sync::Mutex::new(None),
         }
     }
 
     /// 送命令；任何錯誤都吞掉（overlay 掛了不影響聽寫）。
     pub fn send(&self, command: &str) {
-        let _ = Self::send_raw(command);
+        let mut stream = self.stream.lock().unwrap();
+        if stream.is_none() {
+            *stream = Self::connect().ok();
+        }
+        let line = format!("{command}\n");
+        if stream
+            .as_mut()
+            .is_some_and(|connection| connection.write_all(line.as_bytes()).is_ok())
+        {
+            return;
+        }
+        // sidecar 啟動稍慢或重啟時重連一次；level 更新不值得阻塞重試更多次。
+        *stream = Self::connect().ok();
+        if let Some(connection) = stream.as_mut() {
+            if connection.write_all(line.as_bytes()).is_err() {
+                *stream = None;
+            }
+        }
     }
 
-    fn send_raw(command: &str) -> std::io::Result<()> {
+    fn connect() -> std::io::Result<UnixStream> {
         let stream = UnixStream::connect(socket_path())?;
         stream.set_write_timeout(Some(Duration::from_millis(500)))?;
-        let mut stream = stream;
-        stream.write_all(format!("{command}\n").as_bytes())
+        Ok(stream)
     }
 
     pub fn stop(&self) {
         let taken = self.child.lock().ok().and_then(|mut c| c.take());
         if let Some(mut child) = taken {
-            let _ = Self::send_raw("quit");
+            self.send("quit");
+            *self.stream.lock().unwrap() = None;
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             loop {
                 match child.try_wait() {

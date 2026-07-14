@@ -12,6 +12,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[profile.release]
+# 公開 bundle 不帶本機符號表；release workflow 另以 remap-path-prefix 清除編譯路徑。
+strip = "symbols"
+
 [dependencies]
 tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-opener = "2"

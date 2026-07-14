@@ -407,7 +407,8 @@ class IndicatorWindow: NSObject {
 
     private func startFrameTimer() {
         frameTimer?.invalidate()
-        let timer = Timer(timeInterval: 1.0 / 120.0, target: self, selector: #selector(frameTick), userInfo: nil, repeats: true)
+        // 60 Hz 已足以配合 30 ms 音量更新，也能把長錄音時的 overlay wakeups 減半。
+        let timer = Timer(timeInterval: 1.0 / 60.0, target: self, selector: #selector(frameTick), userInfo: nil, repeats: true)
         RunLoop.main.add(timer, forMode: .common)
         frameTimer = timer
     }
@@ -686,12 +687,19 @@ class SocketServer {
         while sock >= 0 {
             let client = accept(sock, nil, nil)
             guard client >= 0 else { continue }
+            var pending = ""
             var buf = [UInt8](repeating: 0, count: 512)
-            let n = read(client, &buf, 511)
-            var cmd = ""
-            if n > 0 { buf[n] = 0; cmd = String(cString: buf).trimmingCharacters(in: .whitespacesAndNewlines) }
+            while sock >= 0 {
+                let n = read(client, &buf, buf.count)
+                if n <= 0 { break }
+                pending += String(decoding: buf[0..<n], as: UTF8.self)
+                while let newline = pending.firstIndex(of: "\n") {
+                    let cmd = String(pending[..<newline]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    pending.removeSubrange(...newline)
+                    if !cmd.isEmpty { handle(cmd, indicator: indicator, menu: menu) }
+                }
+            }
             close(client)
-            handle(cmd, indicator: indicator, menu: menu)
         }
     }
 

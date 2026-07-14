@@ -337,6 +337,60 @@ fn partial_path(dest: &Path) -> PathBuf {
     dest.with_file_name(name)
 }
 
+fn remaining_download_bytes(dest: &Path, expected_total: u64) -> u64 {
+    let partial = partial_path(dest);
+    expected_total.saturating_sub(
+        partial
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0),
+    )
+}
+
+/// 下載前先確認空間；需要剩餘內容再加 10%（至少 128 MB）給暫存與檔案系統。
+/// 這在任何 HTTP request 前執行，避免慢網路下載到一半才發現磁碟已滿。
+pub fn ensure_download_capacity(dest: &Path, expected_total: u64) -> Result<()> {
+    let remaining = remaining_download_bytes(dest, expected_total);
+    let margin = (remaining / 10).max(128 * 1024 * 1024);
+    let required = remaining.saturating_add(margin);
+    let Some(available) = available_space_near(dest) else {
+        // 無法可靠讀取時不假裝磁碟不足；實際 write error 仍會被回報且 partial 可續傳。
+        return Ok(());
+    };
+    if available < required {
+        bail!(
+            "磁碟空間不足：還需要約 {} MB（目前可用 {} MB）；清出空間後可繼續下載",
+            required / 1_048_576,
+            available / 1_048_576
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn available_space_near(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut existing = path.parent().unwrap_or_else(|| Path::new("/"));
+    while !existing.exists() {
+        existing = existing.parent()?;
+    }
+    let c_path = CString::new(existing.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let result = unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn available_space_near(_path: &Path) -> Option<u64> {
+    None
+}
+
 /// 下載 url 到 dest。支援中斷續傳，完成後強制校驗 sha256。
 /// progress 每 ~1MB 回呼一次。
 pub fn download(
@@ -597,6 +651,16 @@ mod tests {
         assert!(parse_content_range("bytes 5-3/6").is_err());
         assert!(parse_content_range("bytes 3-6/6").is_err());
         assert!(parse_content_range("items 3-5/6").is_err());
+    }
+
+    #[test]
+    fn remaining_space_accounts_for_a_resumable_partial() {
+        let dir = tempdir();
+        fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("model.bin");
+        fs::write(partial_path(&dest), vec![0_u8; 400]).unwrap();
+        assert_eq!(remaining_download_bytes(&dest, 1_000), 600);
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

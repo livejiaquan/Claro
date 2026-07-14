@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
 import {
   resolveLlmConfig,
+  type ContextAudit,
   type DictEntry,
   type DownloadProgress,
   type LlmConfig,
@@ -25,20 +26,20 @@ const CUSTOM_PRESETS = [
 const POLISH_MODES: { id: PolishMode; title: string; tag?: string; description: string }[] = [
   {
     id: "raw",
-    title: "RAW 原樣轉錄",
-    description: "不使用 LLM；只套用繁體、個人字典與標點等確定性規則。",
+    title: "原樣轉錄",
+    description: "不使用文字整理模型；只套用繁體、個人字典與基本標點。",
   },
   {
     id: "clean",
-    title: "CLEAN 保守校訂",
+    title: "保守校訂",
     tag: "預設",
-    description: "移除語助詞與自我更正，修正誤字、術語和標點；不跨句重排、不濃縮。",
+    description: "只處理有停頓邊界的語助詞、明確改口與標點；不改字、不跨句重排、不濃縮。",
   },
   {
     id: "organize",
-    title: "ORGANIZE 條理整理",
+    title: "條理整理",
     tag: "需確認",
-    description: "鎖定姓名、數字、時間、否定與其他事實後，允許跨句重排與合併重複內容。",
+    description: "鎖定姓名、數字、時間、否定與其他事實後，只允許完整句子重排、分段與明確清單格式。",
   },
 ];
 
@@ -89,6 +90,7 @@ export default function Settings({
   const [builtinLlms, setBuiltinLlms] = useState<ModelInfo[]>([]);
   const [dict, setDict] = useState<DictEntry[] | null>(null);
   const [dictDraft, setDictDraft] = useState<DictEntry>({ from: "", to: "" });
+  const [contextAudit, setContextAudit] = useState<ContextAudit | null>(null);
 
   const loadModels = () => invoke<ModelInfo[]>("list_models").then(setModels).catch(() => {});
   const loadLlm = () =>
@@ -98,6 +100,8 @@ export default function Settings({
   const loadBuiltinLlms = () =>
     invoke<ModelInfo[]>("list_builtin_llms").then(setBuiltinLlms).catch(() => {});
   const loadDict = () => invoke<DictEntry[]>("get_dictionary").then(setDict).catch(() => {});
+  const loadContextAudit = () =>
+    invoke<ContextAudit | null>("get_context_audit").then(setContextAudit).catch(() => {});
 
   // 字典整存（串行化，同 saveLlm 的理由）
   const dictSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
@@ -121,6 +125,7 @@ export default function Settings({
     loadLlm();
     loadBuiltinLlms();
     loadDict();
+    loadContextAudit();
   }, []);
   // 內建 LLM 下載進度改變清單狀態
   useEffect(() => {
@@ -331,7 +336,9 @@ export default function Settings({
               ? mic.level > 0.01
                 ? "收音正常——這就是聽寫時的音量。"
                 : "太安靜——對著麥克風說幾句話，或換一個輸入裝置。"
-              : "確認 Claro 聽得到你。"
+              : mic.timed_out
+                ? "30 秒內沒有偵測到聲音；請檢查權限或改用其他輸入裝置。"
+                : "確認 Claro 聽得到你。"
           }
         >
           <div className="flex items-center gap-3 w-[260px] pt-1">
@@ -348,7 +355,8 @@ export default function Settings({
 
       <Section title="語音模型">
         {models.map((m) => {
-          const isDownloading = progress?.model_id === m.id && !progress.done;
+          const isDownloading = progress?.model_id === m.id && !progress.done && !progress.error;
+          const downloadError = progress?.model_id === m.id ? progress.error : null;
           const pct =
             isDownloading && progress!.total_mb
               ? Math.min(100, (progress!.downloaded_mb / progress!.total_mb) * 100)
@@ -359,12 +367,13 @@ export default function Settings({
                 <div className="flex items-center gap-2">
                   <span className="row-label">{m.label}</span>
                   {m.recommended && <span className="pill blue">推薦</span>}
-                  {m.active && (
+                  {m.active && m.downloaded && (
                     <span className="pill green">
                       <span className="dot" />
                       使用中
                     </span>
                   )}
+                  {m.active && !m.downloaded && <span className="pill amber">已選擇・待下載</span>}
                 </div>
                 <div className="row-sub">
                   {m.desc}・{m.size_mb >= 1024 ? `${(m.size_mb / 1024).toFixed(1)} GB` : `${m.size_mb} MB`}
@@ -380,6 +389,11 @@ export default function Settings({
                     <div className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
                       {progress!.downloaded_mb}/{progress!.total_mb ?? "?"} MB
                     </div>
+                  </div>
+                )}
+                {downloadError && (
+                  <div className="config-error mt-2" role="alert">
+                    下載中斷：{downloadError}。再次按下會從已完成的位置續傳。
                   </div>
                 )}
               </div>
@@ -417,7 +431,7 @@ export default function Settings({
                 )}
                 {!m.downloaded && !isDownloading && (
                   <button className="btn no-drag" onClick={() => call("download_model", { id: m.id })}>
-                    下載
+                    {downloadError ? "重試並續傳" : "下載"}
                   </button>
                 )}
               </div>
@@ -459,7 +473,7 @@ export default function Settings({
               <div id="organize-confirm-title" className="consent-title">啟用「條理整理」？</div>
               <p>這個模式不只校訂，會改變句子順序與段落結構。重要內容仍應由你檢查。</p>
               <ul>
-                <li><b>可能改變：</b>句序、段落與重複內容。</li>
+                <li><b>可能改變：</b>完整句子的順序、段落、完全重複片段與明確清單格式。</li>
                 <li><b>必須保留：</b>姓名、術語、數字、時間、否定、條件、因果與待辦。</li>
                 <li><b>絕不允許：</b>新增原文沒有的資訊、猜測或替你回答。</li>
               </ul>
@@ -474,23 +488,27 @@ export default function Settings({
         )}
 
         <Row
-          label="處理引擎"
-          sub={llm?.polish_mode === "raw" ? "RAW 不會呼叫引擎；這個選擇會保留給 CLEAN 或 ORGANIZE 使用。" : "引擎只決定在哪裡處理，不會改變上方模式的行為界線。"}
+          label="文字整理位置"
+          sub={llm?.polish_mode === "raw" ? "原樣轉錄不會執行文字整理；這個選擇會保留給其他模式使用。" : "這只決定在哪裡處理，不會改變上方模式的行為界線。"}
         >
           <select
             className="select no-drag"
-            aria-label="處理引擎"
+            aria-label="文字整理位置"
             value={llm?.provider ?? "off"}
             onChange={(e) => saveLlm({ provider: e.target.value })}
           >
-            <option value="off" disabled>尚未選擇引擎</option>
-            <option value="apple" disabled={!!llm && [1, 4].includes(llm.apple_status)}>
-              Apple Intelligence（免安裝{llm?.apple_status === 0 ? "・推薦" : ""}）
-            </option>
-            <option value="builtin">Claro 內建模型（首次需下載）</option>
-            <option value="ollama">Ollama（本機服務）</option>
-            <option value="lmstudio">LM Studio（本機服務）</option>
-            <option value="custom">自訂 API（OpenAI 相容）</option>
+            <option value="off" disabled>尚未選擇整理方式</option>
+            <optgroup label="Claro 本機方案">
+              <option value="apple" disabled={!!llm && [1, 4].includes(llm.apple_status)}>
+                Apple Intelligence（免安裝{llm?.apple_status === 0 ? "・推薦" : ""}）
+              </option>
+              <option value="builtin">Claro 內建模型（不需其他 App）</option>
+            </optgroup>
+            <optgroup label="進階：只在你已經使用時選擇">
+              <option value="ollama">連接既有 Ollama</option>
+              <option value="lmstudio">連接既有 LM Studio</option>
+              <option value="custom">自訂 API（OpenAI 相容）</option>
+            </optgroup>
           </select>
         </Row>
 
@@ -517,7 +535,8 @@ export default function Settings({
             <div>
               <div id="network-confirm-title" className="consent-title">允許使用雲端端點？</div>
               <p>
-                關閉「僅限本機」後，當 CLEAN 或 ORGANIZE 使用外部 API 時，轉錄文字與已啟用的畫面上下文可能送到
+                關閉「僅限本機」後，使用外部 API 時，轉錄文字
+                {llm?.polish_mode === "organize" && status.context_enabled ? "與目前視窗上下文" : ""}可能送到
                 {llm?.execution_location === "cloud" && (llm.endpoint_origin || llm.base_url) ? (
                   <b> {llm.endpoint_origin || llm.base_url}</b>
                 ) : (
@@ -535,7 +554,7 @@ export default function Settings({
 
         {llm && llm.polish_mode !== "raw" && llm.effective_mode === "raw" && llm.blocked_reason && (
           <div className="config-warning" role="status">
-            <span><b>目前安全退回 RAW：</b>{OUTCOME_LABEL[llm.blocked_reason] ?? "整理設定尚未就緒"}，不會送出雲端資料。</span>
+            <span><b>目前安全退回原樣轉錄：</b>{OUTCOME_LABEL[llm.blocked_reason] ?? "整理設定尚未就緒"}，不會送出雲端資料。</span>
             {llm.blocked_reason === "cloud_consent_required" && (
               <button className="btn no-drag" onClick={() => setConfirmCloud(true)}>檢視並允許</button>
             )}
@@ -547,7 +566,8 @@ export default function Settings({
             <div>
               <div id="cloud-endpoint-confirm-title" className="consent-title">允許雲端整理？</div>
               <p>
-                CLEAN 或 ORGANIZE 會把轉錄文字{status.context_enabled ? "與目前視窗上下文" : ""}送到
+                目前的整理模式會把轉錄文字
+                {llm.polish_mode === "organize" && status.context_enabled ? "與目前視窗上下文" : ""}送到
                 <b> {llm.endpoint_origin ?? llm.base_url}</b>；音訊不會傳送。允許後仍可隨時重新開啟「僅限本機」。
               </p>
             </div>
@@ -561,7 +581,8 @@ export default function Settings({
         {llm?.provider === "builtin" && (
           <>
             {builtinLlms.map((m) => {
-              const isDownloading = llmProgress?.model_id === m.id && !llmProgress.done;
+              const isDownloading = llmProgress?.model_id === m.id && !llmProgress.done && !llmProgress.error;
+              const downloadError = llmProgress?.model_id === m.id ? llmProgress.error : null;
               const pct =
                 isDownloading && llmProgress!.total_mb
                   ? Math.min(100, (llmProgress!.downloaded_mb / llmProgress!.total_mb) * 100)
@@ -594,6 +615,11 @@ export default function Settings({
                         <div className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
                           {llmProgress!.downloaded_mb}/{llmProgress!.total_mb ?? "?"} MB
                         </div>
+                      </div>
+                    )}
+                    {downloadError && (
+                      <div className="config-error mt-2" role="alert">
+                        下載中斷：{downloadError}。再次按下會從已完成的位置續傳。
                       </div>
                     )}
                   </div>
@@ -641,7 +667,7 @@ export default function Settings({
                           )
                         }
                       >
-                        下載
+                        {downloadError ? "重試並續傳" : "下載"}
                       </button>
                     )}
                   </div>
@@ -689,11 +715,11 @@ export default function Settings({
               sub={
                 detectErr
                   ? llm.provider === "ollama"
-                    ? "未偵測到 Ollama——先安裝並啟動（brew install ollama），再按「重新偵測」。"
-                    : "未偵測到 LM Studio——先啟動它的本機伺服器（Developer → Start Server），再按「重新偵測」。"
+                    ? "未偵測到既有 Ollama 服務。Claro 不需要 Ollama；若你本來就在使用，啟動後再重新偵測。"
+                    : "未偵測到既有 LM Studio 服務。Claro 不需要 LM Studio；若你本來就在使用，啟動本機伺服器後再重新偵測。"
                   : detected && detected.length === 0
                     ? llm.provider === "ollama"
-                      ? "服務在跑但沒有模型——先 ollama pull qwen3:4b。"
+                      ? "服務已連線但沒有可用模型；請先在你既有的 Ollama 環境準備模型。"
                       : "服務在跑但沒有載入模型——在 LM Studio 載入一個模型。"
                     : "建議 4B 級以上的指令模型，例如 qwen3:4b。"
               }
@@ -820,20 +846,77 @@ export default function Settings({
       <Section title="螢幕上下文">
         <Row
           label="讀取畫面詞彙"
-          sub="聽寫時讀取目前視窗的內容（app 名稱、標題、游標周邊文字），把出現過的術語餵給辨識與潤飾——中英混雜的正確率關鍵。內容只在記憶體、永不儲存；密碼欄永不讀取。"
+          sub="按下快捷鍵時讀取當下 App、標題與游標周邊文字，綁定到該次聽寫。內容只在記憶體；密碼欄與常見密碼管理器永不讀取。"
         >
           <select
             className="select no-drag"
             value={status.context_enabled ? "on" : "off"}
-            onChange={(e) =>
-              invoke("set_context_enabled", { enabled: e.target.value === "on" })
-                .then(refresh)
-                .catch((err) => setError(String(err)))
-            }
+            onChange={(e) => {
+              const enabled = e.target.value === "on";
+              invoke("set_context_enabled", { enabled })
+                .then(() => {
+                  if (!enabled) setContextAudit(null);
+                  refresh();
+                })
+                .catch((err) => setError(String(err)));
+            }}
           >
             <option value="on">開啟（建議）</option>
             <option value="off">關閉</option>
           </select>
+        </Row>
+        <Row
+          label="上一次使用的上下文"
+          sub="只保留在本次 Claro 執行期間，方便你確認系統看見了什麼；不會寫入設定或歷史紀錄。"
+        >
+          <div className="flex items-center gap-2">
+            <button className="btn no-drag" onClick={loadContextAudit}>重新讀取</button>
+            {contextAudit && (
+              <button
+                className="btn danger-quiet no-drag"
+                onClick={() =>
+                  invoke("clear_context_audit")
+                    .then(() => setContextAudit(null))
+                    .catch((reason) => setError(String(reason)))
+                }
+              >
+                從記憶體清除
+              </button>
+            )}
+          </div>
+        </Row>
+        {contextAudit ? (
+          <div className="row" style={{ alignItems: "flex-start" }}>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="pill blue">{contextAudit.app_name}</span>
+                <span className="pill">{contextAudit.surface}</span>
+              </div>
+              <pre className="context-audit-text">{contextAudit.text}</pre>
+            </div>
+          </div>
+        ) : (
+          <div className="setup-inline-state">本次執行期間還沒有使用畫面上下文。</div>
+        )}
+      </Section>
+
+      <Section title="隱私與歷史">
+        <Row
+          label="保存本機歷史"
+          sub="關閉後，新聽寫不會寫入 history.jsonl；既有紀錄會保留，直到你在歷史頁清除。"
+        >
+          <label className="local-only-control">
+            <input
+              type="checkbox"
+              checked={status.history_enabled}
+              onChange={(event) =>
+                invoke("set_history_enabled", { enabled: event.target.checked })
+                  .then(refresh)
+                  .catch((reason) => setError(String(reason)))
+              }
+            />
+            <span>{status.history_enabled ? "已開啟" : "已關閉"}</span>
+          </label>
         </Row>
       </Section>
 

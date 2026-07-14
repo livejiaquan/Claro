@@ -7,6 +7,7 @@
     "build:indicator": "bash scripts/build-indicator.sh",
     "dev": "npm run build:indicator && vite",
     "build": "npm run build:indicator && tsc && vite build",
+    "qa:prepare": "npm run build && node scripts/prepare-ui-qa.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

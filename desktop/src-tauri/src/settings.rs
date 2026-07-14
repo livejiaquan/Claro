@@ -68,6 +68,8 @@ pub fn default_config() -> Map<String, Value> {
         "cloud_consent_origin": null,
         // 必須完成權限、本次麥克風測試與模型檢查才由 UI 寫入。
         "setup_completed": false,
+        // 本地聽寫歷史預設開啟；可由使用者關閉並清除。
+        "history_enabled": true,
         // 主熱鍵（handy-keys 字串格式，如 "Opt+Shift+C"、"CmdRight"）
         "hotkey": "Opt+Shift+C",
         // 個人字典（誤認詞 → 正確詞）：貼上前替換＋餵給語音模型做詞彙偏置
@@ -290,6 +292,13 @@ impl Settings {
             .get("setup_completed")
             .and_then(Value::as_bool)
             .unwrap_or(false)
+    }
+
+    pub fn history_enabled(&self) -> bool {
+        self.raw
+            .get("history_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
     }
 
     /// 主熱鍵組合字串（handy-keys 格式）；缺省用預設

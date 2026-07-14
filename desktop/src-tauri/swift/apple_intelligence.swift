@@ -75,7 +75,7 @@ public func claroAppleAiPolish(
     let box = ResultBox()
     let semaphore = DispatchSemaphore(value: 0)
 
-    Task.detached(priority: .userInitiated) {
+    let task = Task.detached(priority: .userInitiated) {
         defer { semaphore.signal() }
         do {
             let session = LanguageModelSession(model: model, instructions: instructionsText)
@@ -85,11 +85,11 @@ public func claroAppleAiPolish(
             box.error = "\(error)"
         }
     }
-    // 有 timeout：FoundationModels 若卡住不能拖垮整個聽寫 session
-    // （呼叫端在 polish 返回前無法處理取消）。逾時後 Task 仍在跑，
-    // box/semaphore 由 closure 持有，晚到的結果被安全丟棄。
-    if semaphore.wait(timeout: .now() + .seconds(30)) == .timedOut {
-        return dupCString(encodeResult(err: "潤飾逾時（30 秒）"))
+    // 有 timeout：FoundationModels 若卡住不能拖垮整個聽寫 session。
+    // 逾時主動取消 Task；若系統模型稍後才響應，結果仍只會被安全丟棄。
+    if semaphore.wait(timeout: .now() + .seconds(5)) == .timedOut {
+        task.cancel()
+        return dupCString(encodeResult(err: "潤飾逾時（5 秒）"))
     }
 
     if let text = box.text {

@@ -11,6 +11,8 @@ use serde_json::{json, Value};
 
 use crate::polish::PolishMetadata;
 
+static HISTORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn history_path() -> PathBuf {
     dirs::home_dir()
         .expect("no home dir")
@@ -30,6 +32,7 @@ pub struct NewEntry<'a> {
 }
 
 pub fn append_entry(entry: NewEntry, path: &Path) -> anyhow::Result<Value> {
+    let _guard = HISTORY_LOCK.lock().unwrap();
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
@@ -60,6 +63,11 @@ pub fn append_entry(entry: NewEntry, path: &Path) -> anyhow::Result<Value> {
         record["polish"] = serde_json::to_value(metadata)?;
     }
 
+    // 隱私開關只影響正式 history；測試傳入的獨立 temp path 仍可驗證序列化。
+    if path == history_path() && !crate::settings::Settings::load().history_enabled() {
+        return Ok(record);
+    }
+
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -72,8 +80,18 @@ pub fn append_entry(entry: NewEntry, path: &Path) -> anyhow::Result<Value> {
     Ok(record)
 }
 
+pub fn clear(path: &Path) -> anyhow::Result<()> {
+    let _guard = HISTORY_LOCK.lock().unwrap();
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// 讀最近 n 筆（保序）；檔案不存在 → 空；壞行跳過。
 pub fn read_recent(n: usize, path: &Path) -> Vec<Value> {
+    let _guard = HISTORY_LOCK.lock().unwrap();
     let Ok(content) = fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -158,6 +176,26 @@ mod tests {
     #[test]
     fn read_recent_missing_file_returns_empty() {
         assert!(read_recent(10, Path::new("/nonexistent/claro/history.jsonl")).is_empty());
+    }
+
+    #[test]
+    fn clear_is_idempotent_and_removes_history() {
+        let path = temp_path();
+        append_entry(
+            NewEntry {
+                raw: "原文",
+                text: "原文",
+                duration_s: 1.0,
+                status: "pasted",
+                timings: None,
+                polish: None,
+            },
+            &path,
+        )
+        .unwrap();
+        clear(&path).unwrap();
+        clear(&path).unwrap();
+        assert!(!path.exists());
     }
 
     // 對應 test_read_recent_skips_corrupt_lines

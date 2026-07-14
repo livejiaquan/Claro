@@ -26,11 +26,13 @@ export default function App() {
   const [statusError, setStatusError] = useState<string | null>(null);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [llmProgress, setLlmProgress] = useState<DownloadProgress | null>(null);
-  const [mic, setMic] = useState<MicLevel>({ level: 0, active: false });
+  const [mic, setMic] = useState<MicLevel>({ level: 0, active: false, generation: 0, passed: false, timed_out: false });
+  const micGeneration = useRef(0);
   const [toast, setToast] = useState<string | null>(null);
   const micRef = useRef(false);
   micRef.current = mic.active;
   const toastTimer = useRef<number | undefined>(undefined);
+  const initialRouteApplied = useRef(false);
 
   const refresh = () =>
     invoke<Status>("get_status")
@@ -42,23 +44,39 @@ export default function App() {
 
   useEffect(() => {
     refresh();
-    const t = setInterval(refresh, 2000);
+    let timer: number | undefined;
+    const syncPolling = () => {
+      if (timer !== undefined) window.clearInterval(timer);
+      timer = undefined;
+      // 主視窗被 hide 時不再每 2 秒列舉 CoreAudio 裝置與模型狀態。
+      if (document.visibilityState === "visible") {
+        refresh();
+        timer = window.setInterval(refresh, 2000);
+      }
+    };
+    document.addEventListener("visibilitychange", syncPolling);
+    syncPolling();
     const un1 = listen<DownloadProgress>("model-download", (e) => {
-      setProgress(e.payload.done || e.payload.error ? null : e.payload);
+      setProgress(e.payload.done ? null : e.payload);
       if (e.payload.error) showToast(`下載失敗：${e.payload.error}`);
       if (e.payload.done) {
         showToast("模型下載完成");
         refresh();
       }
     });
-    const un2 = listen<MicLevel>("mic-level", (e) => setMic(e.payload));
+    const un2 = listen<MicLevel>("mic-level", (e) => {
+      if (e.payload.generation < micGeneration.current) return;
+      micGeneration.current = e.payload.generation;
+      setMic(e.payload);
+    });
     const un3 = listen<DownloadProgress>("llm-model-download", (e) => {
-      setLlmProgress(e.payload.done || e.payload.error ? null : e.payload);
+      setLlmProgress(e.payload.done ? null : e.payload);
       if (e.payload.error) showToast(`下載失敗：${e.payload.error}`);
       if (e.payload.done) showToast("模型下載完成");
     });
     return () => {
-      clearInterval(t);
+      if (timer !== undefined) window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", syncPolling);
       un1.then((f) => f());
       un2.then((f) => f());
       un3.then((f) => f());
@@ -66,6 +84,13 @@ export default function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 第一次開啟尚未完成設定時，直接帶使用者進入引導；之後仍可自由切換頁面。
+  useEffect(() => {
+    if (!status || initialRouteApplied.current) return;
+    initialRouteApplied.current = true;
+    if (!status.setup_completed) setPage("setup");
+  }, [status]);
 
   // 離開設定／首次設定頁自動停止麥克風測試
   useEffect(() => {
@@ -165,7 +190,7 @@ export default function App() {
             </div>
           )}
           <div className="text-[11px]" style={{ color: "var(--faint)" }}>
-            whisper-{status?.model_id ?? "…"}・v0.1.0
+            Claro v0.1.0
           </div>
         </div>
       </aside>
@@ -198,22 +223,30 @@ export default function App() {
               gotoSetup={() => setPage("setup")}
             />
           ) : page === "history" ? (
-            <History onCopied={() => showToast("已複製")} />
+            <History
+              onCopied={() => showToast("已複製")}
+              historyEnabled={status.history_enabled}
+            />
           ) : page === "setup" ? (
             <Onboarding
               status={status}
               mic={mic}
               progress={progress}
+              llmProgress={llmProgress}
               refresh={refresh}
               onToast={showToast}
-              onDone={() =>
+              onDone={() => {
+                if (status.setup_completed) {
+                  setPage("home");
+                  return;
+                }
                 invoke("complete_setup")
                   .then(() => {
                     refresh();
                     setPage("home");
                   })
-                  .catch((reason) => showToast(`無法完成設定：${String(reason)}`))
-              }
+                  .catch((reason) => showToast(`無法完成設定：${String(reason)}`));
+              }}
             />
           ) : (
             <Settings

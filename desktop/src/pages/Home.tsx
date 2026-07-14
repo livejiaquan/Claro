@@ -20,9 +20,9 @@ function isToday(ts: string) {
 }
 
 const MODE_LABEL = {
-  raw: "RAW 原樣轉錄",
-  clean: "CLEAN 保守校訂",
-  organize: "ORGANIZE 條理整理",
+  raw: "原樣轉錄",
+  clean: "保守校訂",
+  organize: "條理整理",
 } as const;
 
 const PROVIDER_LABEL: Record<string, string> = {
@@ -74,6 +74,7 @@ function privacyMessage(llm: ResolvedLlmConfig | null, failed: boolean, contextE
   }
 
   const mode = MODE_LABEL[llm.effective_mode];
+  const contextIsSent = llm.effective_mode === "organize" && contextEnabled;
   if (llm.execution_location === "on_device") {
     return {
       tone: "local",
@@ -82,7 +83,7 @@ function privacyMessage(llm: ResolvedLlmConfig | null, failed: boolean, contextE
     };
   }
   if (llm.execution_location === "local_service") {
-    const data = contextEnabled ? "轉錄文字與畫面上下文" : "轉錄文字";
+    const data = contextIsSent ? "轉錄文字與畫面上下文" : "轉錄文字";
     return {
       tone: "local",
       title: `本機服務・${mode}`,
@@ -90,7 +91,7 @@ function privacyMessage(llm: ResolvedLlmConfig | null, failed: boolean, contextE
     };
   }
   if (llm.execution_location === "cloud") {
-    const data = contextEnabled ? "轉錄文字與畫面上下文" : "轉錄文字";
+    const data = contextIsSent ? "轉錄文字與畫面上下文" : "轉錄文字";
     return {
       tone: "cloud",
       title: `雲端整理・${mode}`,

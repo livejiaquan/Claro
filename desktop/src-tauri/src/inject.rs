@@ -5,13 +5,21 @@
 //! 還原延遲 300ms（SPEC D8：Handy 的 50ms 會 race 慢的目標 app）。
 //! CJK IME 輸入源防護在 M4（SPEC D9）。
 
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
 pub trait TextInjector: Send + Sync {
-    fn inject(&self, text: &str) -> Result<()>;
+    /// `pre_paste_commit` 會在 50ms clipboard settle 後取得真正的 Cmd+V closure。
+    /// 呼叫端必須在同一個 session/state lock 內完成最後驗證並執行 closure，
+    /// 讓 Esc／新 session 不可能插在「guard=true」與實際貼上之間。
+    fn inject(
+        &self,
+        text: &str,
+        pre_paste_commit: &dyn Fn(&dyn Fn() -> Result<()>) -> Result<()>,
+    ) -> Result<()>;
 }
 
 pub struct MacPasteInjector;
@@ -20,22 +28,36 @@ pub struct MacPasteInjector;
 const VK_V: u32 = 9;
 
 impl TextInjector for MacPasteInjector {
-    fn inject(&self, text: &str) -> Result<()> {
+    fn inject(
+        &self,
+        text: &str,
+        pre_paste_commit: &dyn Fn(&dyn Fn() -> Result<()>) -> Result<()>,
+    ) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
-            objc2::rc::autoreleasepool(|_| inject_macos(text))
+            objc2::rc::autoreleasepool(|_| inject_macos(text, pre_paste_commit))
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = text;
+            let _ = (text, pre_paste_commit);
             bail!("clipboard injection is only supported on macOS")
         }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn inject_macos(text: &str) -> Result<()> {
+fn inject_macos(
+    text: &str,
+    pre_paste_commit: &dyn Fn(&dyn Fn() -> Result<()>) -> Result<()>,
+) -> Result<()> {
     use objc2_app_kit::NSPasteboard;
+
+    // 整個 snapshot→temporary write→Cmd+V→restore 是一筆不可交錯的交易。
+    // 否則 B 可能在 A 的 300ms settle 期間把 A 的暫存內容當成「原剪貼簿」，
+    // 最後讓真正的使用者剪貼簿永久遺失。
+    let _transaction = paste_transaction_lock()
+        .lock()
+        .map_err(|_| anyhow!("clipboard transaction lock poisoned"))?;
 
     let pasteboard = NSPasteboard::generalPasteboard();
     // snapshot 必須在 clearContents 之前完整成功；任一格式無法 eager 讀取就不注入。
@@ -54,7 +76,7 @@ fn inject_macos(text: &str) -> Result<()> {
         pre_paste_change_count,
         &marker,
         pre_paste_marker.as_deref(),
-        send_cmd_v,
+        || pre_paste_commit(&send_cmd_v),
     )
     .context("synthesize Cmd+V");
     if paste_result.is_ok() {
@@ -83,6 +105,11 @@ fn inject_macos(text: &str) -> Result<()> {
             Err(anyhow!("{paste}; clipboard restore also failed: {restore}"))
         }
     }
+}
+
+fn paste_transaction_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[cfg(target_os = "macos")]
@@ -285,7 +312,9 @@ fn run_cmd_v_sequence(mut send: impl FnMut(CmdVAction) -> Result<()>) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{paste_if_owned, run_cmd_v_sequence, should_restore, CmdVAction};
+    use super::{
+        paste_if_owned, paste_transaction_lock, run_cmd_v_sequence, should_restore, CmdVAction,
+    };
     use anyhow::bail;
 
     #[test]
@@ -321,6 +350,32 @@ mod tests {
         })
         .unwrap();
         assert!(called);
+    }
+
+    #[test]
+    fn changed_target_never_calls_paste_even_when_clipboard_is_owned() {
+        let marker = b"claro-owner";
+        let mut called = false;
+        let error = paste_if_owned(12, 12, marker, Some(marker), || {
+            let target_allowed = false;
+            if !target_allowed {
+                bail!("paste target or session changed before paste; paste aborted");
+            }
+            called = true;
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(!called);
+        assert!(error.to_string().contains("target or session changed"));
+    }
+
+    #[test]
+    fn clipboard_transaction_lock_rejects_interleaving() {
+        let guard = paste_transaction_lock().lock().unwrap();
+        assert!(paste_transaction_lock().try_lock().is_err());
+        drop(guard);
+        assert!(paste_transaction_lock().try_lock().is_ok());
     }
 
     #[test]
