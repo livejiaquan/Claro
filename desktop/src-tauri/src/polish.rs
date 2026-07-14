@@ -385,27 +385,23 @@ fn guard_candidate(
         PolishMode::Raw => Ok(original.to_string()),
         PolishMode::Clean => {
             let comparison_source = text_without_corrected_clause(original);
-            let original_semantic_len = semantic_chars(&comparison_source).len();
-            let candidate_semantic_len = semantic_chars(&candidate).len();
-            // 去填充詞後若仍少掉四成以上，較可能是模型截斷／摘要，而不是清理。
-            // 自我更正可能讓正確輸出變短；安全優先，無法確定時退回 base text。
-            if candidate_semantic_len.saturating_mul(5) < original_semantic_len.saturating_mul(3) {
-                return Err(GuardRejection::LengthViolation);
+            match clean_checks(original, &comparison_source, &candidate) {
+                Ok(()) => Ok(candidate),
+                Err(reason) => {
+                    // 模型刪掉「空白後的那個/就是說」時（STT 不替停頓補標點，
+                    // 這個位置的填充詞/指示詞同形、無法可靠區分——review H1 反例
+                    // 「Alpha 那個版本」），不放行刪除、也不整句退回：把原詞塞回
+                    // 對齊位置再重跑全部嚴格檢查。其餘清理（語助詞、標點）照常
+                    // 生效，指示詞永不消失。
+                    if let Some(repaired) = reinsert_ambiguous_fillers(&comparison_source, &candidate)
+                    {
+                        if clean_checks(original, &comparison_source, &repaired).is_ok() {
+                            return Ok(repaired);
+                        }
+                    }
+                    Err(reason)
+                }
             }
-            if !clean_anchors_preserved(original, &candidate) {
-                return Err(GuardRejection::MeaningAnchorMismatch);
-            }
-            if !clean_content_preserved(original, &comparison_source, &candidate) {
-                return Err(GuardRejection::MeaningAnchorMismatch);
-            }
-            let (sim, novelty, grew) = content_metrics(&comparison_source, &candidate);
-            if sim < 0.3 {
-                return Err(GuardRejection::LowOverlap);
-            }
-            if grew && novelty > 0.5 {
-                return Err(GuardRejection::HighNovelty);
-            }
-            Ok(candidate)
         }
         PolishMode::Organize => {
             // ORGANIZE 可以換句序，但不能靠新增轉折／結論或刪字來「變通順」。
@@ -416,6 +412,35 @@ fn guard_candidate(
             Ok(candidate)
         }
     }
+}
+
+/// CLEAN 的全套嚴格檢查（長度、錨點、內容、相似度）；修補前後各跑一次。
+fn clean_checks(
+    original: &str,
+    comparison_source: &str,
+    candidate: &str,
+) -> std::result::Result<(), GuardRejection> {
+    let original_semantic_len = semantic_chars(comparison_source).len();
+    let candidate_semantic_len = semantic_chars(candidate).len();
+    // 去填充詞後若仍少掉四成以上，較可能是模型截斷／摘要，而不是清理。
+    // 自我更正可能讓正確輸出變短；安全優先，無法確定時退回 base text。
+    if candidate_semantic_len.saturating_mul(5) < original_semantic_len.saturating_mul(3) {
+        return Err(GuardRejection::LengthViolation);
+    }
+    if !clean_anchors_preserved(original, candidate) {
+        return Err(GuardRejection::MeaningAnchorMismatch);
+    }
+    if !clean_content_preserved(original, comparison_source, candidate) {
+        return Err(GuardRejection::MeaningAnchorMismatch);
+    }
+    let (sim, novelty, grew) = content_metrics(comparison_source, candidate);
+    if sim < 0.3 {
+        return Err(GuardRejection::LowOverlap);
+    }
+    if grew && novelty > 0.5 {
+        return Err(GuardRejection::HighNovelty);
+    }
+    Ok(())
 }
 
 /// 舊 examples/tests 的 CLEAN 相容入口。
@@ -555,30 +580,58 @@ fn tolerable_semantic_chars(text: &str) -> Vec<(char, bool)> {
     out
 }
 
-/// candidate 必須依序吻合 source 的語意字元；只有標記為可容忍的填充詞字元
-/// 可以缺席。貪婪走訪罕見的對位失敗會退回嚴格拒絕（安全方向），不會假陽性。
-fn matches_with_tolerated_skips(source: &[(char, bool)], candidate: &[char]) -> bool {
-    let mut j = 0;
-    for &(c, tolerated) in source {
-        if j < candidate.len() && candidate[j] == c {
-            j += 1;
-        } else if !tolerated {
-            return false;
+/// 把模型刪掉的可容忍填充詞塞回 candidate 的對齊位置（review H1）。
+/// 回傳 None 表示 candidate 的差異不只是這類填充詞（交還原本的拒絕），
+/// 或根本沒有東西可修。輸出以繁化後的 candidate 為底（pipeline 終盤
+/// 反正會再過一次 OpenCC），插入的字取自 source 原詞。
+fn reinsert_ambiguous_fillers(source: &str, candidate: &str) -> Option<String> {
+    let flagged = tolerable_semantic_chars(source);
+    let norm_candidate = crate::textproc::to_traditional(candidate);
+    let cand_chars: Vec<(usize, char)> = norm_candidate.char_indices().collect();
+    let is_sem = |c: char| is_semantic_content_char(c) && !c.is_ascii_alphanumeric();
+
+    let mut insertions: Vec<(usize, char)> = Vec::new();
+    let mut ci = 0;
+    for &(sc, tolerated) in &flagged {
+        // candidate 中下一個非 ASCII 語意字元
+        let mut next_sem: Option<(usize, char)> = None;
+        let mut scan = ci;
+        while scan < cand_chars.len() {
+            let (bp, c) = cand_chars[scan];
+            if is_sem(c) {
+                next_sem = Some((bp, c));
+                break;
+            }
+            scan += 1;
+        }
+        match next_sem {
+            Some((_, c)) if c == sc => ci = scan + 1,
+            _ if tolerated => {
+                let pos = next_sem.map(|(bp, _)| bp).unwrap_or(norm_candidate.len());
+                insertions.push((pos, sc));
+            }
+            _ => return None,
         }
     }
-    j == candidate.len()
+    // candidate 不得有多出的語意字元
+    if cand_chars[ci..].iter().any(|&(_, c)| is_sem(c)) {
+        return None;
+    }
+    if insertions.is_empty() {
+        return None;
+    }
+    let mut out = norm_candidate;
+    for &(pos, c) in insertions.iter().rev() {
+        out.insert(pos, c);
+    }
+    Some(out)
 }
 
 fn clean_content_preserved(original: &str, comparison_source: &str, candidate: &str) -> bool {
     let source_non_ascii = non_ascii_or_symbol_semantic_chars(comparison_source);
     let candidate_non_ascii = non_ascii_or_symbol_semantic_chars(candidate);
     if comparison_source == original {
-        if source_non_ascii != candidate_non_ascii
-            && !matches_with_tolerated_skips(
-                &tolerable_semantic_chars(comparison_source),
-                &candidate_non_ascii,
-            )
-        {
+        if source_non_ascii != candidate_non_ascii {
             return false;
         }
     } else {
@@ -1719,12 +1772,17 @@ mod tests {
                 .unwrap();
             let input = case["input"].as_str().unwrap();
             let candidate = case["candidate"].as_str().unwrap().to_string();
-            let accepted = guard_candidate(mode, input, candidate).is_ok();
+            let result = guard_candidate(mode, input, candidate);
             assert_eq!(
-                accepted,
+                result.is_ok(),
                 case["accepted"].as_bool().unwrap(),
                 "fixture {id}"
             );
+            // 可選的 output 斷言：修補型接受（塞回填充詞）必須產出指定文字，
+            // 不是把 candidate 原樣放行
+            if let Some(expected) = case["output"].as_str() {
+                assert_eq!(result.as_deref(), Ok(expected), "fixture {id} output");
+            }
         }
     }
 
@@ -1846,17 +1904,22 @@ mod tests {
         assert_eq!(guard(input, out.clone()), out);
     }
 
-    // 實測（Qwen3-4B）：中英間距空白後、無標點邊界的「那個」被模型正確刪除，
-    // 嚴格版 strip_fillers 剝不掉它——容忍層必須放行這種純填充詞刪除
+    // 實測（Qwen3-4B）：中英間距空白後、無標點邊界的「那個」被模型刪除。
+    // 這個位置填充詞與指示詞同形（「hyTorch 那個跑訓練」vs「Alpha 那個版本」，
+    // review H1 反例）——不放行刪除、也不整句退回：塞回原詞，其餘清理照常生效
     #[test]
-    fn guard_accepts_boundaryless_filler_removal_after_space() {
+    fn guard_repairs_ambiguous_filler_deletion() {
+        // 模型刪了嗯（嚴格規則允許）＋那個（語意不明）→ 那個被塞回、嗯的清理保留
         let input = "嗯我們用 hyTorch 那個跑訓練然後把模型存到 S3";
-        let out = "我們用 hyTorch 跑訓練然後把模型存到 S3".to_string();
-        assert_eq!(guard(input, out.clone()), out);
+        let candidate = "我們用 hyTorch 跑訓練然後把模型存到 S3".to_string();
+        assert_eq!(guard(input, candidate), "我們用 hyTorch 那個跑訓練然後把模型存到 S3");
+        // review H1 反例：名詞修飾的指示詞——塞回後輸出等於原文
+        let input = "採用 Alpha 那個版本";
+        assert_eq!(guard(input, "採用 Alpha 版本".to_string()), "採用 Alpha 那個版本");
     }
 
-    // 容忍規則刻意窄：句首「那個」是指示詞（fixture）；純 CJK 無空白邊界
-    // 的句中「那個」語意不明——模型刪了都要退回原文
+    // 修補範圍刻意窄：句首「那個」是指示詞（fixture）；純 CJK 無空白邊界
+    // 的句中「那個」不在可修補分類——模型刪了直接退回原文
     #[test]
     fn guard_keeps_demonstrative_and_ambiguous_filler_strict() {
         let input = "那個人不要通知";
@@ -1885,18 +1948,17 @@ mod tests {
     }
 
     #[test]
-    fn tolerated_skip_edges() {
-        let chars = |s: &str| s.chars().collect::<Vec<_>>();
-        // 候選多出字元 → 不放行
-        assert!(!matches_with_tolerated_skips(&tolerable_semantic_chars("好"), &chars("很好")));
-        // 空白後的「那個」可缺席，也可保留
-        let src = tolerable_semantic_chars("跑 那個訓練");
-        assert!(matches_with_tolerated_skips(&src, &chars("跑訓練")));
-        assert!(matches_with_tolerated_skips(&src, &chars("跑那個訓練")));
-        // 少掉的不是填充詞 → 不放行
-        assert!(!matches_with_tolerated_skips(
-            &tolerable_semantic_chars("不要去開會"),
-            &chars("要去開會")
-        ));
+    fn reinsert_ambiguous_fillers_edges() {
+        // 缺席的「那個」塞回下一個語意字元之前
+        assert_eq!(
+            reinsert_ambiguous_fillers("跑 那個訓練", "跑訓練").as_deref(),
+            Some("跑那個訓練")
+        );
+        // 候選保留了填充詞 → 沒東西可修
+        assert_eq!(reinsert_ambiguous_fillers("跑 那個訓練", "跑 那個訓練"), None);
+        // 候選多出字元 → 不修
+        assert_eq!(reinsert_ambiguous_fillers("好", "很好"), None);
+        // 少掉的不是可修補填充詞 → 不修
+        assert_eq!(reinsert_ambiguous_fillers("不要去開會", "要去開會"), None);
     }
 }

@@ -353,5 +353,28 @@
     "input": "Use myVar。Keep APIClient。",
     "candidate": "Keep APIClient。Use myvar。",
     "accepted": false
+  },
+  {
+    "id": "clean_reinserts_noun_demonstrative_after_space",
+    "mode": "clean",
+    "input": "採用 Alpha 那個版本",
+    "candidate": "採用 Alpha 版本",
+    "accepted": true,
+    "output": "採用 Alpha 那個版本"
+  },
+  {
+    "id": "clean_repairs_filler_deletion_keeps_other_cleanup",
+    "mode": "clean",
+    "input": "嗯我們用 hyTorch 那個跑訓練然後把模型存到 S3",
+    "candidate": "我們用 hyTorch 跑訓練然後把模型存到 S3",
+    "accepted": true,
+    "output": "我們用 hyTorch 那個跑訓練然後把模型存到 S3"
+  },
+  {
+    "id": "clean_rejects_cjk_boundaryless_filler_deletion",
+    "mode": "clean",
+    "input": "我們用那個跑一下訓練",
+    "candidate": "我們用跑一下訓練",
+    "accepted": false
   }
 ]

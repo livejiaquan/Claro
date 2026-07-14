@@ -35,6 +35,12 @@ jobs:
         working-directory: desktop/src-tauri
         run: cargo test --lib
 
+      # examples 是文件指定的驗證入口（transcribe_file/builtin_polish…），
+      # cargo test --lib 與 bundle 都不編它們——不查會在使用者手上才編譯失敗
+      - name: Rust check (all targets incl. examples)
+        working-directory: desktop/src-tauri
+        run: cargo check --all-targets
+
       # debug bundle：驗證打包鏈（Info.plist 合併、icon、capabilities）不會等到發版才炸；
       # debug profile 與上面測試共用編譯快取，成本可控
       - name: Tauri app bundle (debug)

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,20 @@ struct VerificationCacheEntry {
 
 static VERIFICATION_CACHE: OnceLock<Mutex<HashMap<PathBuf, VerificationCacheEntry>>> =
     OnceLock::new();
-static VERIFICATION_GATE: OnceLock<Mutex<()>> = OnceLock::new();
+/// 每個檔案一把 gate（review M3）：只序列化「同一檔案」的併發 hash，
+/// 不同模型檔互不阻塞——否則背景預校驗 hash 數 GB LLM 時，
+/// whisper 預載與設定頁的 verify 會全部排在同一把全域鎖後面。
+static VERIFICATION_GATES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn verification_gate(path: &Path) -> Arc<Mutex<()>> {
+    VERIFICATION_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .entry(path.to_path_buf())
+        .or_default()
+        .clone()
+}
 
 fn verification_cache() -> &'static Mutex<HashMap<PathBuf, VerificationCacheEntry>> {
     VERIFICATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -260,6 +273,11 @@ fn forget_verification(path: &Path) {
 /// process cache 記住正確與錯誤的 digest；0600 persistent marker 只記錄成功
 /// 驗證，並綁定 app version/verifier schema。升級後第一次、marker 權限異常，
 /// 或檔案 fingerprint 改變都會重新 hash；UI polling 只需 stat。
+///
+/// 已知限制（review M4）：verify 通過與 loader 開檔之間存在 TOCTOU——
+/// whisper/llama 的 loader 只吃路徑、吃不了已驗證的 fd。前提是同使用者的
+/// 本地程序在這個窗口替換檔案，屬防禦縱深而非信任邊界；fingerprint
+/// （inode/mtime/ctime）會讓下一次 verify 察覺替換。
 pub fn verify_model_file(path: &Path, expected_sha256: &str) -> Result<()> {
     validate_expected_sha256(expected_sha256)?;
     let before = file_fingerprint(path)?;
@@ -269,10 +287,8 @@ pub fn verify_model_file(path: &Path, expected_sha256: &str) -> Result<()> {
 
     // get_status、list_models 與背景 preload 可能同時查同一檔。第一個 miss
     // hash 時序列化，拿到 gate 後再查一次，避免並發重讀數 GB。
-    let _gate = VERIFICATION_GATE
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap();
+    let gate = verification_gate(path);
+    let _gate = gate.lock().unwrap();
     let current = file_fingerprint(path)?;
     if let Some(actual) = cached_digest(path, &current, expected_sha256) {
         return require_matching_digest(path, expected_sha256, &actual);
@@ -430,13 +446,25 @@ pub fn download(
             return Ok(());
         }
     }
-    let resume_from = partial.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut resume_from = partial.metadata().map(|m| m.len()).unwrap_or(0);
 
     let mut req = ureq::get(url);
     if resume_from > 0 {
         req = req.set("Range", &format!("bytes={resume_from}-"));
     }
-    let resp = req.call().context("model download request")?;
+    let resp = match req.call() {
+        Ok(resp) => resp,
+        // 416（review M5）：.partial 比遠端 pinned artifact 還長（revision 換過
+        // 或檔案損壞）——這個 offset 永遠續傳不完，每次重試都卡在同一個 416。
+        // 砍掉 partial 從頭來，一次就好。
+        Err(ureq::Error::Status(416, _)) if resume_from > 0 => {
+            tracing::warn!("stale .partial larger than remote artifact — restarting download");
+            fs::remove_file(&partial).ok();
+            resume_from = 0;
+            ureq::get(url).call().context("model download restart after 416")?
+        }
+        Err(e) => return Err(e).context("model download request"),
+    };
 
     let (mut offset, total) = match resp.status() {
         // 206：伺服器接受續傳

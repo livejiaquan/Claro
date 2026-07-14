@@ -34,6 +34,9 @@ pub struct PasteTarget {
 pub fn is_sensitive_app(app_name: &str, bundle_id: &str) -> bool {
     let name = app_name.to_lowercase();
     let bundle = bundle_id.to_lowercase();
+    // review H2：needle 用單數/字根，複數與品牌全名靠 substring 涵蓋
+    // （"password" 涵蓋 Passwords/Keeper Password Manager；"keychain" 涵蓋
+    // Keychain Access/com.apple.keychainaccess；"鑰匙圈" 涵蓋鑰匙圈存取）
     [
         "1password",
         "bitwarden",
@@ -42,10 +45,15 @@ pub fn is_sensitive_app(app_name: &str, bundle_id: &str) -> bool {
         "lastpass",
         "enpass",
         "strongbox",
-        "passwords",
+        "keeper",
+        "nordpass",
+        "roboform",
+        "proton pass",
+        "proton.pass",
+        "password",
         "密碼",
-        "keychain access",
-        "鑰匙圈存取",
+        "keychain",
+        "鑰匙圈",
     ]
     .iter()
     .any(|needle| name.contains(needle) || bundle.contains(needle))
