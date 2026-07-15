@@ -2,7 +2,7 @@
 
 pub mod registry;
 #[cfg(target_os = "macos")]
-pub mod whisper;
+pub mod transcribe;
 
 use anyhow::Result;
 
@@ -11,7 +11,7 @@ pub struct SttRequest<'a> {
     pub audio: &'a [f32],
     /// ISO 語言碼 hint（None = 自動偵測）
     pub language: Option<&'a str>,
-    /// Whisper initial_prompt（繁中模板＋詞彙偏置；M3 起帶上下文詞彙）
+    /// Whisper initial_prompt（詞彙偏置；Qwen3-ASR 安全忽略）
     pub initial_prompt: Option<String>,
 }
 
@@ -23,15 +23,10 @@ pub trait SttEngine: Send {
     fn transcribe(&mut self, req: &SttRequest) -> Result<String>;
 }
 
-/// 預設的繁中 initial_prompt（移植 prototype `_transcribe`；
-/// terms 為詞彙偏置，M1 只有個人字典值，M3 加上下文詞彙）
-pub fn build_initial_prompt(terms: &[String]) -> String {
-    let hint = if terms.is_empty() {
-        String::new()
-    } else {
-        format!("，可能提到：{}", terms.join("、"))
-    };
-    format!("以下是繁體中文為主、夾雜英文技術術語的口語內容{hint}。")
+/// Whisper initial_prompt 要像「前一段轉錄」，不是對模型下指令。
+/// 因此無詞彙時不傳 prompt，有詞彙時只傳正規寫法清單。
+pub fn build_initial_prompt(terms: &[String]) -> Option<String> {
+    (!terms.is_empty()).then(|| format!("{}。", terms.join("、")))
 }
 
 #[cfg(test)]
@@ -40,15 +35,14 @@ mod tests {
 
     #[test]
     fn prompt_without_terms() {
-        assert_eq!(
-            build_initial_prompt(&[]),
-            "以下是繁體中文為主、夾雜英文技術術語的口語內容。"
-        );
+        assert_eq!(build_initial_prompt(&[]), None);
     }
 
     #[test]
     fn prompt_with_terms() {
-        let p = build_initial_prompt(&["PyTorch".into(), "GPT".into()]);
-        assert!(p.contains("可能提到：PyTorch、GPT"));
+        assert_eq!(
+            build_initial_prompt(&["PyTorch".into(), "GPT".into()]),
+            Some("PyTorch、GPT。".into())
+        );
     }
 }

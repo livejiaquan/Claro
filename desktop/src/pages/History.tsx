@@ -70,6 +70,13 @@ const FALLBACK_LABEL: Record<string, string> = {
   meaning_anchor_mismatch: "重要事實或語意錨點不一致",
 };
 
+const STT_MODEL_LABEL: Record<string, string> = {
+  "qwen3-asr-1.7b-q8_0": "Qwen3-ASR 1.7B",
+  "qwen3-asr-0.6b-q8_0": "Qwen3-ASR 0.6B",
+  "large-v3-turbo": "Whisper Large v3 Turbo",
+  "large-v3": "Whisper Large v3",
+};
+
 function historyMetadata(entry: HistoryEntry) {
   const mode = entry.polish?.mode ?? entry.polish_mode ?? entry.mode;
   const provider = entry.polish?.provider ?? entry.polish_provider ?? entry.provider;
@@ -77,12 +84,36 @@ function historyMetadata(entry: HistoryEntry) {
   const fallbackReason = entry.polish?.fallback_reason ?? entry.fallback_reason;
   const sttMs = entry.timings?.stt_ms ?? entry.timings?.stt;
   const polishMs = entry.timings?.polish_ms ?? entry.timings?.polish;
-  return { mode, provider, outcome, fallbackReason, sttMs, polishMs };
+  const sttModel = entry.timings?.stt_model;
+  const promptTermCount = entry.timings?.prompt_term_count;
+  const contextTermCount = entry.timings?.context_term_count;
+  const audioInputRms = entry.timings?.audio_input_rms;
+  const audioClippedRatio = entry.timings?.audio_clipped_ratio;
+  return {
+    mode,
+    provider,
+    outcome,
+    fallbackReason,
+    sttMs,
+    polishMs,
+    sttModel,
+    promptTermCount,
+    contextTermCount,
+    audioInputRms,
+    audioClippedRatio,
+  };
 }
 
 function formatDuration(ms: number | null | undefined) {
   if (ms === null || ms === undefined) return null;
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)} 秒` : `${Math.round(ms)} ms`;
+}
+
+function audioQuality(rms: number | undefined, clippedRatio: number | undefined) {
+  if (rms === undefined && clippedRatio === undefined) return null;
+  if ((clippedRatio ?? 0) >= 0.005) return "可能爆音，請降低輸入音量或離麥克風遠一點";
+  if ((rms ?? 1) < 0.02) return "收音偏小，請靠近麥克風或提高輸入音量";
+  return "收音電平正常";
 }
 
 export default function History({
@@ -218,6 +249,7 @@ export default function History({
           const rawText = typeof entry.raw === "string" ? entry.raw : "";
           const hasSavedRaw = rawText.length > 0;
           const meta = historyMetadata(entry);
+          const audioQualityText = audioQuality(meta.audioInputRms, meta.audioClippedRatio);
           const hasAuditMetadata = Boolean(meta.mode || meta.provider || meta.outcome || meta.fallbackReason);
           const recovery = STATUS_RECOVERY[entry.status];
           return (
@@ -308,6 +340,22 @@ export default function History({
                       <dt>結果</dt>
                       <dd>{meta.outcome ? (OUTCOME_LABEL[meta.outcome] ?? meta.outcome) : hasAuditMetadata ? "未記錄" : "舊紀錄未記錄"}</dd>
                     </div>
+                    <div>
+                      <dt>語音模型</dt>
+                      <dd>
+                        {meta.sttModel ? (STT_MODEL_LABEL[meta.sttModel] ?? meta.sttModel) : "舊紀錄未記錄"}
+                        {meta.promptTermCount !== undefined && `・${meta.promptTermCount} 個詞彙提示`}
+                        {meta.contextTermCount !== undefined
+                          && meta.contextTermCount > (meta.promptTermCount ?? 0)
+                          && `・另找到 ${meta.contextTermCount - (meta.promptTermCount ?? 0)} 個未套用詞彙`}
+                      </dd>
+                    </div>
+                    {audioQualityText && (
+                      <div>
+                        <dt>收音品質</dt>
+                        <dd>{audioQualityText}</dd>
+                      </div>
+                    )}
                     <div>
                       <dt>耗時</dt>
                       <dd>

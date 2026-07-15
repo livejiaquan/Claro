@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
 import {
+  displaySttModelLabel,
+  isPreviewSttModel,
   resolveLlmConfig,
   type ContextAudit,
   type DictEntry,
@@ -55,6 +57,14 @@ const OUTCOME_LABEL: Record<string, string> = {
   invalid_endpoint: "自訂端點格式不正確",
   invalid_custom_url: "自訂端點格式不正確",
 };
+
+function sttModelSortRank(model: ModelInfo) {
+  if (model.active) return 0;
+  if (model.available && model.recommended) return 1;
+  if (model.available) return 2;
+  if (model.preview) return 4;
+  return 3;
+}
 
 export default function Settings({
   status,
@@ -142,7 +152,14 @@ export default function Settings({
   // 下載進度事件會改變模型清單狀態
   useEffect(() => {
     loadModels();
-  }, [progress?.model_id, progress?.done, status.model_id]);
+  }, [
+    progress?.model_id,
+    progress?.done,
+    progress?.downloaded,
+    progress?.activation_status,
+    progress?.error,
+    status.model_id,
+  ]);
 
   const call = (cmd: string, args?: Record<string, unknown>, then?: () => void) => {
     setError(null);
@@ -267,6 +284,10 @@ export default function Settings({
 
   const permsOk = status.accessibility && status.hotkey_active;
   const setupReady = permsOk && status.model_present && status.setup_completed;
+  const orderedModels = models
+    .map((model, index) => ({ model, index }))
+    .sort((a, b) => sttModelSortRank(a.model) - sttModelSortRank(b.model) || a.index - b.index)
+    .map(({ model }) => model);
 
   return (
     <div className="page-in">
@@ -354,9 +375,12 @@ export default function Settings({
       </Section>
 
       <Section title="語音模型">
-        {models.map((m) => {
-          const isDownloading = progress?.model_id === m.id && !progress.done && !progress.error;
-          const downloadError = progress?.model_id === m.id ? progress.error : null;
+        {orderedModels.map((m) => {
+          const available = m.available === true;
+          const isDownloading = available && progress?.model_id === m.id && !progress.done && !progress.error;
+          const activationStatus = progress?.model_id === m.id ? progress.activation_status : "none";
+          const activationPending = activationStatus !== "none";
+          const downloadError = progress?.model_id === m.id && !activationPending ? progress.error : null;
           const pct =
             isDownloading && progress!.total_mb
               ? Math.min(100, (progress!.downloaded_mb / progress!.total_mb) * 100)
@@ -364,20 +388,26 @@ export default function Settings({
           return (
             <div className="row" key={m.id} style={{ alignItems: "flex-start" }}>
               <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="row-label">{m.label}</span>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="row-label">{displaySttModelLabel(m)}</span>
+                  {isPreviewSttModel(m) && <span className="pill amber">驗證中</span>}
                   {m.recommended && <span className="pill blue">推薦</span>}
-                  {m.active && m.downloaded && (
+                  {available && m.active && m.downloaded && (
                     <span className="pill green">
                       <span className="dot" />
                       使用中
                     </span>
                   )}
-                  {m.active && !m.downloaded && <span className="pill amber">已選擇・待下載</span>}
+                  {available && m.active && !m.downloaded && <span className="pill amber">已選擇・待下載</span>}
                 </div>
                 <div className="row-sub">
                   {m.desc}・{m.size_mb >= 1024 ? `${(m.size_mb / 1024).toFixed(1)} GB` : `${m.size_mb} MB`}
                 </div>
+                {!available && (
+                  <div className="model-validation-note">
+                    完成長音訊分段與台灣真人語料驗收前，不提供下載或啟用。
+                  </div>
+                )}
                 {isDownloading && (
                   <div className="mt-2 w-[240px]">
                     <div className="progress-track">
@@ -396,9 +426,46 @@ export default function Settings({
                     下載中斷：{downloadError}。再次按下會從已完成的位置續傳。
                   </div>
                 )}
+                {activationPending && (
+                  <div className="model-validation-note" role="status">
+                    {activationStatus === "waiting_for_idle"
+                      ? "已下載完成；本次聽寫結束後，請按「使用」切換。"
+                      : `已下載完成，但切換失敗：${progress?.error ?? "未知錯誤"}。請按「使用」重試。`}
+                  </div>
+                )}
               </div>
               <div className="flex items-center gap-2 pt-0.5">
-                {m.downloaded && !m.active && (
+                {!available && (
+                  <>
+                    <button className="btn no-drag" disabled>尚未開放</button>
+                    {m.downloaded &&
+                      (pendingDelete === `stt:${m.id}` ? (
+                        <>
+                          <button className="btn no-drag" onClick={() => setPendingDelete(null)}>取消</button>
+                          <button
+                            className="btn danger-quiet no-drag"
+                            aria-label={`確認刪除 ${displaySttModelLabel(m)}`}
+                            onClick={() =>
+                              call("delete_model", { id: m.id }, () => {
+                                setPendingDelete(null);
+                                onToast("已刪除");
+                              })
+                            }
+                          >
+                            確認刪除
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          className="btn danger-quiet no-drag"
+                          onClick={() => setPendingDelete(`stt:${m.id}`)}
+                        >
+                          刪除
+                        </button>
+                      ))}
+                  </>
+                )}
+                {available && m.downloaded && !m.active && (
                   <>
                     <button className="btn no-drag" onClick={() => call("set_model", { id: m.id })}>
                       使用
@@ -429,7 +496,7 @@ export default function Settings({
                     )}
                   </>
                 )}
-                {!m.downloaded && !isDownloading && (
+                {available && !m.downloaded && !isDownloading && (
                   <button className="btn no-drag" onClick={() => call("download_model", { id: m.id })}>
                     {downloadError ? "重試並續傳" : "下載"}
                   </button>
@@ -969,7 +1036,7 @@ export default function Settings({
               className="select no-drag"
               aria-label="新增誤認詞"
               style={{ minWidth: 140 }}
-              placeholder="誤認詞（如 GBT）"
+              placeholder="常被聽錯的詞（如 克拉洛）"
               value={dictDraft.from}
               onChange={(e) => setDictDraft({ ...dictDraft, from: e.target.value })}
             />
@@ -978,7 +1045,7 @@ export default function Settings({
               className="select no-drag"
               aria-label="新增正確詞"
               style={{ minWidth: 140 }}
-              placeholder="正確詞（如 GPT）"
+              placeholder="你的正確寫法（如 Claro）"
               value={dictDraft.to}
               onChange={(e) => setDictDraft({ ...dictDraft, to: e.target.value })}
             />

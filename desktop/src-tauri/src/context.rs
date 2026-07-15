@@ -9,6 +9,13 @@
 const CTX_CURSOR_CHARS: usize = 500;
 const CTX_VISIBLE_CHARS: usize = 1200;
 const CTX_MAX_NODES: usize = 400;
+const CLARO_BUNDLE_ID: &str = "dev.claro.desktop";
+
+/// Claro 的 WKWebView accessibility 必須留在 WebKit 主執行緒處理；背景內容擷取
+/// 遇到自己的 bundle 時一律 fail closed。刻意用 exact match，避免誤傷相似 bundle。
+fn should_skip_background_context(bundle_id: &str) -> bool {
+    bundle_id == CLARO_BUNDLE_ID
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ContextSnapshot {
@@ -281,8 +288,8 @@ pub fn finish_paste_target_capture(_seed: PasteTargetSeed) -> Option<PasteTarget
 #[cfg(target_os = "macos")]
 mod macos {
     use super::{
-        classify_surface, is_sensitive_app, truncate_chars, ContextSnapshot, PasteTarget,
-        CTX_CURSOR_CHARS, CTX_MAX_NODES, CTX_VISIBLE_CHARS,
+        classify_surface, is_sensitive_app, should_skip_background_context, truncate_chars,
+        ContextSnapshot, PasteTarget, CTX_CURSOR_CHARS, CTX_MAX_NODES, CTX_VISIBLE_CHARS,
     };
     use core_foundation::array::{CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex};
     use core_foundation::base::{CFEqual, CFGetTypeID, CFRelease, CFRetain, CFTypeRef, TCFType};
@@ -440,8 +447,12 @@ mod macos {
         hasher.finalize().into()
     }
 
-    fn capture_target_elements(deadline: std::time::Instant) -> Option<TargetElements> {
-        let (pid, app_name, bundle_id) = frontmost_app()?;
+    fn capture_target_elements_for_app(
+        pid: i32,
+        app_name: String,
+        bundle_id: String,
+        deadline: std::time::Instant,
+    ) -> Option<TargetElements> {
         let app_id = if bundle_id.is_empty() {
             format!("pid:{pid}:{}", app_name.to_lowercase())
         } else {
@@ -466,6 +477,17 @@ mod macos {
             window,
             focused,
         })
+    }
+
+    /// 內容擷取專用入口。先以 NSWorkspace 辨識前景 bundle，再建立任何 AX 元素，
+    /// 避免背景執行緒碰觸 Claro 自己的 WKWebView accessibility tree。
+    fn capture_context_target_elements(deadline: std::time::Instant) -> Option<TargetElements> {
+        let (pid, app_name, bundle_id) = frontmost_app()?;
+        if should_skip_background_context(&bundle_id) {
+            tracing::info!("context skipped for Claro's own WebView");
+            return None;
+        }
+        capture_target_elements_for_app(pid, app_name, bundle_id, deadline)
     }
 
     fn paste_target_from_elements(
@@ -571,6 +593,10 @@ mod macos {
         set_global_ax_timeout_once();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
         let (pid, app_name, bundle_id) = frontmost_app()?;
+        if should_skip_background_context(&bundle_id) {
+            tracing::info!("AX target capture skipped for Claro's own WebView");
+            return None;
+        }
         let app_id = if bundle_id.is_empty() {
             format!("pid:{pid}:{}", app_name.to_lowercase())
         } else {
@@ -593,6 +619,10 @@ mod macos {
     }
 
     pub fn finish_paste_target_capture(seed: PasteTargetSeed) -> Option<PasteTarget> {
+        if should_skip_background_context(&seed.bundle_id) {
+            tracing::info!("AX target capture skipped for Claro's own WebView");
+            return None;
+        }
         let started = std::time::Instant::now();
         let deadline = started + std::time::Duration::from_millis(PASTE_TARGET_BUDGET_MS);
         let metadata_deadline = deadline
@@ -630,7 +660,7 @@ mod macos {
         let metadata_deadline = deadline
             .checked_sub(std::time::Duration::from_millis(120))
             .unwrap_or(started);
-        let elements = capture_target_elements(metadata_deadline)?;
+        let elements = capture_context_target_elements(metadata_deadline)?;
         let target = paste_target_from_elements(&elements, metadata_deadline)?;
         elements_still_focused(&elements, deadline).then_some(target)
     }
@@ -811,7 +841,7 @@ mod macos {
         let deadline = started + std::time::Duration::from_millis(CONTEXT_CAPTURE_BUDGET_MS);
         let fingerprint_deadline =
             started + std::time::Duration::from_millis(CONTEXT_CAPTURE_BUDGET_MS / 2);
-        let elements = capture_target_elements(fingerprint_deadline)?;
+        let elements = capture_context_target_elements(fingerprint_deadline)?;
         let target = paste_target_from_elements(&elements, fingerprint_deadline)?;
         capture_snapshot_from_elements(elements, target, deadline)
     }
@@ -822,7 +852,7 @@ mod macos {
         let deadline = started + std::time::Duration::from_millis(CONTEXT_CAPTURE_BUDGET_MS);
         let fingerprint_deadline =
             started + std::time::Duration::from_millis(CONTEXT_CAPTURE_BUDGET_MS / 2);
-        let elements = capture_target_elements(fingerprint_deadline)?;
+        let elements = capture_context_target_elements(fingerprint_deadline)?;
         let observed = paste_target_from_elements(&elements, fingerprint_deadline)?;
         if &observed != expected {
             return None;
@@ -835,6 +865,12 @@ mod macos {
         target: PasteTarget,
         deadline: std::time::Instant,
     ) -> Option<ContextSnapshot> {
+        // 防禦性檢查：正常入口已在建立 AX 元素前擋下；若未來新增內部入口，
+        // 也不得讀取 Claro 自身 WebView 的 title/value/children。
+        if should_skip_background_context(&elements.bundle_id) {
+            tracing::info!("context skipped for Claro's own WebView");
+            return None;
+        }
         if is_sensitive_app(&elements.app_name, &elements.bundle_id) {
             tracing::info!("context skipped for sensitive app '{}'", elements.app_name);
             return None;
@@ -911,6 +947,14 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_webview_context_skip_uses_exact_bundle_match() {
+        assert!(should_skip_background_context("dev.claro.desktop"));
+        assert!(!should_skip_background_context("DEV.CLARO.DESKTOP"));
+        assert!(!should_skip_background_context("dev.claro.desktop.helper"));
+        assert!(!should_skip_background_context("com.example.claro"));
+    }
 
     #[test]
     fn terms_prefer_dict_then_context_dedup_and_cap() {

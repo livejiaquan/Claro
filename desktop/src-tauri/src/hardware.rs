@@ -27,6 +27,14 @@ pub fn profile(apple_status: i32) -> HardwareProfile {
     policy(memory_gb, &architecture, apple_status)
 }
 
+/// 新安裝與模型列表共用的 STT 推薦；不需要查詢 Apple Intelligence。
+pub fn recommended_stt() -> &'static str {
+    let architecture = std::env::consts::ARCH;
+    let memory_bytes = physical_memory_bytes();
+    let memory_gb = ((memory_bytes + GIB - 1) / GIB).max(1);
+    stt_policy(memory_gb, architecture).1
+}
+
 pub fn low_memory_mode() -> bool {
     profile(crate::polish::apple_status()).low_memory_mode
 }
@@ -34,13 +42,7 @@ pub fn low_memory_mode() -> bool {
 pub fn policy(memory_gb: u64, architecture: &str, apple_status: i32) -> HardwareProfile {
     let apple_silicon = matches!(architecture, "aarch64" | "arm64");
     let low_memory_mode = memory_gb <= 12 || !apple_silicon;
-    let (tier, recommended_stt) = if low_memory_mode {
-        ("compact", "large-v3-turbo-q5_0")
-    } else if memory_gb >= 24 {
-        ("performance", "large-v3-turbo")
-    } else {
-        ("balanced", "large-v3-turbo")
-    };
+    let (tier, recommended_stt) = stt_policy(memory_gb, architecture);
     let recommended_llm_provider = if apple_silicon && apple_status == 0 {
         "apple"
     } else {
@@ -50,7 +52,7 @@ pub fn policy(memory_gb: u64, architecture: &str, apple_status: i32) -> Hardware
         format!("{memory_gb} GB Apple Silicon：語音模型採 {tier} 配置，文字整理交由 macOS 端上模型")
     } else if low_memory_mode {
         format!(
-            "{memory_gb} GB {}：使用量化語音模型，轉錄後先釋放 STT 再載入 Claro 內建整理模型",
+            "{memory_gb} GB {}：使用省記憶體語音模型，轉錄後先釋放 STT 再載入 Claro 內建整理模型",
             if apple_silicon {
                 "Apple Silicon"
             } else {
@@ -71,6 +73,19 @@ pub fn policy(memory_gb: u64, architecture: &str, apple_status: i32) -> Hardware
         recommended_llm_provider,
         recommended_llm_model: "qwen3-4b-instruct-2507",
         reason,
+    }
+}
+
+fn stt_policy(memory_gb: u64, architecture: &str) -> (&'static str, &'static str) {
+    let apple_silicon = matches!(architecture, "aarch64" | "arm64");
+    if !apple_silicon {
+        ("compact", "large-v3-turbo-q5_0")
+    } else if memory_gb <= 12 {
+        ("compact", "large-v3-q5_0")
+    } else if memory_gb >= 24 {
+        ("performance", "large-v3")
+    } else {
+        ("balanced", "large-v3")
     }
 }
 
@@ -109,9 +124,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn eight_gb_uses_quantized_stt_and_sequential_models() {
+    fn eight_gb_uses_quantized_full_whisper_and_sequential_models() {
         let p = policy(8, "aarch64", 2);
-        assert_eq!(p.recommended_stt, "large-v3-turbo-q5_0");
+        assert_eq!(p.recommended_stt, "large-v3-q5_0");
         assert_eq!(p.recommended_llm_provider, "builtin");
         assert!(p.low_memory_mode);
         assert!(!p.keep_models_warm);
@@ -120,7 +135,7 @@ mod tests {
     #[test]
     fn apple_intelligence_is_preferred_when_available() {
         let p = policy(16, "aarch64", 0);
-        assert_eq!(p.recommended_stt, "large-v3-turbo");
+        assert_eq!(p.recommended_stt, "large-v3");
         assert_eq!(p.recommended_llm_provider, "apple");
         assert!(!p.low_memory_mode);
     }
@@ -131,5 +146,12 @@ mod tests {
         assert_eq!(p.recommended_stt, "large-v3-turbo-q5_0");
         assert_eq!(p.recommended_llm_provider, "builtin");
         assert!(p.low_memory_mode);
+    }
+
+    #[test]
+    fn larger_apple_silicon_uses_full_large_v3_until_qwen_passes_release_gate() {
+        for memory_gb in [16, 24, 32, 64] {
+            assert_eq!(policy(memory_gb, "arm64", 1).recommended_stt, "large-v3");
+        }
     }
 }

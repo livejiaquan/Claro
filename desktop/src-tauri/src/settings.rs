@@ -13,6 +13,11 @@ use serde_json::{json, Map, Value};
 
 pub const ORGANIZE_CONSENT_VERSION: u64 = 1;
 pub const CLOUD_CONSENT_VERSION: u64 = 1;
+const DICTIONARY_DEFAULTS_VERSION: u64 = 1;
+
+fn default_stt_model() -> &'static str {
+    crate::hardware::recommended_stt()
+}
 
 /// 聽寫後處理模式。模式與 LLM provider 分離：即使預設意圖是 Clean，
 /// provider=off 時 pipeline 仍會安全退回 deterministic base text。
@@ -54,8 +59,9 @@ impl FromStr for PolishMode {
 }
 
 pub fn default_config() -> Map<String, Value> {
+    let stt_model = default_stt_model();
     let Value::Object(m) = json!({
-        "whisper_model": "large-v3-turbo",
+        "whisper_model": stt_model,
         "llm_model": "mlx-community/Qwen2.5-7B-Instruct-4bit",
         "llm_enabled": true,
         // 輸出意圖預設 CLEAN；provider 仍預設 off，所以未選引擎時安全退回原文。
@@ -72,8 +78,9 @@ pub fn default_config() -> Map<String, Value> {
         "history_enabled": true,
         // 主熱鍵（handy-keys 字串格式，如 "Opt+Shift+C"、"CmdRight"）
         "hotkey": "Opt+Shift+C",
-        // 個人字典（誤認詞 → 正確詞）：貼上前替換＋餵給語音模型做詞彙偏置
-        "dictionary": { "GBT": "GPT", "My Torch": "PyTorch" },
+        // 個人字典必須由使用者明確建立；通用預設替換可能改變合法縮寫的意思。
+        "dictionary": {},
+        "dictionary_defaults_version": DICTIONARY_DEFAULTS_VERSION,
         // 螢幕上下文（AX）：抓前景視窗詞彙給辨識與潤飾；內容永不落盤
         "context_enabled": true,
     }) else {
@@ -126,7 +133,8 @@ pub fn load_config(path: &Path) -> Map<String, Value> {
         });
 
     match parsed {
-        Some(data) => {
+        Some(mut data) => {
+            migrate_legacy_dictionary(&mut data);
             let mut cfg = default_config();
             for (k, v) in data {
                 cfg.insert(k, v);
@@ -138,6 +146,29 @@ pub fn load_config(path: &Path) -> Map<String, Value> {
             default_config()
         }
     }
+}
+
+/// 早期版本未經同意內建 `GBT→GPT`、`My Torch→PyTorch`。只有 dictionary
+/// **完全等於**這組舊預設且尚無 migration marker 時才移除；任何新增、刪除或
+/// 修改都視為使用者資料，原樣保留。回傳 map 會在下一次正常設定寫入時持久化。
+fn migrate_legacy_dictionary(data: &mut Map<String, Value>) {
+    if data
+        .get("dictionary_defaults_version")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        >= DICTIONARY_DEFAULTS_VERSION
+    {
+        return;
+    }
+    let legacy = json!({ "GBT": "GPT", "My Torch": "PyTorch" });
+    if data.get("dictionary") == Some(&legacy) {
+        data.insert("dictionary".into(), json!({}));
+        tracing::info!("removed unsafe legacy built-in dictionary defaults");
+    }
+    data.insert(
+        "dictionary_defaults_version".into(),
+        Value::from(DICTIONARY_DEFAULTS_VERSION),
+    );
 }
 
 /// 型別化存取（讀不到就退預設值）
@@ -162,8 +193,8 @@ impl Settings {
         self.raw
             .get("whisper_model")
             .and_then(Value::as_str)
-            .unwrap_or("large-v3-turbo")
-            .to_string()
+            .map(str::to_string)
+            .unwrap_or_else(|| default_stt_model().to_string())
     }
 
     pub fn llm_enabled(&self) -> bool {
@@ -356,11 +387,12 @@ mod tests {
         let dir = tempdir();
         let path = dir.join("cfg").join("config.json");
         let cfg = load_config(&path);
-        assert_eq!(cfg.get("whisper_model").unwrap(), "large-v3-turbo");
+        assert_eq!(cfg.get("whisper_model").unwrap(), default_stt_model());
         assert_eq!(
             cfg.get("setup_completed").and_then(Value::as_bool),
             Some(false)
         );
+        assert_eq!(cfg.get("dictionary"), Some(&json!({})));
         assert!(path.exists());
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -390,6 +422,35 @@ mod tests {
             .contains("Qwen"));
     }
 
+    #[test]
+    fn exact_legacy_builtin_dictionary_is_removed_but_custom_data_is_preserved() {
+        let dir = tempdir();
+        let legacy_path = dir.join("legacy.json");
+        fs::write(
+            &legacy_path,
+            r#"{"dictionary":{"GBT":"GPT","My Torch":"PyTorch"}}"#,
+        )
+        .unwrap();
+        let migrated = load_config(&legacy_path);
+        assert_eq!(migrated.get("dictionary"), Some(&json!({})));
+        assert_eq!(
+            migrated
+                .get("dictionary_defaults_version")
+                .and_then(Value::as_u64),
+            Some(DICTIONARY_DEFAULTS_VERSION)
+        );
+
+        let custom_path = dir.join("custom.json");
+        fs::write(
+            &custom_path,
+            r#"{"dictionary":{"GBT":"GPT","My Torch":"PyTorch","克拉洛":"Claro"}}"#,
+        )
+        .unwrap();
+        let preserved = load_config(&custom_path);
+        assert_eq!(preserved["dictionary"]["克拉洛"], "Claro");
+        assert_eq!(preserved["dictionary"]["GBT"], "GPT");
+    }
+
     // 對應 test_corrupt_json_returns_defaults_without_exception
     #[test]
     fn corrupt_json_returns_defaults_without_exception() {
@@ -397,7 +458,7 @@ mod tests {
         let path = dir.join("config.json");
         fs::write(&path, "{not json!!").unwrap();
         let cfg = load_config(&path);
-        assert_eq!(cfg.get("whisper_model").unwrap(), "large-v3-turbo");
+        assert_eq!(cfg.get("whisper_model").unwrap(), default_stt_model());
     }
 
     // update_config_key：改一鍵、留其餘（含未知鍵）、權限 0600
@@ -428,7 +489,7 @@ mod tests {
         fs::write(&path, r#"{"future_field": {"a": 1}}"#).unwrap();
         let cfg = load_config(&path);
         assert_eq!(cfg.get("future_field").unwrap()["a"], 1);
-        assert_eq!(cfg.get("whisper_model").unwrap(), "large-v3-turbo");
+        assert_eq!(cfg.get("whisper_model").unwrap(), default_stt_model());
     }
 
     // JSON root 不是 object → 退預設值
@@ -438,7 +499,7 @@ mod tests {
         let path = dir.join("config.json");
         fs::write(&path, "[1,2,3]").unwrap();
         let cfg = load_config(&path);
-        assert_eq!(cfg.get("whisper_model").unwrap(), "large-v3-turbo");
+        assert_eq!(cfg.get("whisper_model").unwrap(), default_stt_model());
     }
 
     #[test]

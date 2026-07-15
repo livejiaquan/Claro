@@ -141,7 +141,7 @@ fn set_input_device(
     };
     let generation = state.mic_test_generation.fetch_add(1, Ordering::SeqCst) + 1;
     if let Some(handle) = state.mic_test.lock().unwrap().take() {
-        let _ = handle.stop();
+        let _ = handle.stop_immediately();
     }
     *state.core.input_device.lock().unwrap() = selection;
     state.mic_test_passed.store(false, Ordering::SeqCst);
@@ -199,7 +199,7 @@ fn mic_test_start(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
             if started.elapsed().as_secs() >= 30 {
                 let _audio_gate = core.audio_start_gate.lock().unwrap();
                 if let Some(h) = mic_test.lock().unwrap().take() {
-                    let _ = h.stop();
+                    let _ = h.stop_immediately();
                 }
                 timed_out = true;
                 break;
@@ -233,7 +233,7 @@ fn mic_test_start(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
             if passed {
                 let _audio_gate = core.audio_start_gate.lock().unwrap();
                 if let Some(h) = mic_test.lock().unwrap().take() {
-                    let _ = h.stop();
+                    let _ = h.stop_immediately();
                 }
                 break;
             }
@@ -258,7 +258,7 @@ fn mic_test_stop(app: tauri::AppHandle, state: tauri::State<AppState>) {
     let _audio_gate = state.core.audio_start_gate.lock().unwrap();
     let generation = state.mic_test_generation.fetch_add(1, Ordering::SeqCst) + 1;
     if let Some(h) = state.mic_test.lock().unwrap().take() {
-        let _ = h.stop();
+        let _ = h.stop_immediately();
     }
     emit_mic_inactive(
         &app,
@@ -276,6 +276,8 @@ struct ModelInfo {
     desc: &'static str,
     size_mb: u64,
     recommended: bool,
+    preview: bool,
+    available: bool,
     downloaded: bool,
     active: bool,
     downloading: bool,
@@ -294,6 +296,8 @@ fn list_models(state: tauri::State<AppState>) -> Vec<ModelInfo> {
             desc: m.desc,
             size_mb: m.approx_bytes / 1_048_576,
             recommended: m.id == recommended,
+            preview: m.preview,
+            available: m.available,
             downloaded: registry::model_is_verified(m),
             active: m.id == active,
             downloading: downloading == Some(m.id),
@@ -312,6 +316,8 @@ struct DownloadProgress {
     downloaded_mb: u64,
     total_mb: Option<u64>,
     done: bool,
+    downloaded: bool,
+    activation_status: &'static str,
     error: Option<String>,
 }
 
@@ -337,6 +343,9 @@ fn download_model(
     state: tauri::State<AppState>,
 ) -> Result<(), String> {
     let spec = registry::find(&id).ok_or("未知的模型")?;
+    if !spec.available {
+        return Err("此模型仍在做長音訊與台灣語料驗證，目前僅供離線評測".into());
+    }
     reserve_download(&state.download_gate, spec.id)?;
     if let Err(error) =
         models::ensure_download_capacity(&registry::model_path(spec), spec.approx_bytes)
@@ -365,27 +374,54 @@ fn download_model(
                     downloaded_mb: p.downloaded / 1_048_576,
                     total_mb: p.total.map(|t| t / 1_048_576),
                     done: false,
+                    downloaded: false,
+                    activation_status: "none",
                     error: None,
                 },
             );
-        })
-        .and_then(|()| {
-            if activate_after_download {
+        });
+        let payload = match result {
+            Ok(()) if activate_after_download => match core.swap_model(spec, || {
                 settings::update_config_key(
                     &settings::config_path(),
                     "whisper_model",
                     serde_json::Value::String(spec.id.to_string()),
-                )?;
-                core.swap_model(spec);
-            }
-            Ok(())
-        });
-        let payload = match result {
+                )
+            }) {
+                Ok(()) => DownloadProgress {
+                    model_id: spec.id,
+                    downloaded_mb: 0,
+                    total_mb: None,
+                    done: true,
+                    downloaded: true,
+                    activation_status: "none",
+                    error: None,
+                },
+                Err(error) => {
+                    let activation_status = if error.is_busy() {
+                        "waiting_for_idle"
+                    } else {
+                        "retry_required"
+                    };
+                    let reason = error.to_string();
+                    DownloadProgress {
+                        model_id: spec.id,
+                        downloaded_mb: 0,
+                        total_mb: None,
+                        done: true,
+                        downloaded: true,
+                        activation_status,
+                        error: Some(reason),
+                    }
+                }
+            },
             Ok(()) => DownloadProgress {
                 model_id: spec.id,
                 downloaded_mb: 0,
                 total_mb: None,
                 done: true,
+                downloaded: true,
+                activation_status: "none",
                 error: None,
             },
             Err(e) => DownloadProgress {
@@ -393,6 +429,8 @@ fn download_model(
                 downloaded_mb: 0,
                 total_mb: None,
                 done: false,
+                downloaded: false,
+                activation_status: "none",
                 error: Some(e.to_string()),
             },
         };
@@ -407,18 +445,21 @@ fn download_model(
 #[tauri::command]
 fn set_model(id: String, state: tauri::State<AppState>) -> Result<(), String> {
     let spec = registry::find(&id).ok_or("未知的模型")?;
+    if !spec.available {
+        return Err("此模型仍在做長音訊與台灣語料驗證，目前不可啟用".into());
+    }
     models::verify_model_file(&registry::model_path(spec), spec.sha256)
         .map_err(|e| format!("請先下載完整且驗證通過的模型：{e}"))?;
-    if state.core.sm.lock().unwrap().state() != State::Idle {
-        return Err("聽寫進行中，稍後再切換".into());
-    }
-    state.core.swap_model(spec);
-    settings::update_config_key(
-        &settings::config_path(),
-        "whisper_model",
-        serde_json::Value::String(spec.id.into()),
-    )
-    .map_err(|e| e.to_string())
+    state
+        .core
+        .swap_model(spec, || {
+            settings::update_config_key(
+                &settings::config_path(),
+                "whisper_model",
+                serde_json::Value::String(spec.id.into()),
+            )
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// 刪除已下載的模型檔（使用中的不可刪）。
@@ -493,6 +534,8 @@ struct BuiltinLlmInfo {
     desc: &'static str,
     size_mb: u64,
     recommended: bool,
+    preview: bool,
+    available: bool,
     downloaded: bool,
     active: bool,
     downloading: bool,
@@ -520,6 +563,8 @@ fn list_builtin_llms(state: tauri::State<AppState>) -> Vec<BuiltinLlmInfo> {
             desc: m.desc,
             size_mb: m.approx_bytes / 1_048_576,
             recommended: m.recommended,
+            preview: false,
+            available: true,
             downloaded: llm::model_is_verified(m),
             active: m.id == active,
             downloading: downloading == Some(m.id),
@@ -561,6 +606,8 @@ fn download_builtin_llm(
                     downloaded_mb: p.downloaded / 1_048_576,
                     total_mb: p.total.map(|t| t / 1_048_576),
                     done: false,
+                    downloaded: false,
+                    activation_status: "none",
                     error: None,
                 },
             );
@@ -571,6 +618,8 @@ fn download_builtin_llm(
                 downloaded_mb: 0,
                 total_mb: None,
                 done: true,
+                downloaded: true,
+                activation_status: "none",
                 error: None,
             },
             Err(e) => DownloadProgress {
@@ -578,6 +627,8 @@ fn download_builtin_llm(
                 downloaded_mb: 0,
                 total_mb: None,
                 done: false,
+                downloaded: false,
+                activation_status: "none",
                 error: Some(e.to_string()),
             },
         };
@@ -976,11 +1027,11 @@ fn show_main_window(app: &tauri::AppHandle) {
 fn init_core(app: &tauri::AppHandle) {
     let cfg = settings::Settings::load();
     let spec = registry::resolve(&cfg.whisper_model());
-    tracing::info!("Claro starting — whisper model: {}", spec.id);
+    tracing::info!("Claro starting — STT model: {}", spec.id);
 
     #[cfg(target_os = "macos")]
-    let engine: Box<dyn stt::SttEngine> = Box::new(stt::whisper::WhisperEngine::new(
-        spec.id,
+    let engine: Box<dyn stt::SttEngine> = Box::new(stt::transcribe::TranscribeEngine::new(
+        spec,
         registry::model_path(spec),
     ));
     #[cfg(not(target_os = "macos"))]
@@ -1003,7 +1054,7 @@ fn init_core(app: &tauri::AppHandle) {
             let handle = mic_test.lock().unwrap().take();
             if let Some(handle) = handle {
                 let current_generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
-                let _ = handle.stop();
+                let _ = handle.stop_immediately();
                 emit_mic_inactive(&app, current_generation, passed.load(Ordering::SeqCst));
             }
         }) as Box<dyn Fn() + Send + Sync>
@@ -1227,7 +1278,7 @@ pub fn run() {
                         if let Some(handle) = handle {
                             let generation =
                                 state.mic_test_generation.fetch_add(1, Ordering::SeqCst) + 1;
-                            let _ = handle.stop();
+                            let _ = handle.stop_immediately();
                             emit_mic_inactive(
                                 window.app_handle(),
                                 generation,

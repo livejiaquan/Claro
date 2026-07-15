@@ -55,9 +55,20 @@ export interface ModelInfo {
   desc: string;
   size_mb: number;
   recommended: boolean;
+  /** false 表示只供透明展示，下載與啟用都必須 fail closed。 */
+  available: boolean;
+  preview: boolean;
   downloaded: boolean;
   active: boolean;
   downloading: boolean;
+}
+
+export function isPreviewSttModel(model: Pick<ModelInfo, "preview">): boolean {
+  return model.preview;
+}
+
+export function displaySttModelLabel(model: Pick<ModelInfo, "label" | "preview">): string {
+  return isPreviewSttModel(model) ? model.label.replace(/\s*[（(]預覽[）)]\s*$/, "") : model.label;
 }
 
 export type PolishMode = "raw" | "clean" | "organize";
@@ -187,6 +198,8 @@ export interface DownloadProgress {
   downloaded_mb: number;
   total_mb: number | null;
   done: boolean;
+  downloaded: boolean;
+  activation_status: "none" | "waiting_for_idle" | "retry_required";
   error: string | null;
 }
 
@@ -208,6 +221,15 @@ export interface HistoryEntry {
   timings?: {
     stt_ms?: number;
     polish_ms?: number | null;
+    stt_model?: string;
+    stt_family?: "Whisper" | "Qwen3Asr" | string;
+    stt_language?: string;
+    prompt_term_count?: number;
+    context_term_count?: number;
+    audio_input_rms?: number;
+    audio_clipped_ratio?: number;
+    /** 2026-07-15 前曾記錄 peak-normalized RMS，不能當作實際輸入音量。 */
+    audio_rms?: number;
     /** 舊版/原型相容欄位。 */
     stt?: number;
     polish?: number | null;

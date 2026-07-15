@@ -79,6 +79,11 @@ pub struct Core {
     pub engine: Mutex<Box<dyn SttEngine>>,
     /// UI 顯示與模型管理用的「使用中模型」（與 engine 分開，避免轉錄中卡 get_status）
     pub active_model: Mutex<&'static ModelSpec>,
+    /// 將模型載入、設定寫回與 active_model 更新序列化；避免兩次切換互相覆蓋。
+    model_switch_gate: Mutex<()>,
+    /// 載入模型可能數秒；dispatcher 看到 true 時丟棄熱鍵事件，不能等載入後再
+    /// 用舊 timestamp 開麥或誤判成免持。
+    model_switching: AtomicBool,
     pub overlay: OverlayClient,
     pub injector: Box<dyn TextInjector>,
     /// 正式錄音前停止 onboarding mic test，避免同一 input device 同時開兩條 stream。
@@ -114,10 +119,33 @@ pub struct Core {
     capture: Mutex<Option<CaptureHandle>>,
     recording_flag: Arc<AtomicBool>,
     cancel: Mutex<Arc<AtomicBool>>,
-    /// STT 最後使用時間——閒置看門狗據此卸載（large-v3-turbo 常駐 1.6GB，
+    /// STT 最後使用時間——閒置看門狗據此卸載（精準度模型常駐可達數 GB，
     /// 是待機記憶體的大頭；SPEC §12 待機 <300MB）
     stt_last_used: Mutex<Instant>,
 }
+
+#[derive(Debug)]
+pub enum ModelSwapError {
+    Busy,
+    Failed(anyhow::Error),
+}
+
+impl ModelSwapError {
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Self::Busy)
+    }
+}
+
+impl std::fmt::Display for ModelSwapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => write!(f, "聽寫進行中，稍後再切換"),
+            Self::Failed(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for ModelSwapError {}
 
 impl Core {
     pub fn new(
@@ -134,6 +162,8 @@ impl Core {
             sm: Mutex::new(DictationStateMachine::new()),
             engine: Mutex::new(engine),
             active_model: Mutex::new(active_model),
+            model_switch_gate: Mutex::new(()),
+            model_switching: AtomicBool::new(false),
             overlay,
             injector,
             stop_mic_test,
@@ -159,7 +189,7 @@ impl Core {
     }
 
     /// 確保 STT 引擎已載入（閒置卸載後的回載）。錄音一開始就在背景先跑，
-    /// 載入時間（large-v3-turbo 約 1.4s）被使用者說話的時間蓋掉。
+    /// 載入時間被使用者說話的時間蓋掉。
     pub fn ensure_stt_loaded(&self) {
         let mut eng = self.engine.lock().unwrap();
         if !eng.is_loaded() {
@@ -183,23 +213,98 @@ impl Core {
         });
     }
 
-    /// 熱換 STT 模型：先丟舊引擎（避免雙駐留，Handy 實證），再背景載入新引擎。
-    pub fn swap_model(self: &Arc<Self>, spec: &'static ModelSpec) {
-        *self.active_model.lock().unwrap() = spec;
-        {
-            let mut engine = self.engine.lock().unwrap();
-            *engine = Box::new(crate::stt::whisper::WhisperEngine::new(
-                spec.id,
+    /// 原子切換 STT 模型：舊引擎先卸載以避免兩份大型 Metal 模型同時駐留，
+    /// 但只有候選模型成功載入、設定也成功寫回後，才更新 active_model。
+    /// 任一步失敗都嘗試把原引擎回載，讓失敗不會把下一次聽寫弄壞。
+    pub fn swap_model<F>(&self, spec: &'static ModelSpec, commit: F) -> Result<(), ModelSwapError>
+    where
+        F: FnOnce() -> anyhow::Result<()>,
+    {
+        let _switch = self.model_switch_gate.lock().unwrap();
+        let _switching = begin_model_switch(&self.sm, &self.model_switching)?;
+
+        let mut engine = self.engine.lock().unwrap();
+        let candidate: Box<dyn SttEngine> =
+            Box::new(crate::stt::transcribe::TranscribeEngine::new(
+                spec,
                 crate::stt::registry::model_path(spec),
             ));
-        }
-        let core = self.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = core.engine.lock().unwrap().load() {
-                tracing::warn!("model preload after swap failed: {e}");
-            }
-        });
+        replace_engine_atomically(&mut engine, candidate, commit)
+            .map_err(ModelSwapError::Failed)?;
+        *self.active_model.lock().unwrap() = spec;
+        self.touch_stt();
+        Ok(())
     }
+}
+
+struct ModelSwitchingGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> ModelSwitchingGuard<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self { flag }
+    }
+}
+
+impl Drop for ModelSwitchingGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+/// state check 與 switching=true 必須在同一把 sm lock 內線性化。若先抬旗標再
+/// 發現正在錄音，dispatcher 可能吞掉用來停止錄音的 Up／Esc。
+fn begin_model_switch<'a>(
+    sm: &Mutex<DictationStateMachine>,
+    flag: &'a AtomicBool,
+) -> Result<ModelSwitchingGuard<'a>, ModelSwapError> {
+    let sm = sm.lock().unwrap();
+    if sm.state() != State::Idle {
+        return Err(ModelSwapError::Busy);
+    }
+    let guard = ModelSwitchingGuard::new(flag);
+    drop(sm);
+    Ok(guard)
+}
+
+/// 低記憶體安全的 engine replacement。候選模型失敗或 commit 失敗時，
+/// `current` 仍是原引擎；若切換前已載入，就在回傳錯誤前嘗試回載。
+fn replace_engine_atomically<F>(
+    current: &mut Box<dyn SttEngine>,
+    mut candidate: Box<dyn SttEngine>,
+    commit: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    let previous_was_loaded = current.is_loaded();
+    current.unload();
+
+    if let Err(candidate_error) = candidate.load() {
+        let rollback = previous_was_loaded.then(|| current.load()).transpose();
+        return match rollback {
+            Ok(_) => Err(candidate_error.context("新模型載入失敗，已保留原模型")),
+            Err(rollback_error) => Err(anyhow::anyhow!(
+                "新模型載入失敗：{candidate_error:#}；原模型回載也失敗：{rollback_error:#}"
+            )),
+        };
+    }
+
+    if let Err(commit_error) = commit() {
+        drop(candidate);
+        let rollback = previous_was_loaded.then(|| current.load()).transpose();
+        return match rollback {
+            Ok(_) => Err(commit_error.context("模型設定寫入失敗，已保留原模型")),
+            Err(rollback_error) => Err(anyhow::anyhow!(
+                "模型設定寫入失敗：{commit_error:#}；原模型回載也失敗：{rollback_error:#}"
+            )),
+        };
+    }
+
+    *current = candidate;
+    Ok(())
 }
 
 /// STT 閒置卸載門檻（秒）。與 llm.rs 同款政策（閒置 5 分鐘）；
@@ -233,12 +338,29 @@ pub fn spawn_stt_idle_watcher(core: Arc<Core>) {
     });
 }
 
+fn apply_hotkey_transition(
+    sm: &Mutex<DictationStateMachine>,
+    model_switching: &AtomicBool,
+    message: HotkeyMsg,
+) -> SmAction {
+    let mut sm = sm.lock().unwrap();
+    if model_switching.load(Ordering::SeqCst) {
+        return SmAction::None;
+    }
+    match message {
+        HotkeyMsg::Down(ts) => sm.hotkey_down(ts),
+        HotkeyMsg::Up(ts) => sm.hotkey_up(ts),
+        HotkeyMsg::Esc => sm.esc(),
+    }
+}
+
 /// dispatcher 主迴圈：在專屬執行緒上跑，直到 msg channel 關閉。
 pub fn run_dispatcher(core: Arc<Core>, rx: crossbeam_channel::Receiver<Msg>) {
     for msg in rx {
         match msg {
             Msg::Hotkey(HotkeyMsg::Down(ts)) => {
-                let action = core.sm.lock().unwrap().hotkey_down(ts);
+                let action =
+                    apply_hotkey_transition(&core.sm, &core.model_switching, HotkeyMsg::Down(ts));
                 match action {
                     SmAction::StartRecording => start_recording(&core),
                     SmAction::StopAndProcess => start_processing(&core),
@@ -247,7 +369,8 @@ pub fn run_dispatcher(core: Arc<Core>, rx: crossbeam_channel::Receiver<Msg>) {
                 core.sync_esc();
             }
             Msg::Hotkey(HotkeyMsg::Up(ts)) => {
-                let action = core.sm.lock().unwrap().hotkey_up(ts);
+                let action =
+                    apply_hotkey_transition(&core.sm, &core.model_switching, HotkeyMsg::Up(ts));
                 match action {
                     SmAction::EnterHandsfree => {
                         core.overlay.send("handsfree");
@@ -259,7 +382,8 @@ pub fn run_dispatcher(core: Arc<Core>, rx: crossbeam_channel::Receiver<Msg>) {
                 core.sync_esc();
             }
             Msg::Hotkey(HotkeyMsg::Esc) => {
-                let action = core.sm.lock().unwrap().esc();
+                let action =
+                    apply_hotkey_transition(&core.sm, &core.model_switching, HotkeyMsg::Esc);
                 match action {
                     SmAction::CancelRecording => cancel_recording(&core),
                     SmAction::CancelProcessing => {
@@ -285,15 +409,27 @@ pub fn run_dispatcher(core: Arc<Core>, rx: crossbeam_channel::Receiver<Msg>) {
 fn start_recording(core: &Arc<Core>) {
     let audio_gate = core.audio_start_gate.lock().unwrap();
     (core.stop_mic_test)();
-    // keyDown 只先固定 focused AX reference（不讀文字／metadata，最長 40ms），
-    // 讓同 App A→B 也可辨識；完整 hash 在麥克風開始收音後才做。
     let session = core.sm.lock().unwrap().session();
-    let target_seed = crate::context::begin_paste_target_capture();
     let device = core.input_device.lock().unwrap().clone();
-    let capture_result = audio::start_capture(device);
+    // 麥克風裝置初始化與最小 AX target seed 並行。AX 最壞約 50ms，不能讓它
+    // 排在開麥前切掉按下即說的第一個音節；seed 仍在 keyDown dispatcher 尚未
+    // 處理下一事件時固定，可辨識同一 App 內的欄位切換。
+    let mic_requested_at = Instant::now();
+    let (capture_tx, capture_rx) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = capture_tx.send(audio::start_capture(device));
+    });
+    let target_seed = crate::context::begin_paste_target_capture();
+    let capture_result = capture_rx
+        .recv_timeout(Duration::from_secs(4))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("audio thread did not start in time")));
     drop(audio_gate);
     match capture_result {
         Ok(handle) => {
+            tracing::info!(
+                "microphone stream ready in {}ms",
+                mic_requested_at.elapsed().as_millis()
+            );
             core.recording_flag.store(true, Ordering::SeqCst);
             let level = handle.level_handle();
             let started = Instant::now();
@@ -391,6 +527,14 @@ fn detach_capture(core: &Arc<Core>) -> Option<CaptureHandle> {
     core.capture.lock().unwrap().take()
 }
 
+struct CollectedAudio {
+    samples: Vec<f32>,
+    /// 正規化前的實際輸入電平；可用來判斷麥克風太小聲，不能用 peak-normalized
+    /// samples 回推。
+    input_rms: f32,
+    clipped_ratio: f32,
+}
+
 /// 停止錄音並取回音訊；None 表示不合格（已送 error 態與 history）
 fn collect_audio(
     core: &Arc<Core>,
@@ -398,9 +542,14 @@ fn collect_audio(
     cancelled: bool,
     session: u64,
     cancel: Option<&AtomicBool>,
-) -> Option<Vec<f32>> {
+) -> Option<CollectedAudio> {
     let handle = handle?;
-    let samples = match handle.stop() {
+    let stop_immediately = cancelled || cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
+    let samples = match if stop_immediately {
+        handle.stop_immediately()
+    } else {
+        handle.stop()
+    } {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("audio capture failed: {e}");
@@ -453,7 +602,14 @@ fn collect_audio(
         );
         return None;
     }
-    Some(audio::normalize(samples))
+    let input_rms = audio::rms(&samples);
+    let clipped_ratio =
+        samples.iter().filter(|sample| sample.abs() >= 0.99).count() as f32 / samples.len() as f32;
+    Some(CollectedAudio {
+        samples: audio::normalize(samples),
+        input_rms,
+        clipped_ratio,
+    })
 }
 
 fn start_processing(core: &Arc<Core>) {
@@ -520,9 +676,14 @@ fn process_session(
     cancel: &AtomicBool,
     capture: Option<CaptureHandle>,
 ) {
-    let Some(samples) = collect_audio(core, capture, false, session, Some(cancel)) else {
+    let Some(captured_audio) = collect_audio(core, capture, false, session, Some(cancel)) else {
         return;
     };
+    let CollectedAudio {
+        samples,
+        input_rms,
+        clipped_ratio,
+    } = captured_audio;
     let dur = samples.len() as f64 / audio::TARGET_RATE as f64;
     send_overlay_for_session(core, session, cancel, "processing");
     // 單一 session 只讀一次設定，避免使用者在轉錄途中切模式造成 provider、
@@ -571,13 +732,22 @@ fn process_session(
 
     let t0 = Instant::now();
     let dict_pairs = core.dict.lock().unwrap().clone();
+    let dict_terms: Vec<String> = dict_pairs.iter().map(|(_, right)| right.clone()).collect();
+    let terms = crate::context::context_terms(&dict_terms, &screen_ctx, 15);
+    let (stt_model, stt_family, prompt_term_count) = {
+        let model = *core.active_model.lock().unwrap();
+        let prompt_term_count = matches!(model.family, crate::stt::registry::ModelFamily::Whisper)
+            .then_some(terms.len())
+            .unwrap_or(0);
+        (model.id, format!("{:?}", model.family), prompt_term_count)
+    };
     let raw = {
-        let dict_terms: Vec<String> = dict_pairs.iter().map(|(_, right)| right.clone()).collect();
-        let terms = crate::context::context_terms(&dict_terms, &screen_ctx, 15);
         let req = crate::stt::SttRequest {
             audio: &samples,
+            // 台灣中文是目前產品預設。auto 與 zh 的合成 smoke 無差異，
+            // 在真人短句／混語 corpus 完成前不把未證實的 auto 當準確度修正。
             language: Some("zh"),
-            initial_prompt: Some(crate::stt::build_initial_prompt(&terms)),
+            initial_prompt: crate::stt::build_initial_prompt(&terms),
         };
         let res = {
             let mut eng = core.engine.lock().unwrap();
@@ -657,7 +827,19 @@ fn process_session(
         (settings.polish_mode() != PolishMode::Raw).then(|| t1.elapsed().as_millis() as u64);
     let text = textproc::normalize_cjk_punct(&textproc::to_traditional(&output));
 
-    let timings = Some(json!({ "stt_ms": stt_ms, "polish_ms": polish_ms }));
+    // 只記錄除錯所需的模型／解碼 profile 與聚合音量，不保存 Context 詞彙內容。
+    // 讓未來的準確率回報能分辨「哪個模型」與「是否有詞彙偏置」，不再盲猜。
+    let timings = Some(json!({
+        "stt_ms": stt_ms,
+        "polish_ms": polish_ms,
+        "stt_model": stt_model,
+        "stt_family": stt_family,
+        "stt_language": "zh",
+        "prompt_term_count": prompt_term_count,
+        "context_term_count": terms.len(),
+        "audio_input_rms": (input_rms * 10_000.0).round() / 10_000.0,
+        "audio_clipped_ratio": (clipped_ratio * 10_000.0).round() / 10_000.0,
+    }));
 
     if !async_feedback_allowed(core, session, cancel) {
         let _ = history::append_entry(
@@ -787,14 +969,15 @@ fn cancel_recording(core: &Arc<Core>) {
     let capture = detach_capture(core);
     let core = core.clone();
     std::thread::spawn(move || {
-        let Some(samples) = collect_audio(&core, capture, true, session, None) else {
+        let Some(captured_audio) = collect_audio(&core, capture, true, session, None) else {
             return;
         };
+        let samples = captured_audio.samples;
         let dur = samples.len() as f64 / audio::TARGET_RATE as f64;
         let req = crate::stt::SttRequest {
             audio: &samples,
             language: Some("zh"),
-            initial_prompt: Some(crate::stt::build_initial_prompt(&[])),
+            initial_prompt: crate::stt::build_initial_prompt(&[]),
         };
         let raw = core
             .engine
@@ -824,15 +1007,155 @@ fn cancel_recording(core: &Arc<Core>) {
 #[cfg(test)]
 mod target_tests {
     use super::{
-        commit_paste_for_session, context_matches_target, enqueue_pending_result,
-        force_stop_session, paste_target_matches, record_success, take_session_slot, PendingResult,
+        apply_hotkey_transition, begin_model_switch, commit_paste_for_session,
+        context_matches_target, enqueue_pending_result, force_stop_session, paste_target_matches,
+        record_success, replace_engine_atomically, take_session_slot, PendingResult,
     };
     use crate::context::{ContextSnapshot, PasteTarget};
     use crate::state_machine::{DictationStateMachine, SmAction, State};
+    use crate::stt::{SttEngine, SttRequest};
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    struct FakeEngine {
+        id: &'static str,
+        loaded: bool,
+        fail_load: bool,
+        loads: Arc<AtomicUsize>,
+    }
+
+    impl FakeEngine {
+        fn boxed(
+            id: &'static str,
+            loaded: bool,
+            fail_load: bool,
+            loads: Arc<AtomicUsize>,
+        ) -> Box<dyn SttEngine> {
+            Box::new(Self {
+                id,
+                loaded,
+                fail_load,
+                loads,
+            })
+        }
+    }
+
+    impl SttEngine for FakeEngine {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn is_loaded(&self) -> bool {
+            self.loaded
+        }
+
+        fn load(&mut self) -> anyhow::Result<()> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            if self.fail_load {
+                anyhow::bail!("fake load failed");
+            }
+            self.loaded = true;
+            Ok(())
+        }
+
+        fn unload(&mut self) {
+            self.loaded = false;
+        }
+
+        fn transcribe(&mut self, _req: &SttRequest<'_>) -> anyhow::Result<String> {
+            unreachable!("model-swap tests do not transcribe")
+        }
+    }
+
+    #[test]
+    fn hotkey_pair_during_model_load_is_dropped_instead_of_replayed() {
+        let sm = Mutex::new(DictationStateMachine::new());
+        let switching = AtomicBool::new(true);
+
+        assert_eq!(
+            apply_hotkey_transition(&sm, &switching, crate::hotkey::HotkeyMsg::Down(1.0)),
+            SmAction::None
+        );
+        assert_eq!(
+            apply_hotkey_transition(&sm, &switching, crate::hotkey::HotkeyMsg::Up(1.1)),
+            SmAction::None
+        );
+        assert_eq!(sm.lock().unwrap().state(), State::Idle);
+
+        switching.store(false, Ordering::SeqCst);
+        assert_eq!(
+            apply_hotkey_transition(&sm, &switching, crate::hotkey::HotkeyMsg::Down(2.0)),
+            SmAction::StartRecording
+        );
+    }
+
+    #[test]
+    fn failed_switch_while_recording_never_raises_drop_hotkeys_flag() {
+        let mut machine = DictationStateMachine::new();
+        assert_eq!(machine.hotkey_down(1.0), SmAction::StartRecording);
+        let sm = Mutex::new(machine);
+        let switching = AtomicBool::new(false);
+
+        assert!(begin_model_switch(&sm, &switching).is_err());
+        assert!(!switching.load(Ordering::SeqCst));
+        assert_eq!(
+            apply_hotkey_transition(&sm, &switching, crate::hotkey::HotkeyMsg::Up(2.0)),
+            SmAction::StopAndProcess
+        );
+    }
+
+    #[test]
+    fn model_swap_commits_only_after_candidate_loads() {
+        let old_loads = Arc::new(AtomicUsize::new(0));
+        let new_loads = Arc::new(AtomicUsize::new(0));
+        let committed = AtomicBool::new(false);
+        let mut current = FakeEngine::boxed("old", true, false, old_loads.clone());
+        let candidate = FakeEngine::boxed("new", false, false, new_loads.clone());
+
+        replace_engine_atomically(&mut current, candidate, || {
+            committed.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(current.id(), "new");
+        assert!(current.is_loaded());
+        assert!(committed.load(Ordering::SeqCst));
+        assert_eq!(new_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(old_loads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn model_swap_rolls_back_when_candidate_load_fails() {
+        let old_loads = Arc::new(AtomicUsize::new(0));
+        let mut current = FakeEngine::boxed("old", true, false, old_loads.clone());
+        let candidate = FakeEngine::boxed("new", false, true, Arc::new(AtomicUsize::new(0)));
+
+        let error = replace_engine_atomically(&mut current, candidate, || Ok(())).unwrap_err();
+
+        assert!(error.to_string().contains("新模型載入失敗"));
+        assert_eq!(current.id(), "old");
+        assert!(current.is_loaded());
+        assert_eq!(old_loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn model_swap_rolls_back_when_config_commit_fails() {
+        let old_loads = Arc::new(AtomicUsize::new(0));
+        let mut current = FakeEngine::boxed("old", true, false, old_loads.clone());
+        let candidate = FakeEngine::boxed("new", false, false, Arc::new(AtomicUsize::new(0)));
+
+        let error =
+            replace_engine_atomically(&mut current, candidate, || anyhow::bail!("disk full"))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("模型設定寫入失敗"));
+        assert_eq!(current.id(), "old");
+        assert!(current.is_loaded());
+        assert_eq!(old_loads.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn paste_requires_same_known_target() {

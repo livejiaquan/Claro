@@ -764,6 +764,89 @@ input {
 .setup-banner-checks .ready {
   color: var(--green);
 }
+
+/* 既有使用者的準確度升級入口：只導向設定，不在首頁觸發下載。 */
+.accuracy-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 15px 16px;
+  border: 1px solid rgba(52, 120, 246, 0.2);
+  border-left: 3px solid var(--accent);
+  border-radius: 13px;
+  background: linear-gradient(135deg, #f8fbff, var(--accent-soft));
+}
+.accuracy-banner-copy {
+  min-width: 0;
+}
+.accuracy-banner-kicker {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+.accuracy-banner-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.accuracy-banner-heading h2 {
+  font-size: 13.5px;
+  font-weight: 650;
+}
+.accuracy-banner-heading .pill,
+.accuracy-banner-copy p .pill {
+  padding: 2px 8px;
+  font-size: 10.5px;
+}
+.accuracy-banner-copy p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.accuracy-banner-copy p strong {
+  color: var(--text);
+  font-weight: 650;
+}
+.accuracy-banner-note {
+  display: block;
+  margin-top: 5px;
+  color: #55709f;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.accuracy-banner-actions {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.accuracy-banner-status {
+  min-height: 58px;
+  justify-content: flex-start;
+  border-left-width: 1px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--muted);
+  font-size: 12px;
+}
+.accuracy-banner-status .btn {
+  margin-left: auto;
+}
+.accuracy-loading-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--accent);
+  animation: pulse 1.1s ease-in-out infinite;
+}
 .setup-compact {
   display: flex;
   align-items: center;
@@ -936,6 +1019,12 @@ input {
 .setup-model-row .progress-track {
   max-width: 250px;
 }
+.model-validation-note {
+  margin-top: 5px;
+  color: #8c6a3a;
+  font-size: 11px;
+  line-height: 1.45;
+}
 .setup-first-dictation.blocked {
   background: rgba(255, 255, 255, 0.58);
 }
@@ -1012,6 +1101,14 @@ input {
   }
   .consent-actions {
     justify-content: flex-end;
+  }
+  .accuracy-banner {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .accuracy-banner-actions {
+    align-self: flex-start;
   }
 }
 

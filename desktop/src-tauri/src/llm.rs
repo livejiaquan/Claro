@@ -107,6 +107,7 @@ mod engine {
     const MAX_OUTPUT_TOKENS: usize = 512;
     const N_CTX: u32 = 4096;
     const MAX_GENERATION_TIME: Duration = Duration::from_secs(6);
+    const MAX_TOTAL_TIME: Duration = Duration::from_secs(8);
 
     struct Loaded {
         id: String,
@@ -117,6 +118,29 @@ mod engine {
     static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
     static STATE: Mutex<Option<Loaded>> = Mutex::new(None);
     static WATCHER: Once = Once::new();
+
+    fn ensure_total_budget(
+        cancel: &std::sync::atomic::AtomicBool,
+        total_deadline: Instant,
+    ) -> Result<()> {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("內建整理已取消");
+        }
+        if Instant::now() >= total_deadline {
+            bail!("內建整理準備逾時；模型已保留供下一次使用");
+        }
+        Ok(())
+    }
+
+    /// 生成最多六秒，但不可超過整次內建整理的總額度。
+    fn start_generation_deadline(
+        cancel: &std::sync::atomic::AtomicBool,
+        timeout: Duration,
+        total_deadline: Instant,
+    ) -> Result<Instant> {
+        ensure_total_budget(cancel, total_deadline)?;
+        Ok((Instant::now() + timeout).min(total_deadline))
+    }
 
     fn backend() -> Result<&'static LlamaBackend> {
         if let Some(b) = BACKEND.get() {
@@ -173,7 +197,7 @@ mod engine {
         user: &str,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<String> {
-        let deadline = Instant::now() + MAX_GENERATION_TIME;
+        let total_deadline = Instant::now() + MAX_TOTAL_TIME;
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
             bail!("內建整理已取消");
         }
@@ -181,9 +205,13 @@ mod engine {
         let path = model_path(spec);
         crate::models::verify_model_file(&path, spec.sha256)
             .with_context(|| format!("模型尚未下載或完整性驗證失敗：{}", spec.label))?;
+        ensure_total_budget(cancel, total_deadline)?;
 
         let backend = backend()?;
-        let mut guard = STATE.lock().unwrap();
+        ensure_total_budget(cancel, total_deadline)?;
+        let mut guard = STATE
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("內建整理正在處理另一個要求，安全退回原文"))?;
 
         // 換模型先 drop 舊的（避免雙駐留峰值），再載新的
         if guard.as_ref().map(|l| l.id.as_str()) != Some(model_id) {
@@ -204,12 +232,10 @@ mod engine {
             });
             spawn_watcher();
         }
-        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
-            bail!("內建整理已取消");
-        }
-        if Instant::now() >= deadline {
-            bail!("內建整理逾時");
-        }
+
+        // Metal 冷載本身不可安全中斷；若已吃完總額度，模型仍保留在 STATE，
+        // 這一段立即 fallback，下一段 warm call 不再支付冷載成本。
+        let deadline = start_generation_deadline(cancel, MAX_GENERATION_TIME, total_deadline)?;
         let loaded = guard.as_mut().expect("loaded above");
         loaded.last_used = Instant::now();
         let model = &loaded.model;
@@ -287,6 +313,51 @@ mod engine {
     pub fn generate(model_id: &str, system: &str, user: &str) -> Result<String> {
         let cancel = std::sync::atomic::AtomicBool::new(false);
         generate_with_cancel(model_id, system, user, &cancel)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[test]
+        fn generation_budget_is_capped_by_total_deadline() {
+            let cancel = AtomicBool::new(false);
+            let timeout = Duration::from_millis(50);
+            let total_deadline = Instant::now() + Duration::from_millis(20);
+
+            let deadline = start_generation_deadline(&cancel, timeout, total_deadline)
+                .expect("total budget is still available");
+
+            assert!(deadline <= total_deadline);
+        }
+
+        #[test]
+        fn cancellation_after_model_preparation_stops_before_generation() {
+            let cancel = AtomicBool::new(false);
+            cancel.store(true, Ordering::SeqCst);
+            let error = start_generation_deadline(
+                &cancel,
+                MAX_GENERATION_TIME,
+                Instant::now() + MAX_TOTAL_TIME,
+            )
+            .expect_err("cancellation after preparation must stop generation");
+
+            assert!(error.to_string().contains("取消"));
+        }
+
+        #[test]
+        fn expired_total_budget_stops_before_generation() {
+            let cancel = AtomicBool::new(false);
+            let error = start_generation_deadline(
+                &cancel,
+                MAX_GENERATION_TIME,
+                Instant::now() - Duration::from_millis(1),
+            )
+            .expect_err("expired preparation budget must fallback");
+
+            assert!(error.to_string().contains("準備逾時"));
+        }
     }
 }
 

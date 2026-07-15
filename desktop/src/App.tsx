@@ -43,6 +43,16 @@ export default function App() {
       .catch((reason) => setStatusError(String(reason)));
 
   useEffect(() => {
+    if (
+      progress &&
+      progress.activation_status !== "none" &&
+      status?.model_id === progress.model_id
+    ) {
+      setProgress(null);
+    }
+  }, [progress, status?.model_id]);
+
+  useEffect(() => {
     refresh();
     let timer: number | undefined;
     const syncPolling = () => {
@@ -57,12 +67,17 @@ export default function App() {
     document.addEventListener("visibilitychange", syncPolling);
     syncPolling();
     const un1 = listen<DownloadProgress>("model-download", (e) => {
-      setProgress(e.payload.done ? null : e.payload);
-      if (e.payload.error) showToast(`下載失敗：${e.payload.error}`);
-      if (e.payload.done) {
+      setProgress(e.payload.done && e.payload.activation_status === "none" ? null : e.payload);
+      if (e.payload.activation_status === "waiting_for_idle") {
+        showToast("模型已下載；本次聽寫結束後請按「使用」切換");
+      } else if (e.payload.activation_status === "retry_required") {
+        showToast("模型已下載，但切換失敗；請到設定重試使用");
+      } else if (e.payload.error) {
+        showToast(`下載失敗：${e.payload.error}`);
+      } else if (e.payload.done) {
         showToast("模型下載完成");
-        refresh();
       }
+      if (e.payload.downloaded || e.payload.done) refresh();
     });
     const un2 = listen<MicLevel>("mic-level", (e) => {
       if (e.payload.generation < micGeneration.current) return;
@@ -221,6 +236,7 @@ export default function App() {
               onCopied={() => showToast("已複製")}
               gotoHistory={() => setPage("history")}
               gotoSetup={() => setPage("setup")}
+              gotoSettings={() => setPage("settings")}
             />
           ) : page === "history" ? (
             <History

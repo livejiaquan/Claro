@@ -17,15 +17,15 @@ fn main() -> anyhow::Result<()> {
             .map(|s| s.map(|v| v as f32 / 32768.0))
             .collect::<Result<_, _>>()?;
         let spec = claro_lib::stt::registry::resolve("large-v3-turbo");
-        let mut engine = claro_lib::stt::whisper::WhisperEngine::new(
-            spec.id,
+        let mut engine = claro_lib::stt::transcribe::TranscribeEngine::new(
+            spec,
             claro_lib::stt::registry::model_path(spec),
         );
         use claro_lib::stt::SttEngine;
         let raw = engine.transcribe(&claro_lib::stt::SttRequest {
             audio: &samples,
-            language: Some("zh"),
-            initial_prompt: Some(claro_lib::stt::build_initial_prompt(&["PyTorch".into()])),
+            language: None,
+            initial_prompt: claro_lib::stt::build_initial_prompt(&["PyTorch".into()]),
         })?;
         println!("STT: {raw}");
     }

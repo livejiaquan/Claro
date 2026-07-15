@@ -1,9 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
+  displaySttModelLabel,
+  isPreviewSttModel,
   resolveLlmConfig,
   type HistoryEntry,
   type LlmConfig,
+  type ModelInfo,
   type ResolvedLlmConfig,
   type Status,
 } from "../types";
@@ -45,6 +48,47 @@ const BLOCKED_COPY: Record<string, string> = {
   invalid_endpoint: "自訂端點格式不正確",
   invalid_custom_url: "自訂端點格式不正確",
 };
+
+function formatModelSize(sizeMb: number) {
+  return sizeMb >= 1024 ? `${(sizeMb / 1024).toFixed(1)} GB` : `${sizeMb} MB`;
+}
+
+const ACCURACY_NOTICE_VERSION = 1;
+
+// 只在推薦模型的辨識能力明確高一階時稱為「精準度升級」。硬體推薦也可能
+// 是為了省記憶體（例如 Intel 的 Turbo Q5），不能把降級誤包裝成升級。
+const STT_ACCURACY_TIER: Record<string, number> = {
+  small: 0,
+  medium: 1,
+  "large-v3-turbo-q5_0": 2,
+  "large-v3-turbo": 3,
+  "large-v3-q5_0": 4,
+  "large-v3": 5,
+};
+
+function isAccuracyUpgrade(active: ModelInfo, recommended: ModelInfo) {
+  const activeTier = STT_ACCURACY_TIER[active.id];
+  const recommendedTier = STT_ACCURACY_TIER[recommended.id];
+  return activeTier !== undefined && recommendedTier !== undefined && recommendedTier > activeTier;
+}
+
+function accuracyNoticeKey(activeId: string, recommendedId: string) {
+  return `claro:accuracy-upgrade:v${ACCURACY_NOTICE_VERSION}:${encodeURIComponent(activeId)}->${encodeURIComponent(recommendedId)}`;
+}
+
+function accuracyNoticeWasDismissed(key: string) {
+  try {
+    return window.localStorage.getItem(key) === "dismissed";
+  } catch {
+    return false;
+  }
+}
+
+function currentModelPosition(model: ModelInfo) {
+  if (isPreviewSttModel(model)) return "預覽模型";
+  if (model.id.includes("turbo") || model.id === "small" || model.id === "medium") return "速度優先";
+  return "既有方案";
+}
 
 function privacyMessage(llm: ResolvedLlmConfig | null, failed: boolean, contextEnabled: boolean) {
   if (failed) {
@@ -111,15 +155,31 @@ export default function Home({
   onCopied,
   gotoHistory,
   gotoSetup,
+  gotoSettings,
 }: {
   status: Status;
   onCopied: () => void;
   gotoHistory: () => void;
   gotoSetup: () => void;
+  gotoSettings: () => void;
 }) {
   const [entries, setEntries] = useState<HistoryEntry[]>([]);
   const [llm, setLlm] = useState<ResolvedLlmConfig | null>(null);
   const [llmFailed, setLlmFailed] = useState(false);
+  const [models, setModels] = useState<ModelInfo[] | null>(null);
+  const [modelsFailed, setModelsFailed] = useState(false);
+  const [dismissedUpgradeKey, setDismissedUpgradeKey] = useState<string | null>(null);
+
+  const refreshModels = useCallback(() => {
+    setModels(null);
+    setModelsFailed(false);
+    invoke<ModelInfo[]>("list_models")
+      .then((next) => {
+        setModels(next);
+        setModelsFailed(false);
+      })
+      .catch(() => setModelsFailed(true));
+  }, []);
 
   useEffect(() => {
     const refreshHistory = () => invoke<HistoryEntry[]>("get_history", { n: 500 }).then(setEntries).catch(() => {});
@@ -143,6 +203,10 @@ export default function Home({
     return () => clearInterval(t);
   }, []);
 
+  useEffect(() => {
+    if (status.setup_completed) refreshModels();
+  }, [refreshModels, status.model_id, status.setup_completed]);
+
   const pasted = entries.filter((e) => e.status === "pasted");
   const today = pasted.filter((e) => isToday(e.ts));
   const todayChars = today.reduce((s, e) => s + (e.text?.length ?? 0), 0);
@@ -154,6 +218,32 @@ export default function Home({
   const privacy = privacyMessage(llm, llmFailed, status.context_enabled);
   const permissionsReady = status.accessibility && status.hotkey_active;
   const needsSetup = !permissionsReady || !status.model_present || !status.setup_completed;
+  const activeModel = models?.find((model) => model.active) ?? models?.find((model) => model.id === status.model_id);
+  const recommendedModel = models?.find((model) => model.recommended && model.available === true);
+  const upgradeNoticeKey =
+    status.setup_completed &&
+    activeModel &&
+    recommendedModel &&
+    isAccuracyUpgrade(activeModel, recommendedModel)
+      ? accuracyNoticeKey(activeModel.id, recommendedModel.id)
+      : null;
+  const upgradeNoticeDismissed = Boolean(
+    upgradeNoticeKey &&
+      (dismissedUpgradeKey === upgradeNoticeKey || accuracyNoticeWasDismissed(upgradeNoticeKey)),
+  );
+  const accuracyUpgrade = Boolean(
+    upgradeNoticeKey && !upgradeNoticeDismissed,
+  );
+
+  const dismissAccuracyUpgrade = () => {
+    if (!upgradeNoticeKey) return;
+    try {
+      window.localStorage.setItem(upgradeNoticeKey, "dismissed");
+    } catch {
+      // localStorage 被停用時，仍保留這次使用階段的選擇。
+    }
+    setDismissedUpgradeKey(upgradeNoticeKey);
+  };
 
   const copy = (text: string) => {
     invoke("copy_text", { text }).then(onCopied).catch(() => {});
@@ -187,6 +277,46 @@ export default function Home({
           </div>
           <button className="btn-primary no-drag" onClick={gotoSetup}>開始首次設定</button>
         </div>
+      )}
+
+      {status.setup_completed && models === null && !modelsFailed && (
+        <div className="accuracy-banner accuracy-banner-status mb-7" role="status" aria-busy="true">
+          <span className="accuracy-loading-dot" aria-hidden="true" />
+          正在確認這台 Mac 的準確度建議…
+        </div>
+      )}
+
+      {status.setup_completed && modelsFailed && (
+        <div className="accuracy-banner accuracy-banner-status mb-7" role="status">
+          <span>暫時無法檢查語音模型建議。</span>
+          <button className="btn no-drag" onClick={refreshModels}>重新檢查</button>
+        </div>
+      )}
+
+      {accuracyUpgrade && activeModel && recommendedModel && (
+        <section className="accuracy-banner mb-7" aria-labelledby="accuracy-upgrade-title">
+          <div className="accuracy-banner-copy">
+            <span className="accuracy-banner-kicker">準確度升級可用</span>
+            <div className="accuracy-banner-heading">
+              <h2 id="accuracy-upgrade-title">目前使用 {displaySttModelLabel(activeModel)}</h2>
+              <span className="pill amber">{currentModelPosition(activeModel)}</span>
+            </div>
+            <p>
+              這台 Mac 推薦 <strong>{displaySttModelLabel(recommendedModel)}</strong>
+              {isPreviewSttModel(recommendedModel) && <span className="pill amber ml-2">預覽</span>}
+              <span>・{formatModelSize(recommendedModel.size_mb)}，以辨識精準度為優先。</span>
+            </p>
+            <span className="accuracy-banner-note">不會自動下載；只有你在設定按下下載後才會開始。</span>
+          </div>
+          <div className="accuracy-banner-actions">
+            <button className="btn-primary no-drag" onClick={gotoSettings}>
+              查看語音模型
+            </button>
+            <button className="btn no-drag" onClick={dismissAccuracyUpgrade}>
+              保留目前模型
+            </button>
+          </div>
+        </section>
       )}
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-7">

@@ -11,7 +11,10 @@ fn main() {
             println!("── 詞彙偏置（{}） ──", terms.len());
             println!("{}", terms.join("、"));
             println!("── initial_prompt ──");
-            println!("{}", claro_lib::stt::build_initial_prompt(&terms));
+            println!(
+                "{}",
+                claro_lib::stt::build_initial_prompt(&terms).unwrap_or_default()
+            );
         }
         None => println!("擷取不到上下文（沒有輔助使用權限？）"),
     }

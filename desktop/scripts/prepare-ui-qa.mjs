@@ -59,22 +59,32 @@ const bridge = String.raw`
     },
     hardware: {
       architecture: "aarch64", memory_gb: 8, tier: "compact", low_memory_mode: true,
-      keep_models_warm: false, recommended_stt: "large-v3-turbo-q5_0",
+      keep_models_warm: false, recommended_stt: "large-v3-q5_0",
       recommended_llm_provider: "builtin", recommended_llm_model: "qwen3-4b-instruct-2507",
       reason: "8 GB Apple Silicon：使用量化語音模型，轉錄後先釋放 STT 再載入 Claro 內建整理模型",
     },
     models: [
-      { id: "large-v3-turbo", label: "Large v3 Turbo", desc: "中英混合品質佳", size_mb: 1549, recommended: false, downloaded: false, active: true, downloading: false },
-      { id: "large-v3-turbo-q5_0", label: "Large v3 Turbo（量化）", desc: "更省記憶體，品質略降", size_mb: 547, recommended: true, downloaded: false, active: false, downloading: false },
-      { id: "small", label: "Small", desc: "輕量、舊機友善", size_mb: 465, recommended: false, downloaded: false, active: false, downloading: false },
+      { id: "qwen3-asr-1.7b-q8_0", label: "Qwen3-ASR 1.7B（預覽）", desc: "新一代短篇多語辨識；台灣真人語料仍在驗證", size_mb: 2084, recommended: false, available: false, preview: true, downloaded: false, active: false, downloading: false },
+      { id: "qwen3-asr-0.6b-q8_0", label: "Qwen3-ASR 0.6B（預覽）", desc: "輕量短篇多語辨識；台灣真人語料仍在驗證", size_mb: 811, recommended: false, available: false, preview: true, downloaded: false, active: false, downloading: false },
+      { id: "large-v3-turbo", label: "Large v3 Turbo", desc: "Whisper 速度與品質的平衡選擇，支援詞彙提示", size_mb: 1549, recommended: false, available: true, preview: false, downloaded: false, active: true, downloading: false },
+      { id: "large-v3-turbo-q5_0", label: "Large v3 Turbo（量化）", desc: "體積只有 1/3、更省記憶體，品質略降", size_mb: 547, recommended: false, available: true, preview: false, downloaded: false, active: false, downloading: false },
+      { id: "large-v3", label: "Large v3", desc: "Whisper 最高辨識品質，支援專有名詞提示", size_mb: 2951, recommended: false, available: true, preview: false, downloaded: false, active: false, downloading: false },
+      { id: "large-v3-q5_0", label: "Large v3（量化）", desc: "接近最高品質的省空間選擇", size_mb: 1031, recommended: true, available: true, preview: false, downloaded: false, active: false, downloading: false },
+      { id: "small", label: "Small", desc: "輕量、舊機友善", size_mb: 465, recommended: false, available: true, preview: false, downloaded: false, active: false, downloading: false },
     ],
     builtin: [
-      { id: "qwen3-4b-instruct-2507", label: "Qwen3 4B Instruct", desc: "中英混排最穩，繁中品質佳", size_mb: 2382, recommended: true, downloaded: false, active: false, downloading: false },
+      { id: "qwen3-4b-instruct-2507", label: "Qwen3 4B Instruct", desc: "中英混排最穩，繁中品質佳", size_mb: 2382, recommended: true, available: true, preview: false, downloaded: false, active: false, downloading: false },
     ],
     contextAudit: null,
     pendingResult: null,
     history: [],
-    dictionary: [{ from: "GBT", to: "GPT" }, { from: "My Torch", to: "PyTorch" }],
+    dictionary: [{ from: "克拉洛", to: "Claro" }],
+  };
+
+  const modelById = (id) => state.models.find((model) => model.id === id);
+  const recommendModel = (id) => {
+    state.models.forEach((model) => { model.recommended = model.id === id; });
+    state.hardware.recommended_stt = id;
   };
 
   if (scenario === "new-16gb-apple") {
@@ -83,21 +93,18 @@ const bridge = String.raw`
       model_approx_mb: 1549, accessibility: true, hotkey_active: true,
       mic_test_passed_this_launch: true,
     });
-    state.models[0].downloaded = true;
-    state.models[0].active = true;
-    state.models[0].recommended = true;
-    state.models[1].active = false;
-    state.models[1].recommended = false;
+    modelById("large-v3-turbo").downloaded = true;
+    recommendModel("large-v3");
     state.appleStatus = 0;
     state.llm.apple_status = 0;
     Object.assign(state.hardware, {
       memory_gb: 16, tier: "balanced", low_memory_mode: false, keep_models_warm: true,
-      recommended_stt: "large-v3-turbo", recommended_llm_provider: "apple",
+      recommended_stt: "large-v3", recommended_llm_provider: "apple",
       reason: "16 GB Apple Silicon：語音模型採 balanced 配置，文字整理交由 macOS 端上模型",
     });
   }
 
-  if (scenario === "ready-organize" || scenario === "history-errors" || scenario === "context-audit" || scenario === "history-off-pending") {
+  if (scenario === "accuracy-upgrade" || scenario === "accuracy-no-downgrade" || scenario === "ready-organize" || scenario === "history-errors" || scenario === "context-audit" || scenario === "history-off-pending") {
     Object.assign(state.status, {
       model_present: true, accessibility: true, hotkey_active: true, setup_completed: true,
       successful_pastes_this_launch: 3, mic_test_passed_this_launch: true,
@@ -109,7 +116,13 @@ const bridge = String.raw`
       effective_mode: "organize", execution_location: "on_device", blocked_reason: null,
       organize_consent_valid: true,
     });
-    state.models[0].downloaded = true;
+    modelById("large-v3-turbo").downloaded = true;
+    recommendModel("large-v3");
+    Object.assign(state.hardware, {
+      memory_gb: 16, tier: "balanced", low_memory_mode: false, keep_models_warm: true,
+      recommended_stt: "large-v3",
+      reason: "16 GB Apple Silicon：完整語音模型以辨識精準度為優先",
+    });
     state.builtin[0].downloaded = true;
     state.builtin[0].active = true;
     state.contextAudit = {
@@ -120,6 +133,20 @@ const bridge = String.raw`
       { ts: "2026-07-12T09:42:00+08:00", duration_s: 8.4, raw: "先說結論明天不上線原因是測試尚未完成", text: "原因是測試尚未完成。先說結論，明天不上線。", status: "pasted", timings: { stt_ms: 680, polish_ms: 2200 }, polish: { mode: "organize", provider: "builtin", changed: true, outcome: "changed" } },
       { ts: "2026-07-12T09:35:00+08:00", duration_s: 3.1, raw: "用 PyTorch 跑 training", text: "用 PyTorch 跑 training。", status: "pasted", timings: { stt_ms: 710, polish_ms: 900 }, polish: { mode: "clean", provider: "builtin", changed: true, outcome: "changed" } },
     ];
+  }
+
+  // 模擬先前版本已下載、後來因驗收不足而暫停開放的預覽模型。
+  if (scenario === "accuracy-upgrade") {
+    modelById("qwen3-asr-0.6b-q8_0").downloaded = true;
+  }
+
+  if (scenario === "accuracy-no-downgrade") {
+    recommendModel("large-v3-turbo-q5_0");
+    Object.assign(state.hardware, {
+      architecture: "x86_64", memory_gb: 16, tier: "compact", low_memory_mode: true,
+      keep_models_warm: false, recommended_stt: "large-v3-turbo-q5_0",
+      reason: "16 GB Intel：使用省記憶體語音模型",
+    });
   }
 
   if (scenario === "history-errors") {
@@ -207,9 +234,10 @@ const bridge = String.raw`
         emit("mic-level", { active: false, level: 0, generation: micGeneration, passed: false, timed_out: false });
         return null;
       case "set_model":
-        state.models.forEach((model) => { model.active = model.id === args.id; });
         {
         const selected = state.models.find((model) => model.id === args.id);
+        if (!selected?.available) throw new Error("此模型仍在驗證中，尚未開放使用");
+        state.models.forEach((model) => { model.active = model.id === args.id; });
         state.status.model_id = args.id;
         state.status.model_label = selected?.label || args.id;
         state.status.model_approx_mb = selected?.size_mb || 0;
@@ -218,13 +246,14 @@ const bridge = String.raw`
         return null;
       case "download_model": {
         if (activeDownload) throw new Error("已有 " + activeDownload + " 模型正在下載");
-        activeDownload = "STT";
         const model = state.models.find((item) => item.id === args.id);
-        setTimeout(() => emit("model-download", { model_id: args.id, downloaded_mb: 128, total_mb: model.size_mb, done: false, error: null }), 20);
+        if (!model?.available) throw new Error("此模型仍在驗證中，尚未開放下載");
+        activeDownload = "STT";
+        setTimeout(() => emit("model-download", { model_id: args.id, downloaded_mb: 128, total_mb: model.size_mb, done: false, downloaded: false, activation_status: "none", error: null }), 20);
         setTimeout(() => {
           if (failDownloads) {
             activeDownload = null;
-            emit("model-download", { model_id: args.id, downloaded_mb: 128, total_mb: model.size_mb, done: false, error: "網路連線中斷" });
+            emit("model-download", { model_id: args.id, downloaded_mb: 128, total_mb: model.size_mb, done: false, downloaded: false, activation_status: "none", error: "網路連線中斷" });
             return;
           }
           model.downloaded = true;
@@ -236,8 +265,14 @@ const bridge = String.raw`
           }
           activeDownload = null;
           state.status.model_present = model.active;
-          emit("model-download", { model_id: args.id, downloaded_mb: model.size_mb, total_mb: model.size_mb, done: true, error: null });
+          emit("model-download", { model_id: args.id, downloaded_mb: model.size_mb, total_mb: model.size_mb, done: true, downloaded: true, activation_status: "none", error: null });
         }, 120);
+        return null;
+      }
+      case "delete_model": {
+        const model = state.models.find((item) => item.id === args.id);
+        if (model?.active) throw new Error("使用中的模型不能刪除，先切換到其他模型");
+        if (model) model.downloaded = false;
         return null;
       }
       case "set_llm_config":
@@ -272,11 +307,11 @@ const bridge = String.raw`
       case "download_builtin_llm":
         if (activeDownload) throw new Error("已有 " + activeDownload + " 模型正在下載");
         activeDownload = "LLM";
-        setTimeout(() => emit("llm-model-download", { model_id: args.id, downloaded_mb: 256, total_mb: 2382, done: false, error: null }), 20);
+        setTimeout(() => emit("llm-model-download", { model_id: args.id, downloaded_mb: 256, total_mb: 2382, done: false, downloaded: false, activation_status: "none", error: null }), 20);
         setTimeout(() => {
           if (failDownloads) {
             activeDownload = null;
-            emit("llm-model-download", { model_id: args.id, downloaded_mb: 256, total_mb: 2382, done: false, error: "網路連線中斷" });
+            emit("llm-model-download", { model_id: args.id, downloaded_mb: 256, total_mb: 2382, done: false, downloaded: false, activation_status: "none", error: "網路連線中斷" });
             return;
           }
           state.builtin[0].downloaded = true;
@@ -285,7 +320,7 @@ const bridge = String.raw`
           state.llm.blocked_reason = null;
           state.llm.effective_mode = state.llm.polish_mode;
           syncLlm();
-          emit("llm-model-download", { model_id: args.id, downloaded_mb: 2382, total_mb: 2382, done: true, error: null });
+          emit("llm-model-download", { model_id: args.id, downloaded_mb: 2382, total_mb: 2382, done: true, downloaded: true, activation_status: "none", error: null });
         }, 120);
         return null;
       case "set_local_only":

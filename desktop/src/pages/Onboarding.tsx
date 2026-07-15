@@ -59,7 +59,18 @@ export default function Onboarding({
       .finally(() => setModelsLoading(false));
   }, []);
 
-  useEffect(() => loadModels(), [loadModels, progress?.model_id, progress?.done, status.model_id]);
+  useEffect(
+    () => loadModels(),
+    [
+      loadModels,
+      progress?.model_id,
+      progress?.done,
+      progress?.downloaded,
+      progress?.activation_status,
+      progress?.error,
+      status.model_id,
+    ],
+  );
 
   const loadPolish = useCallback(() => {
     setPolishLoading(true);
@@ -117,7 +128,9 @@ export default function Onboarding({
   const recommendedBuiltin =
     builtinLlms.find((model) => model.id === hardware?.recommended_llm_model) ?? builtinLlms[0];
   const onboardingModel =
-    models.find((model) => model.recommended) ?? models.find((model) => model.active) ?? models[0];
+    models.find((model) => model.recommended && model.available) ??
+    models.find((model) => model.active && model.available) ??
+    models.find((model) => model.available);
 
   const run = (command: string, args?: Record<string, unknown>, success?: string) => {
     setError(null);
@@ -282,7 +295,9 @@ export default function Onboarding({
             <div className="setup-model-list">
               {hardware && <div className="setup-inline-state">已依這台 Mac 的 {hardware.memory_gb} GB 記憶體選好推薦方案。</div>}
               {(onboardingModel ? [onboardingModel] : []).map((model) => {
-                const downloadError = progress?.model_id === model.id ? progress.error : null;
+                const activationStatus = progress?.model_id === model.id ? progress.activation_status : "none";
+                const activationPending = activationStatus !== "none";
+                const downloadError = progress?.model_id === model.id && !activationPending ? progress.error : null;
                 const downloading = progress?.model_id === model.id && !progress.done && !progress.error;
                 const percent = downloading && progress.total_mb
                   ? Math.min(100, (progress.downloaded_mb / progress.total_mb) * 100)
@@ -308,6 +323,13 @@ export default function Onboarding({
                       {downloadError && (
                         <div className="config-error mt-2" role="alert">
                           下載中斷：{downloadError}。再次按下會從已完成的位置續傳。
+                        </div>
+                      )}
+                      {activationPending && (
+                        <div className="setup-inline-state" role="status">
+                          {activationStatus === "waiting_for_idle"
+                            ? "已下載完成；本次聽寫結束後，請按「使用」切換。"
+                            : `已下載完成，但切換失敗：${progress?.error ?? "未知錯誤"}。請按「使用」重試。`}
                         </div>
                       )}
                     </div>

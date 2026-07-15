@@ -39,9 +39,7 @@ pub fn clean_transcript(text: &str) -> String {
         let prev = out.chars().last();
         let next = chars.get(j).copied();
         let drop_space = match (prev, next) {
-            (Some(p), Some(n)) => {
-                (is_cjk(p) && is_cjk(n)) || is_cjk_punct(n) || is_cjk_punct(p)
-            }
+            (Some(p), Some(n)) => (is_cjk(p) && is_cjk(n)) || is_cjk_punct(n) || is_cjk_punct(p),
             _ => true, // 頭尾空白
         };
         if !drop_space {
@@ -54,33 +52,43 @@ pub fn clean_transcript(text: &str) -> String {
 
 /// 個人字典替換（寬鬆匹配）：忽略大小寫；條目裡的空白可對應文本中零或多個
 /// 空白——Whisper 對 CJK 夾雜的英文詞常把 "My Torch" 黏成 "MyTorch"，
-/// 字面比對會漏掉（實測踩到）。匹配到的字串全小寫時，替換值也轉小寫
-/// （沿用 prototype `_apply_dict` 的兩態行為）。
+/// 字面比對會漏掉（實測踩到）。
+///
+/// 全程只掃描原始文本一次，避免某條替換結果再次觸發後續條目；同位置有重疊時
+/// 優先採用覆蓋較長原文的條目。ASCII 英數邊緣需落在 token boundary，避免
+/// `GBT` 誤改 `XGBT2`。替換值永遠使用使用者指定的原始大小寫。
 pub fn apply_dict(text: &str, dict: &[(String, String)]) -> String {
-    let mut t = text.to_string();
-    for (wrong, right) in dict {
-        t = replace_loose(&t, wrong, right);
-    }
-    t
-}
-
-fn replace_loose(text: &str, key: &str, right: &str) -> String {
-    let kc: Vec<char> = key.trim().chars().collect();
-    if kc.is_empty() {
+    let entries: Vec<(Vec<char>, &str)> = dict
+        .iter()
+        .filter_map(|(wrong, right)| {
+            let key: Vec<char> = wrong.trim().chars().collect();
+            (!key.is_empty()).then_some((key, right.as_str()))
+        })
+        .collect();
+    if entries.is_empty() {
         return text.to_string();
     }
+
     let tc: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < tc.len() {
-        match match_loose_at(&tc, i, &kc) {
-            Some(end) => {
-                let all_lower = tc[i..end].iter().all(|c| !c.is_uppercase());
-                if all_lower {
-                    out.push_str(&right.to_lowercase());
-                } else {
-                    out.push_str(right);
+        let mut best: Option<(usize, &str)> = None;
+        for (key, right) in &entries {
+            if let Some(end) = match_loose_at(&tc, i, key) {
+                if !has_ascii_token_boundaries(&tc, i, end, key) {
+                    continue;
                 }
+                // 較長匹配優先；同長度保留字典原順序，結果可預測。
+                if best.map(|(best_end, _)| end > best_end).unwrap_or(true) {
+                    best = Some((end, *right));
+                }
+            }
+        }
+
+        match best {
+            Some((end, right)) => {
+                out.push_str(right);
                 i = end;
             }
             None => {
@@ -90,6 +98,24 @@ fn replace_loose(text: &str, key: &str, right: &str) -> String {
         }
     }
     out
+}
+
+fn is_ascii_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// 純 ASCII 且含英數的 key，對應原文必須位於 ASCII token 邊界。
+/// CJK／混合語言條目不加邊界限制，維持既有可在連續中文字串內替換的行為。
+fn has_ascii_token_boundaries(text: &[char], start: usize, end: usize, key: &[char]) -> bool {
+    let ascii_key =
+        key.iter().all(|c| c.is_ascii()) && key.iter().any(|c| c.is_ascii_alphanumeric());
+    if !ascii_key {
+        return true;
+    }
+
+    let left_ok = start == 0 || !is_ascii_token_char(text[start - 1]);
+    let right_ok = end == text.len() || !is_ascii_token_char(text[end]);
+    left_ok && right_ok
 }
 
 /// 從 tc[start] 起嘗試匹配 key：key 的空白 → 文本零或多個空白；其餘字元不分大小寫。
@@ -112,10 +138,7 @@ fn match_loose_at(tc: &[char], start: usize, kc: &[char]) -> Option<usize> {
 }
 
 pub fn default_dict() -> Vec<(String, String)> {
-    vec![
-        ("GBT".into(), "GPT".into()),
-        ("My Torch".into(), "PyTorch".into()),
-    ]
+    Vec::new()
 }
 
 /// CJK 標點正規化：緊跟在 CJK 字後的半形標點 → 全形（Whisper 常吐半形逗號）。
@@ -128,8 +151,10 @@ pub fn normalize_cjk_punct(text: &str) -> String {
         let mapped = match c {
             ',' | '.' | '?' | '!' | ';' | ':' => {
                 let prev_cjk = i > 0 && is_cjk(chars[i - 1]);
-                let next_ascii_alnum =
-                    chars.get(i + 1).map(|n| n.is_ascii_alphanumeric()).unwrap_or(false);
+                let next_ascii_alnum = chars
+                    .get(i + 1)
+                    .map(|n| n.is_ascii_alphanumeric())
+                    .unwrap_or(false);
                 if prev_cjk && !next_ascii_alnum {
                     match c {
                         ',' => '，',
@@ -194,25 +219,75 @@ mod tests {
     }
 
     #[test]
+    fn default_dictionary_is_empty() {
+        assert!(default_dict().is_empty());
+    }
+
+    #[test]
     fn dict_replaces_both_cases() {
-        let d = default_dict();
+        let d = vec![
+            ("GBT".into(), "GPT".into()),
+            ("My Torch".into(), "PyTorch".into()),
+        ];
         assert_eq!(apply_dict("我用 GBT 寫 code", &d), "我用 GPT 寫 code");
-        assert_eq!(apply_dict("gbt 很好用", &d), "gpt 很好用");
+        assert_eq!(apply_dict("gbt 很好用", &d), "GPT 很好用");
         assert_eq!(apply_dict("My Torch 訓練", &d), "PyTorch 訓練");
     }
 
     // Whisper 把 CJK 夾雜的英文詞黏起來或改大小寫時仍要命中（transcribe_file 實測踩到）
     #[test]
     fn dict_matches_spaceless_and_mixed_case() {
-        let d = default_dict();
+        let d = vec![
+            ("GBT".into(), "GPT".into()),
+            ("My Torch".into(), "PyTorch".into()),
+        ];
         assert_eq!(apply_dict("我們用MyTorch跑訓練", &d), "我們用PyTorch跑訓練");
-        assert_eq!(apply_dict("用 my  torch 跑", &d), "用 pytorch 跑");
+        assert_eq!(apply_dict("用 my  torch 跑", &d), "用 PyTorch 跑");
         assert_eq!(apply_dict("Gbt 也可以", &d), "GPT 也可以");
     }
 
     #[test]
+    fn dict_preserves_canonical_case_and_ascii_token_boundaries() {
+        let d = vec![
+            ("gbt".into(), "GPT".into()),
+            ("my torch".into(), "PyTorch".into()),
+        ];
+        assert_eq!(
+            apply_dict("gbt GBT2 XGBT gbt_name (GbT)", &d),
+            "GPT GBT2 XGBT gbt_name (GPT)"
+        );
+        assert_eq!(apply_dict("MyTorch NotMyTorch", &d), "PyTorch NotMyTorch");
+
+        let punct = vec![("C++".into(), "cpp".into())];
+        assert_eq!(apply_dict("C++ C++20 XC++", &punct), "cpp C++20 XC++");
+    }
+
+    #[test]
+    fn dict_uses_longest_overlap_and_does_not_cascade() {
+        let overlap = vec![
+            ("GPT".into(), "short".into()),
+            ("GPT-4".into(), "GPT-4o".into()),
+        ];
+        assert_eq!(apply_dict("GPT-4 and GPT", &overlap), "GPT-4o and short");
+        let reversed: Vec<_> = overlap.into_iter().rev().collect();
+        assert_eq!(apply_dict("GPT-4 and GPT", &reversed), "GPT-4o and short");
+
+        let cascade = vec![("GBT".into(), "GPT".into()), ("GPT".into(), "wrong".into())];
+        assert_eq!(apply_dict("GBT", &cascade), "GPT");
+    }
+
+    #[test]
+    fn dict_keeps_cjk_substring_matching() {
+        let d = vec![("蘋果".into(), "Apple".into())];
+        assert_eq!(apply_dict("紅蘋果汁", &d), "紅Apple汁");
+    }
+
+    #[test]
     fn punct_normalizes_after_cjk() {
-        assert_eq!(normalize_cjk_punct("今天天氣很好,我們來測試."), "今天天氣很好，我們來測試。");
+        assert_eq!(
+            normalize_cjk_punct("今天天氣很好,我們來測試."),
+            "今天天氣很好，我們來測試。"
+        );
         assert_eq!(normalize_cjk_punct("真的嗎?太好了!"), "真的嗎？太好了！");
     }
 
@@ -220,14 +295,23 @@ mod tests {
     fn punct_leaves_ascii_context_alone() {
         assert_eq!(normalize_cjk_punct("圓周率是3.14"), "圓周率是3.14");
         assert_eq!(normalize_cjk_punct("run test,ing now"), "run test,ing now");
-        assert_eq!(normalize_cjk_punct("網址是 example.com"), "網址是 example.com");
+        assert_eq!(
+            normalize_cjk_punct("網址是 example.com"),
+            "網址是 example.com"
+        );
         // 前一字非 CJK → 不動
-        assert_eq!(normalize_cjk_punct("用 PyTorch, 跑訓練"), "用 PyTorch, 跑訓練");
+        assert_eq!(
+            normalize_cjk_punct("用 PyTorch, 跑訓練"),
+            "用 PyTorch, 跑訓練"
+        );
     }
 
     #[test]
     fn punct_converts_at_end_of_cjk_sentence_before_space() {
-        assert_eq!(normalize_cjk_punct("先做這個, 再做那個"), "先做這個， 再做那個");
+        assert_eq!(
+            normalize_cjk_punct("先做這個, 再做那個"),
+            "先做這個， 再做那個"
+        );
     }
 
     #[test]

@@ -15,6 +15,11 @@ pub const TARGET_RATE: u32 = 16_000;
 pub const MIN_DURATION_S: f64 = 0.3;
 pub const SILENCE_RMS: f32 = 0.01;
 pub const MAX_RECORDING_S: f64 = 300.0;
+/// 使用者放開熱鍵後仍保留一小段尾音，避免最後一個音節被硬切掉。
+///
+/// 延遲只發生在持有 cpal stream 的錄音執行緒；音訊 callback 不會 sleep，
+/// channel 非正常斷線時也會立刻關閉 stream，避免退出流程被額外拖慢。
+pub const POST_ROLL: Duration = Duration::from_millis(200);
 
 // ─── 純函數（可測） ───────────────────────────────────────────────────────────
 
@@ -108,7 +113,7 @@ impl AtomicLevel {
 }
 
 pub struct CaptureHandle {
-    stop_tx: Sender<()>,
+    stop_tx: Sender<bool>,
     join: JoinHandle<Result<Vec<f32>>>,
     level: Arc<AtomicLevel>,
     started: Instant,
@@ -131,7 +136,16 @@ impl CaptureHandle {
 
     /// 停止並取回 16kHz mono 音訊（未 normalize、未 validate——由 pipeline 決定）
     pub fn stop(self) -> Result<Vec<f32>> {
-        let _ = self.stop_tx.send(());
+        self.finish(true)
+    }
+
+    /// 取消、切換裝置或退出時立即關閉，不為已作廢的錄音多留尾音。
+    pub fn stop_immediately(self) -> Result<Vec<f32>> {
+        self.finish(false)
+    }
+
+    fn finish(self, keep_post_roll: bool) -> Result<Vec<f32>> {
+        let _ = self.stop_tx.send(keep_post_roll);
         self.join
             .join()
             .map_err(|_| anyhow!("audio thread panicked"))?
@@ -163,10 +177,18 @@ fn pick_device(host: &cpal::Host, preferred: Option<&str>) -> Option<cpal::Devic
     host.default_input_device()
 }
 
+fn post_roll_duration(keep_post_roll: bool) -> Duration {
+    if keep_post_roll {
+        POST_ROLL
+    } else {
+        Duration::ZERO
+    }
+}
+
 /// 開始錄音：專屬執行緒持有 cpal stream，收 mono 原生率樣本；
 /// stop() 後重採樣到 16k 返回。preferred_device 找不到時退回系統預設。
 pub fn start_capture(preferred_device: Option<String>) -> Result<CaptureHandle> {
-    let (stop_tx, stop_rx) = bounded::<()>(1);
+    let (stop_tx, stop_rx) = bounded::<bool>(1);
     let (ready_tx, ready_rx) = bounded::<Result<()>>(1);
     let level = Arc::new(AtomicLevel::default());
     let level_thread = level.clone();
@@ -227,8 +249,13 @@ pub fn start_capture(preferred_device: Option<String>) -> Result<CaptureHandle> 
         stream.play().context("start stream")?;
         let _ = ready_tx.send(Ok(()));
 
-        // 等 stop 訊號（錄音上限由 pipeline 的 watchdog 送 force_stop 事件處理）
-        let _ = stop_rx.recv();
+        // 等 stop 訊號（錄音上限由 pipeline 的 watchdog 送 force_stop 事件處理）。
+        // 收到明確 stop 後，錄音執行緒繼續讓 callback 收 200ms 尾音再關 stream；
+        // 這不阻塞 cpal callback。若 sender 非預期被丟棄則立刻關閉，方便退出。
+        let delay = post_roll_duration(stop_rx.recv().unwrap_or(false));
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         drop(stream);
 
         let native: Vec<f32> = std::mem::take(&mut *samples.lock().unwrap());
@@ -380,5 +407,12 @@ mod tests {
         let src = vec![0.1f32; 1600];
         let out = resample_to_16k(&src, 16_000).unwrap();
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn explicit_stop_keeps_bounded_post_roll_but_disconnect_does_not() {
+        let delay = post_roll_duration(true);
+        assert!((180..=220).contains(&delay.as_millis()));
+        assert_eq!(post_roll_duration(false), Duration::ZERO);
     }
 }
