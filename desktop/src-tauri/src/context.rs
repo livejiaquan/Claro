@@ -500,19 +500,19 @@ mod macos {
             if let Some(value) =
                 attr_string_before(&elements.window, attr, deadline).filter(|s| !s.is_empty())
             {
-                window_parts.push(value);
+                window_parts.push(format!("{attr}={value}"));
                 window_discriminating = true;
             }
         }
         if std::time::Instant::now() < deadline {
             if let Some(point) = attr_point(&elements.window, "AXPosition") {
-                window_parts.push(format!("{:.1},{:.1}", point.x, point.y));
+                window_parts.push(format!("AXPosition={:.1},{:.1}", point.x, point.y));
                 window_discriminating = true;
             }
         }
         if std::time::Instant::now() < deadline {
             if let Some(size) = attr_size(&elements.window, "AXSize") {
-                window_parts.push(format!("{:.1},{:.1}", size.width, size.height));
+                window_parts.push(format!("AXSize={:.1},{:.1}", size.width, size.height));
                 window_discriminating = true;
             }
         }
@@ -520,7 +520,7 @@ mod macos {
             if let Some(value) =
                 attr_string_before(&elements.window, attr, deadline).filter(|s| !s.is_empty())
             {
-                window_parts.push(value);
+                window_parts.push(format!("{attr}={value}"));
             }
         }
 
@@ -530,19 +530,19 @@ mod macos {
             if let Some(value) =
                 attr_string_before(&elements.focused, attr, deadline).filter(|s| !s.is_empty())
             {
-                focus_parts.push(value);
+                focus_parts.push(format!("{attr}={value}"));
                 focus_discriminating = true;
             }
         }
         if std::time::Instant::now() < deadline {
             if let Some(point) = attr_point(&elements.focused, "AXPosition") {
-                focus_parts.push(format!("{:.1},{:.1}", point.x, point.y));
+                focus_parts.push(format!("AXPosition={:.1},{:.1}", point.x, point.y));
                 focus_discriminating = true;
             }
         }
         if std::time::Instant::now() < deadline {
             if let Some(size) = attr_size(&elements.focused, "AXSize") {
-                focus_parts.push(format!("{:.1},{:.1}", size.width, size.height));
+                focus_parts.push(format!("AXSize={:.1},{:.1}", size.width, size.height));
                 focus_discriminating = true;
             }
         }
@@ -550,7 +550,7 @@ mod macos {
             if let Some(value) =
                 attr_string_before(&elements.focused, attr, deadline).filter(|s| !s.is_empty())
             {
-                focus_parts.push(value);
+                focus_parts.push(format!("{attr}={value}"));
                 focus_discriminating = true;
             }
         }
@@ -558,7 +558,7 @@ mod macos {
             if let Some(value) =
                 attr_string_before(&elements.focused, attr, deadline).filter(|s| !s.is_empty())
             {
-                focus_parts.push(value);
+                focus_parts.push(format!("{attr}={value}"));
             }
         }
 
@@ -691,6 +691,45 @@ mod macos {
 
     /// 讀字串屬性，但先用 CFStringGetLength 檢查長度——超過上限直接放棄，
     /// 不為巨大文件（AXValue 可能是整份內容）做整串複製。
+    /// 安全欄位判定（fail-closed，review 發現）：只有 subrole「確定沒有值」
+    /// （NoValue／AttributeUnsupported——一般元素的常態）才視為非安全；
+    /// 讀到 AXSecureTextField 當然是安全欄位；逾時、CannotComplete、無效
+    /// 元素等其他錯誤一律**當成安全欄位**——密碼欄的 subrole 暫時讀不到時
+    /// 絕不能 fail-open 去讀 AXValue。
+    fn secure_or_unknown(el: &Owned, deadline: std::time::Instant) -> bool {
+        if std::time::Instant::now() >= deadline {
+            return true; // 時間耗盡＝未知＝當安全欄位跳過
+        }
+        const AX_ERROR_NO_VALUE: i32 = -25212;
+        const AX_ERROR_ATTRIBUTE_UNSUPPORTED: i32 = -25205;
+        let attr = CFString::new("AXSubrole");
+        let mut out: CFTypeRef = std::ptr::null();
+        let err =
+            unsafe { AXUIElementCopyAttributeValue(el.0, attr.as_concrete_TypeRef(), &mut out) };
+        match err {
+            0 => {
+                if out.is_null() {
+                    return false;
+                }
+                let owned = Owned(out);
+                // 非字串或轉換失敗＝未知＝當安全欄位
+                attr_owned_string(&owned).is_none_or(|s| s == "AXSecureTextField")
+            }
+            AX_ERROR_NO_VALUE | AX_ERROR_ATTRIBUTE_UNSUPPORTED => false,
+            _ => true,
+        }
+    }
+
+    fn attr_owned_string(v: &Owned) -> Option<String> {
+        unsafe {
+            if CFGetTypeID(v.0) != CFString::type_id() {
+                return None;
+            }
+            let s = CFString::wrap_under_get_rule(v.0 as CFStringRef);
+            Some(s.to_string())
+        }
+    }
+
     fn attr_string_capped(el: &Owned, name: &str, max_chars: usize) -> Option<String> {
         let v = copy_attr(el, name)?;
         unsafe {
@@ -715,7 +754,10 @@ mod macos {
                 return Vec::new();
             }
             let arr = v.0 as core_foundation::array::CFArrayRef;
-            let n = CFArrayGetCount(arr);
+            // 單一 container 可能回報數萬 children（瀏覽器/大型文件），全 retain
+            // 會在 400 節點預算外偷跑大量工作（review 發現）——BFS 反正只處理
+            // 前 400 節點，這裡就先掐
+            let n = CFArrayGetCount(arr).min(400);
             (0..n)
                 .filter_map(|i| {
                     let item = CFArrayGetValueAtIndex(arr, i) as CFTypeRef;
@@ -799,9 +841,13 @@ mod macos {
                     role.as_str(),
                     "AXStaticText" | "AXTextField" | "AXTextArea" | "AXHeading"
                 ) {
-                    let secure = attr_string_before(&el, "AXSubrole", deadline)
-                        .is_some_and(|s| s == "AXSecureTextField");
-                    if !secure {
+                    let secure = secure_or_unknown(&el, deadline);
+                    if secure {
+                        // 安全（或無法判定）欄位：不讀文字，也不下探 children——
+                        // 有些 AX provider 會把內容以 child AXStaticText 暴露
+                        continue;
+                    }
+                    {
                         for attr in ["AXValue", "AXTitle"] {
                             if std::time::Instant::now() >= deadline {
                                 break;
@@ -889,12 +935,12 @@ mod macos {
         }
 
         if std::time::Instant::now() < deadline {
-            // 隱私鐵律：密碼欄（role 或 subrole 是 AXSecureTextField）整塊跳過
-            let role =
-                attr_string_before(&elements.focused, "AXRole", deadline).unwrap_or_default();
-            let subrole =
-                attr_string_before(&elements.focused, "AXSubrole", deadline).unwrap_or_default();
-            if role != "AXSecureTextField" && subrole != "AXSecureTextField" {
+            // 隱私鐵律：密碼欄（role 或 subrole 是 AXSecureTextField）整塊跳過。
+            // fail-closed（review 發現）：role 讀不到＝未知元素、subrole 讀取
+            // 錯誤＝未知——都不准 fail-open 去讀 AXValue
+            let role_known_safe = attr_string_before(&elements.focused, "AXRole", deadline)
+                .is_some_and(|r| r != "AXSecureTextField");
+            if role_known_safe && !secure_or_unknown(&elements.focused, deadline) {
                 // 20 萬字上限：焦點若在整份大型文件，值太大直接放棄（不整串複製）
                 if std::time::Instant::now() < deadline {
                     if let Some(value) = attr_string_capped(&elements.focused, "AXValue", 200_000) {
@@ -907,11 +953,16 @@ mod macos {
                         }
                     }
                 }
-                if let Some(sel) = attr_string_before(&elements.focused, "AXSelectedText", deadline)
-                {
-                    let sel = sel.trim();
-                    if !sel.is_empty() {
-                        parts.push(format!("Selected: {}", truncate_chars(sel, 200)));
+                // 上限先掐在 AX 轉換層（review 發現：選取幾十萬字會整段複製
+                // 進來才截 200 字，延遲與記憶體都失控）；4k 字已遠超顯示需求
+                if std::time::Instant::now() < deadline {
+                    if let Some(sel) =
+                        attr_string_capped(&elements.focused, "AXSelectedText", 4_000)
+                    {
+                        let sel = sel.trim();
+                        if !sel.is_empty() {
+                            parts.push(format!("Selected: {}", truncate_chars(sel, 200)));
+                        }
                     }
                 }
             }
