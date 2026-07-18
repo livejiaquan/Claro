@@ -299,6 +299,8 @@ export default function Onboarding({
                 const activationPending = activationStatus !== "none";
                 const downloadError = progress?.model_id === model.id && !activationPending ? progress.error : null;
                 const downloading = progress?.model_id === model.id && !progress.done && !progress.error;
+                // 後端清單的 downloading 為真值：事件還沒到也不能把「下載」按鈕放出來
+                const downloadActive = downloading || model.downloading;
                 const percent = downloading && progress.total_mb
                   ? Math.min(100, (progress.downloaded_mb / progress.total_mb) * 100)
                   : null;
@@ -332,8 +334,11 @@ export default function Onboarding({
                             : `已下載完成，但切換失敗：${progress?.error ?? "未知錯誤"}。請按「使用」重試。`}
                         </div>
                       )}
+                      {!downloading && downloadActive && (
+                        <div className="setup-inline-state" role="status">下載進行中…</div>
+                      )}
                     </div>
-                    {!model.downloaded && !downloading && (
+                    {!model.downloaded && !downloadActive && (
                       <button className="btn no-drag" onClick={() => run("download_model", { id: model.id, activate: true })}>
                         {downloadError ? "重試並續傳" : "下載並使用"}
                       </button>

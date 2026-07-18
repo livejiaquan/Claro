@@ -178,6 +178,10 @@ export default function Settings({
   const llmRef = useRef<ResolvedLlmConfig | null>(null);
   llmRef.current = llm;
   const llmSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
+  // 第三道防線（review 發現）：佇列中「較舊請求」的後端回應不能落地——
+  // 快速連續輸入時，第一個字元的回應會把畫面與 llmRef 倒退成舊前綴，
+  // 後續字元再從舊值 merge，最終覆蓋掉完整的新值
+  const llmSaveSeq = useRef(0);
   const saveLlm = (next: Partial<ResolvedLlmConfig>, confirmed = false) => {
     const cur = llmRef.current;
     if (!cur) return;
@@ -185,6 +189,7 @@ export default function Settings({
     llmRef.current = merged;
     setLlm(merged);
     setTestResult(null);
+    const seq = ++llmSaveSeq.current;
     llmSaveQueue.current = llmSaveQueue.current.then(() =>
       invoke<LlmConfig | null>("set_llm_config", {
         provider: merged.provider,
@@ -193,8 +198,10 @@ export default function Settings({
         confirmed,
       })
         .then((updated) => {
-          if (updated) setLlm(resolveLlmConfig(updated));
-          else loadLlm();
+          if (seq === llmSaveSeq.current) {
+            if (updated) setLlm(resolveLlmConfig(updated));
+            else loadLlm();
+          }
           if (confirmed) {
             setConfirmCloud(false);
             onToast("已確認此雲端端點");
@@ -202,7 +209,7 @@ export default function Settings({
         })
         .catch((e) => {
           setError(String(e));
-          loadLlm();
+          if (seq === llmSaveSeq.current) loadLlm();
         }),
     );
   };
@@ -377,7 +384,11 @@ export default function Settings({
       <Section title="語音模型">
         {orderedModels.map((m) => {
           const available = m.available === true;
-          const isDownloading = available && progress?.model_id === m.id && !progress.done && !progress.error;
+          // 後端清單的 downloading 是真值：進度事件還沒到（下載剛起步、頁面
+          // 重開）時也要顯示下載中，否則按鈕看似可再按、實際會回「已有下載」
+          const isDownloading =
+            available &&
+            ((progress?.model_id === m.id && !progress.done && !progress.error) || m.downloading);
           const activationStatus = progress?.model_id === m.id ? progress.activation_status : "none";
           const activationPending = activationStatus !== "none";
           const downloadError = progress?.model_id === m.id && !activationPending ? progress.error : null;
@@ -648,7 +659,9 @@ export default function Settings({
         {llm?.provider === "builtin" && (
           <>
             {builtinLlms.map((m) => {
-              const isDownloading = llmProgress?.model_id === m.id && !llmProgress.done && !llmProgress.error;
+              const isDownloading =
+                (llmProgress?.model_id === m.id && !llmProgress.done && !llmProgress.error) ||
+                m.downloading;
               const downloadError = llmProgress?.model_id === m.id ? llmProgress.error : null;
               const pct =
                 isDownloading && llmProgress!.total_mb

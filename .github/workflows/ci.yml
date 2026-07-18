@@ -63,6 +63,8 @@ jobs:
           test -x "$MAIN"
           test -x "$SIDECAR"
           test "$(plutil -extract LSMinimumSystemVersion raw "$APP/Contents/Info.plist")" = "11.0"
+          # 麥克風用途說明必須進最終 bundle——缺了 TCC 會靜默拒絕（終端機啟動繼承權限測不出來）
+          test -n "$(plutil -extract NSMicrophoneUsageDescription raw "$APP/Contents/Info.plist")"
           [[ "$(file "$MAIN")" =~ arm64|x86_64 ]]
           [[ "$(file "$SIDECAR")" =~ arm64|x86_64 ]]
           MAIN_LOAD_COMMANDS="$(otool -l "$MAIN")"
