@@ -452,6 +452,12 @@ fn strip_fillers(text: &str) -> String {
     fn pause_boundary(c: char) -> bool {
         c.is_whitespace() || "，,。.!！？?；;：:\n、".contains(c)
     }
+    // 子句中途的停頓（逗號/頓號/空白）才是填充詞邊界；句號/問號/驚嘆號或
+    // 字串結尾前的「那個」多半是指示代名詞受詞（review 反例「我選 Alpha
+    // 那個。」），不得剝除
+    fn clause_pause(c: char) -> bool {
+        c.is_whitespace() || "，,、；;：:\n".contains(c)
+    }
 
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
@@ -478,8 +484,8 @@ fn strip_fillers(text: &str) -> String {
                 continue;
             }
             let after = cursor + filler.len();
-            let right_boundary = text[after..].chars().next().is_none_or(pause_boundary);
-            if may_attach_right || right_boundary {
+            let right_clause_pause = text[after..].chars().next().is_some_and(clause_pause);
+            if may_attach_right || right_clause_pause {
                 cursor = after;
                 removed = true;
                 break;
@@ -607,7 +613,19 @@ fn reinsert_ambiguous_fillers(source: &str, candidate: &str) -> Option<String> {
         match next_sem {
             Some((_, c)) if c == sc => ci = scan + 1,
             _ if tolerated => {
-                let pos = next_sem.map(|(bp, _)| bp).unwrap_or(norm_candidate.len());
+                // 塞回位置：下一個語意字元前；句尾案例則塞在結尾標點／空白
+                // 之前（「我選 Alpha。」+那個 → 「我選 Alpha那個。」，
+                // 不能落在句號後面）
+                let pos = next_sem.map(|(bp, _)| bp).unwrap_or_else(|| {
+                    let mut end = norm_candidate.len();
+                    for &(bp, c) in cand_chars.iter().rev() {
+                        if is_semantic_content_char(c) {
+                            break;
+                        }
+                        end = bp;
+                    }
+                    end
+                });
                 insertions.push((pos, sc));
             }
             _ => return None,
@@ -638,6 +656,11 @@ fn clean_content_preserved(original: &str, comparison_source: &str, candidate: &
         if !correction_stable_content_preserved(original, candidate) {
             return false;
         }
+        // 已知缺口（review H2-2，暫緩）：multiset 以完整原文為上界，模型若把
+        // 「被撤回的內容」重排復活（寄小王，不對，寄小李 → 寄小李、小王）
+        // 仍會放行。收緊到生效文本或子序列都會誤殺合法改口（clause 偵測會
+        // 過度裁切句首穩定內容、替換內容又允許移位）——正解是重做
+        // correction_scope 的 clause 對齊，需要獨立回合＋fixture 集。
         let original_non_ascii = non_ascii_or_symbol_semantic_chars(original);
         let mut remaining = std::collections::HashMap::new();
         for c in original_non_ascii {

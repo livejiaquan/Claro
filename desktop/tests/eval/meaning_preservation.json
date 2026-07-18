@@ -376,5 +376,13 @@
     "input": "我們用那個跑一下訓練",
     "candidate": "我們用跑一下訓練",
     "accepted": false
+  },
+  {
+    "id": "clean_keeps_sentence_final_demonstrative",
+    "mode": "clean",
+    "input": "我選 Alpha 那個。",
+    "candidate": "我選 Alpha。",
+    "accepted": true,
+    "output": "我選 Alpha那個。"
   }
 ]

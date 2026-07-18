@@ -4,6 +4,14 @@
 
 use std::sync::OnceLock;
 
+fn is_cjk_numeral(c: char) -> bool {
+    matches!(
+        c,
+        '零' | '〇' | '一' | '二' | '兩' | '三' | '四' | '五' | '六' | '七' | '八' | '九' | '十'
+            | '百' | '千' | '萬' | '億'
+    )
+}
+
 fn is_cjk(c: char) -> bool {
     ('\u{4e00}'..='\u{9fff}').contains(&c)
 }
@@ -155,7 +163,13 @@ pub fn normalize_cjk_punct(text: &str) -> String {
                     .get(i + 1)
                     .map(|n| n.is_ascii_alphanumeric())
                     .unwrap_or(false);
-                if prev_cjk && !next_ascii_alnum {
+                // CJK 數字間的半形句點是小數點/版本號（review 反例：
+                // 「三.五」「二.七.一」），不是句尾——保留半形
+                let cjk_decimal = c == '.'
+                    && i > 0
+                    && is_cjk_numeral(chars[i - 1])
+                    && chars.get(i + 1).copied().is_some_and(is_cjk_numeral);
+                if prev_cjk && !next_ascii_alnum && !cjk_decimal {
                     match c {
                         ',' => '，',
                         '.' => '。',
@@ -294,6 +308,11 @@ mod tests {
     #[test]
     fn punct_leaves_ascii_context_alone() {
         assert_eq!(normalize_cjk_punct("圓周率是3.14"), "圓周率是3.14");
+        // CJK 數字間的小數點/版本號不是句尾（review 反例）
+        assert_eq!(normalize_cjk_punct("比例是三.五"), "比例是三.五");
+        assert_eq!(normalize_cjk_punct("版本二.七.一"), "版本二.七.一");
+        // 但 CJK 數字後真正的句尾仍要轉
+        assert_eq!(normalize_cjk_punct("總共有三."), "總共有三。");
         assert_eq!(normalize_cjk_punct("run test,ing now"), "run test,ing now");
         assert_eq!(
             normalize_cjk_punct("網址是 example.com"),
