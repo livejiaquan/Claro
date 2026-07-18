@@ -1,3 +1,10 @@
+/// 程序收尾旗標：RunEvent::Exit 第一步就設起。所有「背景載入模型」的路徑
+/// （STT 預載/回載、LLM 冷生成載入）都必須先看它——否則 exit handler 卸載
+/// 完成後，還在等鎖的背景執行緒會把 Metal 模型又載回來，atexit teardown
+/// 再度 ggml_abort（review 抓到的競態）。
+pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub mod audio;
 pub mod context;
 pub mod hardware;
@@ -466,6 +473,11 @@ fn set_model(id: String, state: tauri::State<AppState>) -> Result<(), String> {
 #[tauri::command]
 fn delete_model(id: String, state: tauri::State<AppState>) -> Result<(), String> {
     let spec = registry::find(&id).ok_or("未知的模型")?;
+    // 與 set_model 的切換交易互斥：切換中 active_model 還沒 commit，
+    // 只看它會誤放行「刪掉正在載入的模型檔」
+    let Some(_switch) = state.core.try_model_switch_gate() else {
+        return Err("模型切換進行中，稍後再刪除".into());
+    };
     if state.core.active_model.lock().unwrap().id == spec.id {
         return Err("使用中的模型不能刪除，先切換到其他模型".into());
     }
@@ -1109,6 +1121,11 @@ fn init_core(app: &tauri::AppHandle) {
         let core = core.clone();
         std::thread::spawn(move || {
             if registry::model_is_verified(spec) {
+                // 校驗（整檔 hash 可能數秒）期間 app 可能已進入收尾——
+                // 這時載入會在 exit handler 卸載後把 Metal 模型又載回來
+                if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
                 if let Err(e) = core.engine.lock().unwrap().load() {
                     tracing::warn!("model preload failed: {e}");
                 }
@@ -1296,6 +1313,8 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => show_main_window(app),
             tauri::RunEvent::Exit => {
+                // 先立旗再卸載：擋住所有還在排隊的背景載入（見 SHUTTING_DOWN 註解）
+                crate::SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
                 if let Some(state) = app.try_state::<AppState>() {
                     state.core.overlay.stop();
                     // 主動釋放 whisper/llama 的 Metal 資源：留給 atexit teardown 會

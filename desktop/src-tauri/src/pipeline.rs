@@ -188,9 +188,20 @@ impl Core {
         *self.stt_last_used.lock().unwrap() = Instant::now();
     }
 
+    /// 模型檔刪除等外部操作用：切換交易進行中時回 None（review 發現：
+    /// set_model 正在載入 B 時 delete_model(B) 只看 active_model 擋不住，
+    /// 會刪掉正在 commit 的模型檔）。拿到 guard 期間切換也進不來。
+    pub fn try_model_switch_gate(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        self.model_switch_gate.try_lock().ok()
+    }
+
     /// 確保 STT 引擎已載入（閒置卸載後的回載）。錄音一開始就在背景先跑，
     /// 載入時間被使用者說話的時間蓋掉。
     pub fn ensure_stt_loaded(&self) {
+        // 收尾中不准回載——exit handler 卸載後又載回會重現 atexit ggml_abort
+        if crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         let mut eng = self.engine.lock().unwrap();
         if !eng.is_loaded() {
             let t = Instant::now();
@@ -440,20 +451,17 @@ fn start_recording(core: &Arc<Core>) {
             std::thread::spawn(move || {
                 let mut force_sent = false;
                 while flag.load(Ordering::SeqCst) {
+                    // overlay socket 可能阻塞/重連（500ms timeout）——絕不能在
+                    // sm 鎖內做 I/O，否則熱鍵 Up/Esc/ForceStop 全排在後面
+                    // （review 發現）。鎖內只判定，送資料在鎖外。
                     let current = {
                         let sm = overlay_core.sm.lock().unwrap();
-                        if sm.session() == session && flag.load(Ordering::SeqCst) {
-                            overlay_core
-                                .overlay
-                                .send(&format!("level {:.4}", level.get()));
-                            true
-                        } else {
-                            false
-                        }
+                        sm.session() == session && flag.load(Ordering::SeqCst)
                     };
                     if !current {
                         break;
                     }
+                    overlay_core.overlay.send(&format!("level {:.4}", level.get()));
                     if !force_sent && started.elapsed().as_secs_f64() > audio::MAX_RECORDING_S {
                         let _ = msg_tx.send(Msg::ForceStop(session));
                         force_sent = true;

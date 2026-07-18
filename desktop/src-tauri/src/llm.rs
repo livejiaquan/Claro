@@ -216,6 +216,11 @@ mod engine {
         // 換模型先 drop 舊的（避免雙駐留峰值），再載新的
         if guard.as_ref().map(|l| l.id.as_str()) != Some(model_id) {
             *guard = None;
+            // 收尾旗標要在拿到 STATE 鎖之後檢查：unload_now/exit 只觀察這把鎖，
+            // 冷生成在 hash/初始化階段不持鎖，先前會在卸載判定後又把模型載回
+            if crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("app shutting down — refusing to load builtin model");
+            }
             let t0 = Instant::now();
             let params = LlamaModelParams::default().with_n_gpu_layers(u32::MAX); // 全層 Metal
             let model = LlamaModel::load_from_file(backend, &path, &params)

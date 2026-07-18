@@ -354,6 +354,12 @@ static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 一次更新多個設定鍵、單次寫回——多鍵設定（如 LLM provider/model/base_url）
 /// 必須原子成組寫入，分次寫會在連續操作時留下混搭的中間狀態。
+///
+/// 落盤走 temp＋rename（review 發現：原本直接 truncate 正式檔，讀者不持
+/// 寫入鎖，truncate 到寫完之間讀到空檔/半份 JSON 會退回預設值——
+/// context_enabled 之類的隱私選項會因此短暫「重新打開」；程序在該窗口
+/// 被 _exit/斷電更會把損壞留到下次啟動）。rename 同目錄是原子的，
+/// 讀者永遠只看到舊完整檔或新完整檔。
 pub fn update_config_keys(path: &Path, pairs: Vec<(String, Value)>) -> anyhow::Result<()> {
     let _g = CONFIG_WRITE_LOCK.lock().unwrap();
     let mut cfg = load_config(path);
@@ -364,16 +370,21 @@ pub fn update_config_keys(path: &Path, pairs: Vec<(String, Value)>) -> anyhow::R
         fs::create_dir_all(dir)?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.set_permissions(fs::Permissions::from_mode(0o600))?;
-    let mut s = serde_json::to_string_pretty(&Value::Object(cfg))?;
-    s.push('\n');
-    f.write_all(s.as_bytes())?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+        let mut s = serde_json::to_string_pretty(&Value::Object(cfg))?;
+        s.push('\n');
+        f.write_all(s.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 

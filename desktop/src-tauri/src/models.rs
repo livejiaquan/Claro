@@ -407,6 +407,22 @@ fn available_space_near(_path: &Path) -> Option<u64> {
     None
 }
 
+/// 每個目的地一把下載互斥（review 發現）：兩個下載同開同一個 `.partial`
+/// 時，A 驗證＋rename 後 B 仍握著同 inode 的 FD 繼續寫，A 之後取 fingerprint
+/// 會把損壞內容綁進 process cache 與 persistent marker。UI 的單槽 guard 只
+/// 擋得住 app 內按鈕，examples／未來的多入口一律在這裡兜底。
+static DOWNLOAD_GATES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn download_gate(dest: &Path) -> Arc<Mutex<()>> {
+    DOWNLOAD_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .entry(dest.to_path_buf())
+        .or_default()
+        .clone()
+}
+
 /// 下載 url 到 dest。支援中斷續傳，完成後強制校驗 sha256。
 /// progress 每 ~1MB 回呼一次。
 pub fn download(
@@ -415,6 +431,8 @@ pub fn download(
     expected_sha256: &str,
     mut progress: impl FnMut(Progress),
 ) -> Result<()> {
+    let gate = download_gate(dest);
+    let _gate = gate.lock().unwrap();
     validate_expected_sha256(expected_sha256)?;
     if dest.exists() {
         let (_, actual) = sha256_stable_file(dest)?;
