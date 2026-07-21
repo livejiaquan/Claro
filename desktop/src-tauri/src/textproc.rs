@@ -191,7 +191,42 @@ pub fn normalize_cjk_punct(text: &str) -> String {
 }
 
 /// OpenCC s2twp：確定性簡轉繁（台灣用語）。初始化失敗時原樣返回（不阻擋聽寫）。
+/// 正體與簡體都合法的字：OpenCC `STCharacters` 中一對多、且候選包含自身者
+/// （「只」→只／隻／祇、「干」→幹／乾／干、「里」→裏／里、「台」→臺／檯／颱／台…）。
+/// 它們單獨出現不足以判定整段是簡體；拿它們當轉換觸發條件會把正體改壞。
+const DUAL_SCRIPT_CHARS: &str = "㐹万丑丰了于云亘仆仇价仿伙余佛佣俊修借僵克党冬准凌几凶出划刮制千升卜占卷厂厘只台叶吁吃合吊同后向周咨咸咽哄唇喂噪回困夫夸奸姜娘它家尸局岩岳巨布帘席干幸广庵弦彩征御志念恤愈愿戚才扎托扣折抵拐挂挨挽据搜斗旋昆暗曲朱朴杆杠杯杰松板极柜栗核梁欲沈沾泛注涂涌淀游漓熏玩璇症皂矩确私秋种筑系胄背胜胡腊腌膻致舍芸苔苹范荐蒙蔑虫蚝蜡蝎表谷跖辟适郁酸采里雕面";
+
+/// 是否含「明確簡體字」（不含雙義字）。
+///
+/// s2twp 的前提是輸入為簡體；對已經是正體的文字硬轉會過度轉換——實測
+/// 「不是只會有一個」→「不是隻會有一個」、「干擾」→「幹擾」、「聯繫」→「聯絡」。
+/// 因此只有偵測到明確簡體字時才做轉換。逐字比對用不帶詞組表的 s2t，
+/// 避免詞組表本身的替換造成誤判。
+fn has_simplified(text: &str) -> bool {
+    static S2T: OnceLock<Option<ferrous_opencc::OpenCC>> = OnceLock::new();
+    let cc = S2T.get_or_init(|| {
+        ferrous_opencc::OpenCC::from_config(ferrous_opencc::config::BuiltinConfig::S2t)
+            .map_err(|e| tracing::warn!("opencc s2t init failed: {e}"))
+            .ok()
+    });
+    let Some(cc) = cc else { return false };
+    let mut buf = [0u8; 4];
+    for c in text.chars() {
+        if !is_cjk(c) || DUAL_SCRIPT_CHARS.contains(c) {
+            continue;
+        }
+        let s: &str = c.encode_utf8(&mut buf);
+        if cc.convert(s) != s {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn to_traditional(text: &str) -> String {
+    if !has_simplified(text) {
+        return text.to_string();
+    }
     static OPENCC: OnceLock<Option<ferrous_opencc::OpenCC>> = OnceLock::new();
     let cc = OPENCC.get_or_init(|| {
         ferrous_opencc::OpenCC::from_config(ferrous_opencc::config::BuiltinConfig::S2twp)
@@ -342,5 +377,35 @@ mod tests {
     #[test]
     fn opencc_leaves_traditional_untouched() {
         assert_eq!(to_traditional("我們用繁體中文"), "我們用繁體中文");
+    }
+
+    /// 迴歸：實際使用中出現過「Figma 不是隻會有一個」——輸入已是正體，
+    /// s2twp 的詞組表仍把「只會」轉成「隻會」。
+    #[test]
+    fn opencc_does_not_over_convert_traditional_text() {
+        assert_eq!(
+            to_traditional("Figma不是只會有一個嗎？"),
+            "Figma不是只會有一個嗎？"
+        );
+        assert_eq!(to_traditional("干擾很嚴重"), "干擾很嚴重");
+        assert_eq!(to_traditional("聯繫我"), "聯繫我");
+        assert_eq!(to_traditional("這一里路"), "這一里路");
+    }
+
+    /// 雙義字不可讓判定器誤以為整段是簡體，但真的有簡體字時仍要轉。
+    #[test]
+    fn has_simplified_ignores_dual_script_chars() {
+        assert!(!has_simplified("只會有一個"));
+        assert!(!has_simplified("干擾"));
+        assert!(!has_simplified("Figma 是什麼"));
+        assert!(has_simplified("这是简体"));
+        assert!(has_simplified("请不吝点赞"));
+    }
+
+    /// LLM 若吐出簡體，終盤仍必須繁化（SPEC D6 的核心保證不能被閘門破壞）。
+    #[test]
+    fn opencc_still_converts_when_simplified_present() {
+        assert_eq!(to_traditional("重点是当成一个"), "重點是當成一個");
+        assert_eq!(to_traditional("这个软件"), "這個軟體");
     }
 }
