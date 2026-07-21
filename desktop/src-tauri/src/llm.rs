@@ -309,9 +309,21 @@ mod engine {
             ctx.decode(&mut batch).context("decode step")?;
         }
         require_complete_generation(reached_eog)?;
-        let out = model
-            .tokens_to_str(&generated, Special::Plaintext)
-            .context("detokenize output")?;
+        // llama-cpp-2 的 tokens_to_str 對每個 token 只給固定 8 bytes 緩衝且不重試，
+        // 只要有一個 token 超過 8 bytes 就整串失敗。Qwen 詞彙表常把多個中文字併成
+        // 一個 token（3 個中文字就是 9 bytes），因此中文輸出幾乎必然踩雷——實測
+        // 使用者的聽寫穩定回報 `detokenize output`。改用會自動擴充緩衝的
+        // token_to_bytes 逐 token 取「位元組」，全部累積完再一次轉字串：
+        // 仍是整串收完才 decode，不會把拆成多 token 的 CJK 字丟掉。
+        let mut bytes: Vec<u8> = Vec::with_capacity(generated.len() * 4);
+        for token in &generated {
+            bytes.extend_from_slice(
+                &model
+                    .token_to_bytes(*token, Special::Plaintext)
+                    .context("detokenize output")?,
+            );
+        }
+        let out = String::from_utf8(bytes).context("detokenize output")?;
         Ok(out.trim().to_string())
     }
 
