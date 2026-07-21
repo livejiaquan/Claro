@@ -292,6 +292,27 @@ impl Settings {
             .is_some_and(|origin| Some(origin) == consented_origin)
     }
 
+    /// 詞彙表：只餵給 STT 做解碼期偏置，不做任何字面替換。
+    ///
+    /// 之所以和 `dictionary` 分開，是因為兩者的安全條件相反。「Claude」適合當
+    /// 偏置詞讓 Whisper 在聲學階段就認對；但把「Cloud → Claude」寫成替換規則，
+    /// 會把使用者真的在講 cloud storage 的句子改壞。偏置無副作用、替換有。
+    pub fn vocabulary(&self) -> Vec<String> {
+        self.raw
+            .get("vocabulary")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| {
+                        let term = v.as_str()?.trim();
+                        (!term.is_empty()).then(|| term.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// 個人字典（誤認詞 → 正確詞）。config 缺鍵時回預設字典。
     pub fn dictionary(&self) -> Vec<(String, String)> {
         self.raw

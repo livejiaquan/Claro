@@ -22,6 +22,11 @@ use crate::stt::registry::ModelSpec;
 use crate::stt::SttEngine;
 use crate::textproc;
 
+/// 送進 initial_prompt 的候選詞上限。真正的天花板是 `build_initial_prompt`
+/// 的 token 預算（Whisper 硬限 223 token）；這個數字只是避免無謂地掃過長的
+/// 畫面文字，取得比預算略寬即可。
+const PROMPT_TERM_LIMIT: usize = 48;
+
 pub enum Msg {
     Hotkey(HotkeyMsg),
     ForceStop(u64),
@@ -740,8 +745,12 @@ fn process_session(
 
     let t0 = Instant::now();
     let dict_pairs = core.dict.lock().unwrap().clone();
-    let dict_terms: Vec<String> = dict_pairs.iter().map(|(_, right)| right.clone()).collect();
-    let terms = crate::context::context_terms(&dict_terms, &screen_ctx, 15);
+    // 偏置詞來自兩處：只做偏置的詞彙表，以及字典的 canonical 值（字典另外負責
+    // 事後替換）。實際能塞多少由 build_initial_prompt 的 token 預算決定，這裡
+    // 的上限只是避免無謂地掃過長的畫面文字。
+    let mut bias_terms = settings.vocabulary();
+    bias_terms.extend(dict_pairs.iter().map(|(_, right)| right.clone()));
+    let terms = crate::context::context_terms(&bias_terms, &screen_ctx, PROMPT_TERM_LIMIT);
     let (stt_model, stt_family, prompt_term_count) = {
         let model = *core.active_model.lock().unwrap();
         let prompt_term_count = matches!(model.family, crate::stt::registry::ModelFamily::Whisper)

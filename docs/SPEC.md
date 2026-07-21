@@ -111,7 +111,7 @@ pub struct ScreenContext {
     pub window_title: Option<String>,
     pub around_cursor: Option<String>,  // 游標前後各 500 字
     pub selected: Option<String>,       // 上限 200 字
-    pub visible: Option<String>,        // BFS 可見文字，總預算 1200 字 / 400 節點
+    pub visible: Option<String>,        // BFS 可見文字，總預算 3000 字 / 800 節點
 }
 
 pub trait TextInjector: Send + Sync {
@@ -148,9 +148,9 @@ Qwen3-ASR Q8_0 離線評測 artifacts 固定如下；來源、256-token／長音
 
 ## 7. 上下文引擎（差異化核心）
 
-**預設用 AX API、不用截圖**：不觸發螢幕錄影權限，也不需 vision model 常駐。keyDown 只用一次有界 AX 呼叫固定 focused element reference；不讀文字或逐項 metadata。麥克風開始後才完成 target hash，Context 另以同一批 retained AX refs 在背景擷取；worker 約 250ms 後硬停止，processing 也最多等待 250ms。逾時、失敗或目標不一致就不用。`keyDown→錄音提示 p95 ≤150ms` 仍需真機矩陣量測，不是目前已證實的數字。截圖+本地 VLM 是 post-v0.1 的可選進階，預設關，且同樣不得超過當次 deadline。
+**預設用 AX API、不用截圖**：不觸發螢幕錄影權限，也不需 vision model 常駐。keyDown 只用一次有界 AX 呼叫固定 focused element reference；不讀文字或逐項 metadata。麥克風開始後才完成 target hash，Context 另以同一批 retained AX refs 在背景擷取；worker 約 420ms 後硬停止（與錄音並行，非關鍵路徑），processing 在放開後最多等待 250ms。逾時、失敗或目標不一致就不用。`keyDown→錄音提示 p95 ≤150ms` 仍需真機矩陣量測，不是目前已證實的數字。截圖+本地 VLM 是 post-v0.1 的可選進階，預設關，且同樣不得超過當次 deadline。
 
-移植 prototype 已驗證的擷取邏輯：frontmost app → AXFocusedWindow 標題 → AXFocusedUIElement 的游標前後文（AXSelectedTextRange）與選取文字 → 視窗 AX 樹 BFS 收可見文字（只收 AXStaticText/AXTextField/AXTextArea/AXHeading，排除按鈕/連結噪音）。預算：游標前後各 500 字、可見文字 1200 字、400 節點。
+移植 prototype 已驗證的擷取邏輯：frontmost app → AXFocusedWindow 標題 → AXFocusedUIElement 的游標前後文（AXSelectedTextRange）與選取文字 → 視窗 AX 樹 BFS 收可見文字（只收 AXStaticText/AXTextField/AXTextArea/AXHeading，排除按鈕/連結噪音）。預算：游標前後各 500 字、可見文字 3000 字、800 節點。可見文字額度大於 prototype 的 1200/400，因為它是「自動詞源」——螢幕上出現過的專有名詞可直接進 STT 偏置，使用者不必手動維護字典。供給放大必須搭配 `ascii_term_priority` 相關性排序，否則雜訊詞會先佔滿有限的 prompt 格子。
 
 Claro 已實作並以 fixture 驗證的上下文雙重用途：
 1. **解碼期偏置（provider-aware）**：抽英文／技術詞彙與 CJK 詞彙；Whisper 將上限 15 個 canonical terms 放進 `initial_prompt`，Qwen3-ASR 現有 transcribe.cpp port 不接受此 extension，不能宣稱已套用同等偏置

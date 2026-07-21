@@ -4,11 +4,15 @@
 //! 隱私鐵律：AXSecureTextField 永不讀；內容只在記憶體、永不落盤；
 //! 設定 `context_enabled=false` 時零 AX 文字擷取；貼上安全仍會讀取並立即 hash
 //! App／視窗／焦點 metadata，但不讀欄位值、不顯示、不落盤。
-//! 預算沿用 prototype：游標前後 500 字、可見文字 1200 字、400 節點。
+//! 預算：游標前後 500 字、可見文字 3000 字、800 節點。可見文字的額度比
+//! prototype 的 1200/400 大，因為它是「自動詞源」——使用者不必手動維護字典，
+//! 螢幕上出現過的專有名詞就能進 STT 偏置。擷取在 keyDown 就於背景啟動、
+//! 錄音期間跑完，放開後最多只等 250ms，所以加預算幾乎不佔關鍵路徑。
+//! 供給變大必須搭配 `ascii_term_priority` 排序，否則雜訊詞會先佔滿 prompt 格子。
 
 const CTX_CURSOR_CHARS: usize = 500;
-const CTX_VISIBLE_CHARS: usize = 1200;
-const CTX_MAX_NODES: usize = 400;
+const CTX_VISIBLE_CHARS: usize = 3000;
+const CTX_MAX_NODES: usize = 800;
 const CLARO_BUNDLE_ID: &str = "dev.claro.desktop";
 
 /// Claro 的 WKWebView accessibility 必須留在 WebKit 主執行緒處理；背景內容擷取
@@ -143,40 +147,81 @@ pub fn surface_guidance(context: &str) -> &'static str {
 
 /// 從螢幕上下文抽英文／技術／CJK 詞彙，連同個人字典餵給 Whisper。
 /// 這是 Claro 自己可驗證的解碼期偏置，不推測 Typeless 的內部管線。
+/// 回傳順序是「最不重要在前、最重要在後」：Whisper 的 initial_prompt 超限時
+/// 從左邊截斷，且 attention 讓尾端權重最高，所以個人字典排在最後。
 pub fn context_terms(dict_terms: &[String], context: &str, limit: usize) -> Vec<String> {
     let stop = [
         "app", "window", "visible", "selected", "editing", "around", "cursor",
     ];
     let mut seen: Vec<String> = stop.iter().map(|s| s.to_string()).collect();
-    let mut out: Vec<String> = Vec::new();
 
-    let push = |t: &str, seen: &mut Vec<String>, out: &mut Vec<String>| {
-        let k = t.to_lowercase();
-        if !seen.contains(&k) {
-            seen.push(k);
-            out.push(t.to_string());
+    fn take(src: &[String], cap: usize, seen: &mut Vec<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        for t in src {
+            if out.len() >= cap {
+                break;
+            }
+            let k = t.to_lowercase();
+            if !seen.contains(&k) {
+                seen.push(k);
+                out.push(t.clone());
+            }
         }
-    };
+        out
+    }
 
-    for t in dict_terms {
-        if out.len() >= limit {
-            return out;
-        }
-        push(t, &mut seen, &mut out);
-    }
-    for t in ascii_tokens(context) {
-        if out.len() >= limit {
-            break;
-        }
-        push(&t, &mut seen, &mut out);
-    }
-    for t in cjk_tokens(context) {
-        if out.len() >= limit {
-            break;
-        }
-        push(&t, &mut seen, &mut out);
-    }
+    // 畫面詞按「值得偏置的程度」排序再取，否則供給一大就被雜訊詞先佔位。
+    // sort_by 是穩定排序，同分者維持原本的畫面出現順序。
+    let mut ascii = ascii_tokens(context);
+    ascii.sort_by(|a, b| ascii_term_priority(b).cmp(&ascii_term_priority(a)));
+    let cjk = cjk_tokens(context);
+
+    // 畫面詞代表「此刻正在講什麼」，是比靜態字典更即時的訊號；字典一旦超過
+    // 額度就會把畫面詞整個擠掉，所以畫面有詞時先保留一半額度給它。
+    let screen_reserved = (ascii.len() + cjk.len()).min(limit / 2);
+    let dict_cap = limit.saturating_sub(screen_reserved);
+
+    // 先取字典：它在去重上優先，畫面上的同名詞會讓給字典的正規寫法。
+    let mut dict_picked = take(dict_terms, dict_cap, &mut seen);
+    let remaining = limit - dict_picked.len();
+    // 選詞要取優先序最高的，但排列要把最高的放最後（尾端 attention 最高、
+    // 且左截斷時最後才被丟）——兩者方向相反，所以選完再反轉。
+    let mut ascii_picked = take(&ascii, remaining, &mut seen);
+    ascii_picked.reverse();
+    let remaining = remaining - ascii_picked.len();
+    let cjk_picked = take(&cjk, remaining, &mut seen);
+    // 預留是以「畫面詞總數」估的，但其中可能有 stopword 或重複而取不滿；
+    // 沒用掉的額度要還給字典，不能空著浪費 prompt 預算。
+    let remaining = remaining - cjk_picked.len();
+    dict_picked.extend(take(dict_terms, remaining, &mut seen));
+
+    // CJK 詞最雜放最前面，字典最可信放最後。
+    let mut out = cjk_picked;
+    out.extend(ascii_picked);
+    out.extend(dict_picked);
     out
+}
+
+/// 一個畫面詞值得佔用 prompt 格子的程度（大 = 優先）。
+///
+/// 依據實測失敗案例歸納：Claude、Anthropic、Figma、exFAT、OnyX、NVIDIA、
+/// subagent、Codex 全都是首字大寫或帶內部大小寫／數字／點號的專有名詞。
+/// 全小寫的常見英文字 Whisper 本來就聽得對，塞進 prompt 只會擠掉真正需要的詞，
+/// 而且偏置詞會把鄰近的正常詞拉偏（實測見過「設成 32」被拉成「射程 32」）。
+fn ascii_term_priority(term: &str) -> u8 {
+    let mut chars = term.chars();
+    let Some(first) = chars.next() else {
+        return 0;
+    };
+    let inner_upper = chars.any(|c| c.is_ascii_uppercase());
+    let marked = term.contains(['.', '-', '_', '+']) || term.chars().any(|c| c.is_ascii_digit());
+    if inner_upper || marked {
+        2 // exFAT、PostgreSQL、whisper.cpp、Qwen3-ASR
+    } else if first.is_ascii_uppercase() {
+        1 // Claude、Figma、Anthropic
+    } else {
+        0 // the、file、open
+    }
 }
 
 /// 等價 prototype 的 `[A-Za-z][A-Za-z0-9_.+-]{2,}`（免拉 regex 依賴）
@@ -876,11 +921,15 @@ mod macos {
         chunks.join(" | ")
     }
 
-    // Work deadline 210ms；最後一個已開始的 AX call 最多 40ms，整批硬上限約 250ms。
-    const CONTEXT_CAPTURE_BUDGET_MS: u64 = 210;
+    /// Work deadline 380ms；最後一個已開始的 AX call 最多 40ms，整批硬上限約 420ms。
+    ///
+    /// 擷取在 keyDown 就於背景啟動、與錄音並行，放開後 pipeline 才另外最多等
+    /// 250ms。可用時間是「按住時長 + 250ms」，而 Claro 會拒收 0.5 秒以下的音訊，
+    /// 因此最短的有效聽寫也有 750ms 可用，420ms 的硬上限不會擠到關鍵路徑。
+    const CONTEXT_CAPTURE_BUDGET_MS: u64 = 380;
 
     /// 讀前景 app／視窗／游標周邊／可見文字。fingerprint 與內容共用同一批
-    /// retained AX refs，因此 A→B→A 也不會把 B 內容包成 A；整批約 250ms 硬上限。
+    /// retained AX refs，因此 A→B→A 也不會把 B 內容包成 A；整批約 420ms 硬上限。
     pub fn capture_snapshot() -> Option<ContextSnapshot> {
         set_global_ax_timeout_once();
         let started = std::time::Instant::now();
@@ -1013,8 +1062,9 @@ mod tests {
         let ctx =
             "App: Zed\nWindow: main.rs — claro\nVisible: pytorch tokenizer | whisper.cpp | GPT";
         let terms = context_terms(&dict, ctx, 15);
-        assert_eq!(terms[0], "PyTorch");
-        assert_eq!(terms[1], "GPT");
+        // 字典詞排在最尾端：Whisper prompt 左截斷、尾端 attention 最高。
+        assert_eq!(terms[terms.len() - 2], "PyTorch");
+        assert_eq!(terms[terms.len() - 1], "GPT");
         assert!(terms.contains(&"Zed".to_string()));
         assert!(terms.contains(&"whisper.cpp".to_string()));
         // pytorch（小寫）與 GPT 重複 → 去重
@@ -1038,6 +1088,52 @@ mod tests {
         assert_eq!(terms.len(), 3);
         assert!(!terms.iter().any(|t| t.to_lowercase() == "app"));
         assert!(!terms.iter().any(|t| t.to_lowercase() == "editing"));
+    }
+
+    /// 專有名詞形狀的詞要贏過全小寫常見字——prompt 格子有限，全小寫的字
+    /// Whisper 本來就聽得對。
+    #[test]
+    fn distinctive_screen_terms_outrank_common_lowercase_words() {
+        assert_eq!(ascii_term_priority("exFAT"), 2);
+        assert_eq!(ascii_term_priority("whisper.cpp"), 2);
+        assert_eq!(ascii_term_priority("Qwen3-ASR"), 2);
+        assert_eq!(ascii_term_priority("Claude"), 1);
+        assert_eq!(ascii_term_priority("the"), 0);
+
+        // 額度不足時，專有名詞要贏過全小寫常見字而入選。
+        let ctx = "Visible: the file open plain words Claude exFAT";
+        let picked = context_terms(&[], ctx, 2);
+        assert_eq!(
+            picked,
+            vec!["Claude".to_string(), "exFAT".to_string()],
+            "應只留下兩個專有名詞，且高優先序在尾端"
+        );
+
+        // 額度有餘時常見字可以填補，但必須排在專有名詞「之前」——
+        // 尾端是 attention 最高、最後才被截斷的位置。
+        let all = context_terms(&[], ctx, 8);
+        let pos = |t: &str| all.iter().position(|x| x == t).expect("詞應存在");
+        assert!(pos("the") < pos("Claude"), "常見字必須排在專有名詞之前：{all:?}");
+        assert!(pos("Claude") < pos("exFAT"), "首字大寫應排在內部大小寫之前：{all:?}");
+    }
+
+    /// 迴歸：字典塞滿額度時，畫面詞曾經一個都進不去。畫面詞是比靜態字典更
+    /// 即時的訊號，必須保留一半額度給它。
+    #[test]
+    fn long_dictionary_does_not_crowd_out_screen_terms() {
+        let dict: Vec<String> = (0..40).map(|i| format!("DictTerm{i}")).collect();
+        let ctx = "App: Zed\nVisible: Kubernetes PostgreSQL Terraform";
+        let terms = context_terms(&dict, ctx, 10);
+        assert_eq!(terms.len(), 10);
+        for want in ["Kubernetes", "PostgreSQL", "Terraform"] {
+            assert!(terms.contains(&want.to_string()), "畫面詞 {want} 被擠掉了");
+        }
+        // 字典詞仍占多數額度，且全部落在尾端。
+        let first_dict = terms
+            .iter()
+            .position(|t| t.starts_with("DictTerm"))
+            .expect("字典詞應該入選");
+        assert!(terms[first_dict..].iter().all(|t| t.starts_with("DictTerm")));
     }
 
     #[test]

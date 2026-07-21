@@ -1,64 +1,165 @@
 {
-  "version": 1,
-  "description": "Claro STT 無聲合成語音 regression corpus。只用來比較版本與解碼設定，不代表真人台灣口音準確率。",
+  "version": 2,
+  "description": "Claro STT 無聲合成語音 regression corpus。只用來比較版本與解碼設定，不代表真人台灣口音準確率。v2 新增 real_* 案：取自實際使用 history 的英文專有名詞誤判（Claude→Cloud、Anthropic→Entropy、Figma→SIGMA、exFAT→ESFAT、OnyX→ONYS、maintenance→main time）。",
   "cases": [
     {
       "id": "zh_basic_001",
       "reference": "今天下午我們先確認專案進度，再安排下一步。",
-      "tags": ["zh_tw", "basic"],
+      "tags": [
+        "zh_tw",
+        "basic"
+      ],
       "terms": [],
-      "anchors": ["今天", "下午", "下一步"],
-      "tts": { "voice": "Meijia", "rate": 185 }
+      "anchors": [
+        "今天",
+        "下午",
+        "下一步"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 185
+      }
     },
     {
       "id": "zh_basic_002",
       "reference": "請把會議記錄整理成三個重點，完成後傳給我。",
-      "accepted_references": ["請把會議記錄整理成3個重點，完成後傳給我。"],
-      "tags": ["zh_tw", "instruction"],
+      "accepted_references": [
+        "請把會議記錄整理成3個重點，完成後傳給我。"
+      ],
+      "tags": [
+        "zh_tw",
+        "instruction"
+      ],
       "terms": [],
-      "anchors": ["三個", "完成後"],
-      "tts": { "voice": "Meijia", "rate": 195 }
+      "anchors": [
+        "三個",
+        "完成後"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 195
+      }
     },
     {
       "id": "mix_tech_001",
       "reference": "請用 PyTorch 跑 training，batch size 設成三十二。",
-      "accepted_references": ["請用 PyTorch 跑 training，batch size 設成32。"],
-      "tags": ["code_switch", "technical", "number"],
-      "terms": ["PyTorch", "training", "batch size"],
-      "anchors": ["PyTorch", "training", "batch size", "三十二|32"],
-      "tts": { "voice": "Meijia", "rate": 185 }
+      "accepted_references": [
+        "請用 PyTorch 跑 training，batch size 設成32。"
+      ],
+      "tags": [
+        "code_switch",
+        "technical",
+        "number"
+      ],
+      "terms": [
+        "PyTorch",
+        "training",
+        "batch size"
+      ],
+      "anchors": [
+        "PyTorch",
+        "training",
+        "batch size",
+        "三十二|32"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 185
+      }
     },
     {
       "id": "mix_tech_002",
       "reference": "這個 API 在 macOS 上使用 Metal，fallback 才走 CPU。",
-      "tags": ["code_switch", "technical", "macos"],
-      "terms": ["API", "macOS", "Metal", "fallback", "CPU"],
-      "anchors": ["API", "macOS", "Metal", "fallback", "CPU"],
-      "tts": { "voice": "Meijia", "rate": 190 }
+      "tags": [
+        "code_switch",
+        "technical",
+        "macos"
+      ],
+      "terms": [
+        "API",
+        "macOS",
+        "Metal",
+        "fallback",
+        "CPU"
+      ],
+      "anchors": [
+        "API",
+        "macOS",
+        "Metal",
+        "fallback",
+        "CPU"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 190
+      }
     },
     {
       "id": "mix_tech_003",
       "reference": "把 pull request 合併到 main branch 之前，先跑 cargo test。",
-      "tags": ["code_switch", "developer"],
-      "terms": ["pull request", "main branch", "cargo test"],
-      "anchors": ["pull request", "main branch", "cargo test", "之前"],
-      "tts": { "voice": "Meijia", "rate": 190 }
+      "tags": [
+        "code_switch",
+        "developer"
+      ],
+      "terms": [
+        "pull request",
+        "main branch",
+        "cargo test"
+      ],
+      "anchors": [
+        "pull request",
+        "main branch",
+        "cargo test",
+        "之前"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 190
+      }
     },
     {
       "id": "brand_001",
       "reference": "Claro、Typeless 和 Apple Intelligence 都要分開評估。",
-      "tags": ["brand", "code_switch"],
-      "terms": ["Claro", "Typeless", "Apple Intelligence"],
-      "anchors": ["Claro", "Typeless", "Apple Intelligence"],
-      "tts": { "voice": "Meijia", "rate": 180 }
+      "tags": [
+        "brand",
+        "code_switch"
+      ],
+      "terms": [
+        "Claro",
+        "Typeless",
+        "Apple Intelligence"
+      ],
+      "anchors": [
+        "Claro",
+        "Typeless",
+        "Apple Intelligence"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 180
+      }
     },
     {
       "id": "brand_002",
       "reference": "Qwen3-ASR 和 Whisper large v3 要用同一批音檔比較。",
-      "tags": ["brand", "technical", "code_switch"],
-      "terms": ["Qwen3-ASR", "Whisper large v3"],
-      "anchors": ["Qwen3-ASR", "Whisper large v3", "同一批"],
-      "tts": { "voice": "Meijia", "rate": 180 }
+      "tags": [
+        "brand",
+        "technical",
+        "code_switch"
+      ],
+      "terms": [
+        "Qwen3-ASR",
+        "Whisper large v3"
+      ],
+      "anchors": [
+        "Qwen3-ASR",
+        "Whisper large v3",
+        "同一批"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 180
+      }
     },
     {
       "id": "number_001",
@@ -67,19 +168,45 @@
         "這次報價是125800元，不是158000元。",
         "這次報價是12萬5800元，不是15萬8000元。"
       ],
-      "tags": ["number", "negation", "money"],
+      "tags": [
+        "number",
+        "negation",
+        "money"
+      ],
       "terms": [],
-      "anchors": ["十二萬五千八百|125800", "不是", "十五萬八千|158000"],
-      "tts": { "voice": "Meijia", "rate": 180 }
+      "anchors": [
+        "十二萬五千八百|125800",
+        "不是",
+        "十五萬八千|158000"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 180
+      }
     },
     {
       "id": "number_002",
       "reference": "版本是二點七點一，連接埠是八千零八十。",
-      "accepted_references": ["版本是2.7.1，連接埠是8080。"],
-      "tags": ["number", "version", "technical"],
-      "terms": ["版本", "連接埠"],
-      "anchors": ["二點七點一|2.7.1", "八千零八十|8080"],
-      "tts": { "voice": "Meijia", "rate": 180 }
+      "accepted_references": [
+        "版本是2.7.1，連接埠是8080。"
+      ],
+      "tags": [
+        "number",
+        "version",
+        "technical"
+      ],
+      "terms": [
+        "版本",
+        "連接埠"
+      ],
+      "anchors": [
+        "二點七點一|2.7.1",
+        "八千零八十|8080"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 180
+      }
     },
     {
       "id": "datetime_001",
@@ -88,10 +215,23 @@
         "會議改到7月16日下午3點半，請不要排在上午。",
         "會議改到7月16日下午3:30，請不要排在上午。"
       ],
-      "tags": ["date", "time", "negation"],
+      "tags": [
+        "date",
+        "time",
+        "negation"
+      ],
       "terms": [],
-      "anchors": ["七月十六日|7月16日", "下午", "三點半|3:30|3 點半", "不要", "上午"],
-      "tts": { "voice": "Meijia", "rate": 185 }
+      "anchors": [
+        "七月十六日|7月16日",
+        "下午",
+        "三點半|3:30|3 點半",
+        "不要",
+        "上午"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 185
+      }
     },
     {
       "id": "correction_001",
@@ -100,34 +240,90 @@
         "明天早上9點開會，等等，不是9點，改成10點半。",
         "明天早上9點開會，等等，不是9點，改成10:30。"
       ],
-      "tags": ["self_correction", "time", "negation"],
+      "tags": [
+        "self_correction",
+        "time",
+        "negation"
+      ],
       "terms": [],
-      "anchors": ["九點|9點", "不是", "十點半|10:30|10 點半"],
-      "tts": { "voice": "Meijia", "rate": 180 }
+      "anchors": [
+        "九點|9點",
+        "不是",
+        "十點半|10:30|10 點半"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 180
+      }
     },
     {
       "id": "correction_002",
       "reference": "寄給小王，算了，改寄給王怡婷。",
-      "tags": ["self_correction", "name"],
-      "terms": ["王怡婷"],
-      "anchors": ["小王", "改", "王怡婷"],
-      "tts": { "voice": "Meijia", "rate": 180 }
+      "tags": [
+        "self_correction",
+        "name"
+      ],
+      "terms": [
+        "王怡婷"
+      ],
+      "anchors": [
+        "小王",
+        "改",
+        "王怡婷"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 180
+      }
     },
     {
       "id": "taiwan_name_001",
       "reference": "陳怡安星期五要去成功大學光復校區。",
-      "tags": ["taiwan", "name", "place"],
-      "terms": ["陳怡安", "成功大學", "光復校區"],
-      "anchors": ["陳怡安", "星期五", "成功大學", "光復校區"],
-      "tts": { "voice": "Meijia", "rate": 180 }
+      "tags": [
+        "taiwan",
+        "name",
+        "place"
+      ],
+      "terms": [
+        "陳怡安",
+        "成功大學",
+        "光復校區"
+      ],
+      "anchors": [
+        "陳怡安",
+        "星期五",
+        "成功大學",
+        "光復校區"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 180
+      }
     },
     {
       "id": "taiwan_place_001",
       "reference": "從臺南搭高鐵到板橋，再轉捷運到新店。",
-      "tags": ["taiwan", "place", "transport"],
-      "terms": ["臺南", "板橋", "新店"],
-      "anchors": ["臺南|台南", "高鐵", "板橋", "捷運", "新店"],
-      "tts": { "voice": "Meijia", "rate": 190 }
+      "tags": [
+        "taiwan",
+        "place",
+        "transport"
+      ],
+      "terms": [
+        "臺南",
+        "板橋",
+        "新店"
+      ],
+      "anchors": [
+        "臺南|台南",
+        "高鐵",
+        "板橋",
+        "捷運",
+        "新店"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 190
+      }
     },
     {
       "id": "email_001",
@@ -136,51 +332,329 @@
         "請寄到 claro test@example.com。",
         "請寄到 clarotest@example.com。"
       ],
-      "tags": ["email", "code_switch"],
-      "terms": ["claro", "example.com"],
-      "anchors": ["claro", "test", "小老鼠|@", "example", "com"],
-      "tts": { "voice": "Meijia", "rate": 175 }
+      "tags": [
+        "email",
+        "code_switch"
+      ],
+      "terms": [
+        "claro",
+        "example.com"
+      ],
+      "anchors": [
+        "claro",
+        "test",
+        "小老鼠|@",
+        "example",
+        "com"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 175
+      }
     },
     {
       "id": "url_001",
       "reference": "文件放在 GitHub dot com slash QwenLM slash Qwen3-ASR。",
-      "accepted_references": ["文件放在 github.com/QwenLM/Qwen3-ASR。"],
-      "tags": ["url", "code_switch", "technical"],
-      "terms": ["GitHub", "QwenLM", "Qwen3-ASR"],
-      "anchors": ["GitHub", "QwenLM", "Qwen3-ASR"],
-      "tts": { "voice": "Meijia", "rate": 170 }
+      "accepted_references": [
+        "文件放在 github.com/QwenLM/Qwen3-ASR。"
+      ],
+      "tags": [
+        "url",
+        "code_switch",
+        "technical"
+      ],
+      "terms": [
+        "GitHub",
+        "QwenLM",
+        "Qwen3-ASR"
+      ],
+      "anchors": [
+        "GitHub",
+        "QwenLM",
+        "Qwen3-ASR"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 170
+      }
     },
     {
       "id": "negation_001",
       "reference": "這個版本可以離線使用，但不要把音訊送到雲端。",
-      "tags": ["negation", "privacy"],
+      "tags": [
+        "negation",
+        "privacy"
+      ],
       "terms": [],
-      "anchors": ["離線", "但", "不要", "音訊", "雲端"],
-      "tts": { "voice": "Meijia", "rate": 190 }
+      "anchors": [
+        "離線",
+        "但",
+        "不要",
+        "音訊",
+        "雲端"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 190
+      }
     },
     {
       "id": "long_001",
       "reference": "先確認麥克風權限和輸入裝置，接著下載使用者同意的模型，最後在文字編輯器完成第一次聽寫。",
-      "tags": ["long", "sequence", "onboarding"],
-      "terms": ["麥克風", "輸入裝置", "文字編輯器"],
-      "anchors": ["先", "接著", "最後", "使用者同意", "第一次聽寫"],
-      "tts": { "voice": "Meijia", "rate": 190 }
+      "tags": [
+        "long",
+        "sequence",
+        "onboarding"
+      ],
+      "terms": [
+        "麥克風",
+        "輸入裝置",
+        "文字編輯器"
+      ],
+      "anchors": [
+        "先",
+        "接著",
+        "最後",
+        "使用者同意",
+        "第一次聽寫"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 190
+      }
     },
     {
       "id": "english_001",
       "reference": "Please keep the original meaning and do not invent any details.",
-      "tags": ["english", "negation"],
-      "terms": ["original meaning"],
-      "anchors": ["original meaning", "do not", "details"],
-      "tts": { "voice": "Samantha", "rate": 185 }
+      "tags": [
+        "english",
+        "negation"
+      ],
+      "terms": [
+        "original meaning"
+      ],
+      "anchors": [
+        "original meaning",
+        "do not",
+        "details"
+      ],
+      "tts": {
+        "voice": "Samantha",
+        "rate": 185
+      }
     },
     {
       "id": "english_002",
       "reference": "The deployment failed after the database migration completed.",
-      "tags": ["english", "technical"],
-      "terms": ["deployment", "database migration"],
-      "anchors": ["deployment", "failed", "database migration", "completed"],
-      "tts": { "voice": "Samantha", "rate": 185 }
+      "tags": [
+        "english",
+        "technical"
+      ],
+      "terms": [
+        "deployment",
+        "database migration"
+      ],
+      "anchors": [
+        "deployment",
+        "failed",
+        "database migration",
+        "completed"
+      ],
+      "tts": {
+        "voice": "Samantha",
+        "rate": 185
+      }
+    },
+    {
+      "id": "real_claude_001",
+      "reference": "我想請問這個 ChatGPT 跟 Claude 的差異性在哪裡？",
+      "tags": [
+        "code_switch",
+        "brand",
+        "real_world"
+      ],
+      "terms": [
+        "ChatGPT",
+        "Claude"
+      ],
+      "anchors": [
+        "ChatGPT",
+        "Claude"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 185
+      }
+    },
+    {
+      "id": "real_anthropic_001",
+      "reference": "如果想知道 Anthropic 跟 OpenAI 的差距會很大嗎？",
+      "tags": [
+        "code_switch",
+        "brand",
+        "real_world"
+      ],
+      "terms": [
+        "Anthropic",
+        "OpenAI"
+      ],
+      "anchors": [
+        "Anthropic",
+        "OpenAI"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 185
+      }
+    },
+    {
+      "id": "real_figma_001",
+      "reference": "我目前 Figma 的設定裡面，最核心的內容是什麼？",
+      "tags": [
+        "code_switch",
+        "brand",
+        "real_world"
+      ],
+      "terms": [
+        "Figma"
+      ],
+      "anchors": [
+        "Figma"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 190
+      }
+    },
+    {
+      "id": "real_exfat_001",
+      "reference": "我的硬碟格式是 exFAT，需要再切一個 macOS 的格式給它。",
+      "tags": [
+        "code_switch",
+        "technical",
+        "real_world"
+      ],
+      "terms": [
+        "exFAT",
+        "macOS"
+      ],
+      "anchors": [
+        "exFAT",
+        "macOS"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 185
+      }
+    },
+    {
+      "id": "real_onyx_001",
+      "reference": "我想先用 OnyX 這個 app 做 maintenance 清理。",
+      "tags": [
+        "code_switch",
+        "technical",
+        "real_world"
+      ],
+      "terms": [
+        "OnyX",
+        "maintenance"
+      ],
+      "anchors": [
+        "OnyX",
+        "maintenance"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 185
+      }
+    },
+    {
+      "id": "real_codex_001",
+      "reference": "你可以指派自己的 subagent，不要交給 Codex 來做。",
+      "tags": [
+        "code_switch",
+        "technical",
+        "real_world"
+      ],
+      "terms": [
+        "subagent",
+        "Codex"
+      ],
+      "anchors": [
+        "subagent",
+        "Codex",
+        "指派"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 185
+      }
+    },
+    {
+      "id": "real_backup_001",
+      "reference": "他說磁碟有問題要進入 Recovery 修復，我想先用 Time Machine 備份。",
+      "tags": [
+        "code_switch",
+        "technical",
+        "real_world"
+      ],
+      "terms": [
+        "Recovery",
+        "Time Machine"
+      ],
+      "anchors": [
+        "Recovery",
+        "Time Machine"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 190
+      }
+    },
+    {
+      "id": "real_token_001",
+      "reference": "先把整個 Figma 專案裡面那一套 token 全部匯出來。",
+      "accepted_references": [
+        "先把整個 Figma 專案裡面那一套 token 全部匯出來"
+      ],
+      "tags": [
+        "code_switch",
+        "technical",
+        "real_world"
+      ],
+      "terms": [
+        "Figma",
+        "token"
+      ],
+      "anchors": [
+        "Figma",
+        "token",
+        "匯出"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 185
+      }
+    },
+    {
+      "id": "real_opencc_001",
+      "reference": "Figma 不是只會有一個嗎？",
+      "tags": [
+        "opencc",
+        "zh_tw",
+        "real_world"
+      ],
+      "terms": [
+        "Figma"
+      ],
+      "anchors": [
+        "Figma",
+        "只會"
+      ],
+      "tts": {
+        "voice": "Meijia",
+        "rate": 190
+      }
     }
   ]
 }
