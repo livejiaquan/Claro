@@ -1292,6 +1292,15 @@ where
     let Some(polisher) = from_settings(settings) else {
         return fallback_result(settings, text, PolishFallbackReason::ProviderUnavailable);
     };
+    // 下載期間內建模型讓路：聽寫本身必須可用（STT 會照常重載），但再疊上
+    // 2.5GB 的 LLM 與下載寫入／整檔 sha256，會把 WebKit renderer 擠到被系統
+    // 回收（白屏）。潤飾退回原文只是少了標點整理，聽寫不受影響。
+    if matches!(polisher, Polisher::Builtin { .. })
+        && crate::DOWNLOAD_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        tracing::info!("model download in progress — skipping builtin polish to spare memory");
+        return fallback_result(settings, text, PolishFallbackReason::ProviderUnavailable);
+    }
     let provider = polisher.provider_id().to_string();
     let candidate = match generate(&polisher, mode, text, context) {
         Ok(candidate) => candidate,

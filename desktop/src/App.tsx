@@ -86,7 +86,13 @@ export default function App() {
     });
     const un3 = listen<DownloadProgress>("llm-model-download", (e) => {
       setLlmProgress(e.payload.done ? null : e.payload);
-      if (e.payload.error) showToast(`下載失敗：${e.payload.error}`);
+      if (e.payload.error)
+        showToast(
+          // 使用者主動取消不是失敗；後端用固定訊息讓前端能區分。
+          e.payload.error.includes("下載已取消")
+            ? "已取消下載；已完成的部分保留，下次會續傳"
+            : `下載失敗：${e.payload.error}`,
+        );
       if (e.payload.done) showToast("模型下載完成");
     });
     return () => {

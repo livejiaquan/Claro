@@ -344,16 +344,45 @@ fn release_download(gate: &Mutex<Option<&'static str>>) {
     *gate.lock().unwrap() = None;
 }
 
-/// 下載前先卸載常駐的 STT／LLM。兩者在 16GB 機器上可同時佔去 5.6GB，
-/// 再加上下載寫入與結尾的整檔 sha256，足以讓 WebKit renderer 被記憶體壓力
-/// 殺掉（主進程存活，使用者看到的就是白屏）。卸載後兩者都會在下次用時自動
-/// 重載，只多一次載入延遲。
-fn free_memory_for_download(core: &Arc<pipeline::Core>) {
-    llm::unload_blocking();
-    let mut engine = core.engine.lock().unwrap();
-    if engine.is_loaded() {
-        engine.unload();
-        tracing::info!("unloaded STT before model download to reduce memory pressure");
+/// 下載進行中。聽寫仍須可用（STT 會照常重載），但內建 LLM 潤飾會讓路——
+/// 兩個模型加上下載寫入與整檔 sha256，在 16GB 機器上足以讓 WebKit renderer
+/// 被記憶體壓力殺掉（主進程存活，使用者看到的就是白屏）。
+pub static DOWNLOAD_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// 下載期間的狀態持有者。用 Drop 收尾，背景執行緒即使 panic（例如 mutex
+/// poisoned）也不會把 downloading／gate 永久卡住而必須重開 app。
+struct DownloadSession {
+    slot: Arc<Mutex<Option<&'static str>>>,
+    gate: Arc<Mutex<Option<&'static str>>>,
+}
+
+impl DownloadSession {
+    fn new(
+        slot: Arc<Mutex<Option<&'static str>>>,
+        gate: Arc<Mutex<Option<&'static str>>>,
+        core: &Arc<pipeline::Core>,
+    ) -> Self {
+        DOWNLOAD_ACTIVE.store(true, Ordering::SeqCst);
+        llm::unload_blocking();
+        if let Ok(mut engine) = core.engine.lock() {
+            if engine.is_loaded() {
+                engine.unload();
+                tracing::info!("unloaded STT before model download to reduce memory pressure");
+            }
+        }
+        Self { slot, gate }
+    }
+}
+
+impl Drop for DownloadSession {
+    fn drop(&mut self) {
+        DOWNLOAD_ACTIVE.store(false, Ordering::SeqCst);
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = None;
+        }
+        if let Ok(mut gate) = self.gate.lock() {
+            *gate = None;
+        }
     }
 }
 
@@ -400,7 +429,7 @@ fn download_model(
         // 下載會寫入數 GB 並在結尾整檔 hash；常駐的 STT/LLM 若同時佔著數 GB，
         // WebKit renderer 會被系統以記憶體壓力殺掉（使用者實測踩過：白屏）。
         // 先讓出記憶體，下載結束後照原本的用時載入路徑自然回來。
-        free_memory_for_download(&core);
+        let _session = DownloadSession::new(downloading, download_gate, &core);
         let dest = registry::model_path(spec);
         let result = models::download(spec.url, &dest, spec.sha256, &cancel, |p| {
             let _ = app.emit(
@@ -471,8 +500,6 @@ fn download_model(
             },
         };
         let _ = app.emit("model-download", payload);
-        *downloading.lock().unwrap() = None;
-        release_download(&download_gate);
     });
     Ok(())
 }
@@ -641,7 +668,7 @@ fn download_builtin_llm(
     let cancel = state.download_cancel.clone();
     cancel.store(false, Ordering::SeqCst);
     std::thread::spawn(move || {
-        free_memory_for_download(&core);
+        let _session = DownloadSession::new(downloading, download_gate, &core);
         let dest = llm::model_path(spec);
         let result = models::download(spec.url, &dest, spec.sha256, &cancel, |p| {
             let _ = app.emit(
@@ -678,8 +705,6 @@ fn download_builtin_llm(
             },
         };
         let _ = app.emit("llm-model-download", payload);
-        *downloading.lock().unwrap() = None;
-        release_download(&download_gate);
     });
     Ok(())
 }

@@ -392,9 +392,14 @@ export default function Settings({
           const activationStatus = progress?.model_id === m.id ? progress.activation_status : "none";
           const activationPending = activationStatus !== "none";
           const downloadError = progress?.model_id === m.id && !activationPending ? progress.error : null;
+          // 後端在 spawn 前就把 downloading 設為真，第一個進度事件要累積 1MB
+          // 才送出（下載前的模型卸載又拉長了這個空窗），所以 progress 可能還是
+          // null。這裡不能用 `!` 斷言——runtime 沒有它，會直接拋錯白屏。
+          const activeProgress =
+            progress?.model_id === m.id && isDownloading ? progress : null;
           const pct =
-            isDownloading && progress!.total_mb
-              ? Math.min(100, (progress!.downloaded_mb / progress!.total_mb) * 100)
+            activeProgress?.total_mb
+              ? Math.min(100, (activeProgress.downloaded_mb / activeProgress.total_mb) * 100)
               : null;
           return (
             <div className="row" key={m.id} style={{ alignItems: "flex-start" }}>
@@ -429,7 +434,9 @@ export default function Settings({
                     </div>
                     <div className="text-[11px] mt-1 flex items-center gap-2" style={{ color: "var(--muted)" }}>
                       <span>
-                        {progress!.downloaded_mb}/{progress!.total_mb ?? "?"} MB
+                        {activeProgress
+                          ? `${activeProgress.downloaded_mb}/${activeProgress.total_mb ?? "?"} MB`
+                          : "準備中…"}
                       </span>
                       <button
                         className="btn danger-quiet no-drag"
@@ -671,9 +678,11 @@ export default function Settings({
                 (llmProgress?.model_id === m.id && !llmProgress.done && !llmProgress.error) ||
                 m.downloading;
               const downloadError = llmProgress?.model_id === m.id ? llmProgress.error : null;
+              const activeProgress =
+                llmProgress?.model_id === m.id && isDownloading ? llmProgress : null;
               const pct =
-                isDownloading && llmProgress!.total_mb
-                  ? Math.min(100, (llmProgress!.downloaded_mb / llmProgress!.total_mb) * 100)
+                activeProgress?.total_mb
+                  ? Math.min(100, (activeProgress.downloaded_mb / activeProgress.total_mb) * 100)
                   : null;
               return (
                 <div className="row" key={m.id} style={{ alignItems: "flex-start" }}>
@@ -702,7 +711,9 @@ export default function Settings({
                         </div>
                         <div className="text-[11px] mt-1 flex items-center gap-2" style={{ color: "var(--muted)" }}>
                           <span>
-                            {llmProgress!.downloaded_mb}/{llmProgress!.total_mb ?? "?"} MB
+                            {activeProgress
+                              ? `${activeProgress.downloaded_mb}/${activeProgress.total_mb ?? "?"} MB`
+                              : "準備中…"}
                           </span>
                           <button
                             className="btn danger-quiet no-drag"

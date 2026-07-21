@@ -470,7 +470,12 @@ pub fn download(
     }
     let mut resume_from = partial.metadata().map(|m| m.len()).unwrap_or(0);
 
-    let mut req = ureq::get(url);
+    // 沒有讀取逾時的話，伺服器建立連線後停住不送 body 會讓 read() 永久阻塞，
+    // 取消旗標永遠沒機會被檢查。給一個上限讓 read 返回錯誤，使用者按取消才有效。
+    let agent = ureq::AgentBuilder::new()
+        .timeout_read(std::time::Duration::from_secs(30))
+        .build();
+    let mut req = agent.get(url);
     if resume_from > 0 {
         req = req.set("Range", &format!("bytes={resume_from}-"));
     }
@@ -483,7 +488,7 @@ pub fn download(
             tracing::warn!("stale .partial larger than remote artifact — restarting download");
             fs::remove_file(&partial).ok();
             resume_from = 0;
-            ureq::get(url).call().context("model download restart after 416")?
+            agent.get(url).call().context("model download restart after 416")?
         }
         Err(e) => return Err(e).context("model download request"),
     };
@@ -579,6 +584,12 @@ pub fn download(
         if offset != total {
             bail!("incomplete download: {offset}/{total} bytes (再跑一次會續傳)");
         }
+    }
+
+    // EOF 之後、整檔 sha256 之前再檢查一次：這段對數 GB 檔案要跑數秒，
+    // 若在此期間按取消卻照樣 finalize，UI 會顯示「下載完成」而無視使用者操作。
+    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        bail!("{DOWNLOAD_CANCELLED}");
     }
 
     let (_, actual) = sha256_stable_file(&partial)?;
@@ -879,24 +890,38 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// 取消必須保留 `.partial`，否則使用者取消一次就得從零重下（網路慢時很痛）。
+    /// 下載到一半才取消時，`.partial` 必須保留**已下載的位元組**，否則使用者
+    /// 取消一次就得從零重下（網路慢時很痛）。刻意讓進度回呼在跑過至少一個
+    /// 回報間隔後才設旗標，才會走到「已寫入資料後取消」這條路徑——一開始就
+    /// 取消只會得到空的 `.partial`，證明不了續傳契約。
     #[test]
-    fn cancelled_download_keeps_partial_for_resume() {
+    fn cancelled_download_keeps_downloaded_bytes_for_resume() {
         let dir = tempdir();
         let dest = dir.join("model.bin");
-        let url = serve_once(
-            "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcdef".to_string(),
-        );
-        let cancel = std::sync::atomic::AtomicBool::new(true);
-        let error = download(&url, &dest, &digest(b"abcdef"), &cancel, |_| {}).unwrap_err();
+        let body = vec![b'x'; 3 * 1024 * 1024];
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                .into_bytes();
+        response.extend_from_slice(&body);
+        let url = serve_once_bytes(response);
+
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let error = download(&url, &dest, &digest(&body), &cancel, |p| {
+            // 進度每 1MB 回報一次；收到第一次回報代表資料已落盤。
+            assert!(p.downloaded > 0);
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .unwrap_err();
+
         assert!(
             error.to_string().contains(DOWNLOAD_CANCELLED),
             "取消要回報可辨識的原因，UI 才能跟一般失敗區分：{error}"
         );
         assert!(!dest.exists(), "取消不可產生成品檔");
+        let kept = fs::metadata(partial_path(&dest)).unwrap().len();
         assert!(
-            partial_path(&dest).exists(),
-            "`.partial` 必須留著讓下次續傳"
+            kept > 0 && kept < body.len() as u64,
+            "`.partial` 要保留已下載的位元組供續傳，實得 {kept} bytes"
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -986,13 +1011,19 @@ mod tests {
     }
 
     fn serve_once(response: String) -> String {
+        serve_once_bytes(response.into_bytes())
+    }
+
+    /// 二進位版本：取消測試需要送幾 MB 的 body 才會觸發進度回報。
+    /// 用戶端可能中途斷線（取消），因此寫入失敗不 panic。
+    fn serve_once_bytes(response: Vec<u8>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0u8; 2048];
             let _ = stream.read(&mut request);
-            stream.write_all(response.as_bytes()).unwrap();
+            let _ = stream.write_all(&response);
         });
         format!("http://{address}/model")
     }
