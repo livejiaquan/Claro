@@ -425,10 +425,14 @@ fn download_gate(dest: &Path) -> Arc<Mutex<()>> {
 
 /// 下載 url 到 dest。支援中斷續傳，完成後強制校驗 sha256。
 /// progress 每 ~1MB 回呼一次。
+/// 使用者主動取消下載時的錯誤訊息。`.partial` 會保留，下次可續傳。
+pub const DOWNLOAD_CANCELLED: &str = "下載已取消";
+
 pub fn download(
     url: &str,
     dest: &Path,
     expected_sha256: &str,
+    cancel: &std::sync::atomic::AtomicBool,
     mut progress: impl FnMut(Progress),
 ) -> Result<()> {
     let gate = download_gate(dest);
@@ -537,6 +541,12 @@ pub fn download(
     let mut buf = vec![0u8; 256 * 1024];
     let mut since_report: u64 = 0;
     loop {
+        // 取消點放在讀取之前：`.partial` 只保留已完整落盤的位元組，
+        // 下次以 Range 續傳接得上，不會留下半截的 chunk。
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            file.flush().ok();
+            bail!("{DOWNLOAD_CANCELLED}");
+        }
         let n = reader.read(&mut buf).context("read download stream")?;
         if n == 0 {
             break;
@@ -715,7 +725,7 @@ mod tests {
         let dest = dir.join("model.bin");
         fs::write(&dest, b"already verified").unwrap();
         let expected = digest(b"already verified");
-        download("not a URL", &dest, &expected, |_| {}).unwrap();
+        download("not a URL", &dest, &expected, &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"already verified");
         fs::remove_dir_all(dir).unwrap();
     }
@@ -850,7 +860,7 @@ mod tests {
             body.len(),
             String::from_utf8_lossy(body)
         ));
-        download(&url, &dest, &digest(body), |_| {}).unwrap();
+        download(&url, &dest, &digest(body), &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), body);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -864,8 +874,30 @@ mod tests {
             "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/6\r\nContent-Length: 3\r\nConnection: close\r\n\r\ndef"
                 .to_string(),
         );
-        download(&url, &dest, &digest(b"abcdef"), |_| {}).unwrap();
+        download(&url, &dest, &digest(b"abcdef"), &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"abcdef");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 取消必須保留 `.partial`，否則使用者取消一次就得從零重下（網路慢時很痛）。
+    #[test]
+    fn cancelled_download_keeps_partial_for_resume() {
+        let dir = tempdir();
+        let dest = dir.join("model.bin");
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcdef".to_string(),
+        );
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let error = download(&url, &dest, &digest(b"abcdef"), &cancel, |_| {}).unwrap_err();
+        assert!(
+            error.to_string().contains(DOWNLOAD_CANCELLED),
+            "取消要回報可辨識的原因，UI 才能跟一般失敗區分：{error}"
+        );
+        assert!(!dest.exists(), "取消不可產生成品檔");
+        assert!(
+            partial_path(&dest).exists(),
+            "`.partial` 必須留著讓下次續傳"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -879,7 +911,7 @@ mod tests {
             "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-5/6\r\nContent-Length: 2\r\nConnection: close\r\n\r\nef"
                 .to_string(),
         );
-        let error = download(&url, &dest, &digest(b"abcdef"), |_| {}).unwrap_err();
+        let error = download(&url, &dest, &digest(b"abcdef"), &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap_err();
         assert!(error.to_string().contains("resume offset mismatch"));
         assert_eq!(fs::read(&partial).unwrap(), b"abc");
         fs::remove_dir_all(dir).unwrap();
@@ -895,7 +927,7 @@ mod tests {
             "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nConnection: close\r\n\r\ndef"
                 .to_string(),
         );
-        let error = download(&url, &dest, &digest(b"abcdef"), |_| {}).unwrap_err();
+        let error = download(&url, &dest, &digest(b"abcdef"), &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap_err();
         assert!(error.to_string().contains("missing Content-Range"));
         assert_eq!(fs::read(&partial).unwrap(), b"abc");
         fs::remove_dir_all(dir).unwrap();
@@ -923,7 +955,7 @@ mod tests {
         let bytes = b"completed before rename";
         fs::write(&partial, bytes).unwrap();
 
-        download("not a URL", &dest, &digest(bytes), |_| {}).unwrap();
+        download("not a URL", &dest, &digest(bytes), &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
 
         assert!(!partial.exists());
         assert_eq!(fs::read(&dest).unwrap(), bytes);

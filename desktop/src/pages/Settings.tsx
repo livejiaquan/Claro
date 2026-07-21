@@ -427,8 +427,16 @@ export default function Settings({
                         style={{ width: pct !== null ? `${pct}%` : "30%" }}
                       />
                     </div>
-                    <div className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
-                      {progress!.downloaded_mb}/{progress!.total_mb ?? "?"} MB
+                    <div className="text-[11px] mt-1 flex items-center gap-2" style={{ color: "var(--muted)" }}>
+                      <span>
+                        {progress!.downloaded_mb}/{progress!.total_mb ?? "?"} MB
+                      </span>
+                      <button
+                        className="btn danger-quiet no-drag"
+                        onClick={() => call("cancel_download")}
+                      >
+                        取消
+                      </button>
                     </div>
                   </div>
                 )}
@@ -692,8 +700,16 @@ export default function Settings({
                             style={{ width: pct !== null ? `${pct}%` : "30%" }}
                           />
                         </div>
-                        <div className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
-                          {llmProgress!.downloaded_mb}/{llmProgress!.total_mb ?? "?"} MB
+                        <div className="text-[11px] mt-1 flex items-center gap-2" style={{ color: "var(--muted)" }}>
+                          <span>
+                            {llmProgress!.downloaded_mb}/{llmProgress!.total_mb ?? "?"} MB
+                          </span>
+                          <button
+                            className="btn danger-quiet no-drag"
+                            onClick={() => call("cancel_download")}
+                          >
+                            取消
+                          </button>
                         </div>
                       </div>
                     )}

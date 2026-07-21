@@ -21,7 +21,13 @@ fn main() -> anyhow::Result<()> {
         spec.approx_bytes / 1_048_576,
         dest.display()
     );
-    models::download(spec.url, &dest, spec.sha256, models::print_progress)?;
+    models::download(
+        spec.url,
+        &dest,
+        spec.sha256,
+        &std::sync::atomic::AtomicBool::new(false),
+        models::print_progress,
+    )?;
     eprintln!("完成：{}", dest.display());
     Ok(())
 }

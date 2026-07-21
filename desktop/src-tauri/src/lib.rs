@@ -37,6 +37,9 @@ struct AppState {
     download_gate: Arc<Mutex<Option<&'static str>>>,
     downloading: Arc<Mutex<Option<&'static str>>>,
     llm_downloading: Arc<Mutex<Option<&'static str>>>,
+    /// 使用者按下取消時設起；下載迴圈在每個 chunk 前檢查。STT 與 LLM 共用一支，
+    /// 因為 download_gate 已保證同時只有一個下載在跑。
+    download_cancel: Arc<AtomicBool>,
     mic_test: Arc<Mutex<Option<CaptureHandle>>>,
     mic_test_passed: Arc<AtomicBool>,
     mic_test_generation: Arc<AtomicU64>,
@@ -341,6 +344,26 @@ fn release_download(gate: &Mutex<Option<&'static str>>) {
     *gate.lock().unwrap() = None;
 }
 
+/// 下載前先卸載常駐的 STT／LLM。兩者在 16GB 機器上可同時佔去 5.6GB，
+/// 再加上下載寫入與結尾的整檔 sha256，足以讓 WebKit renderer 被記憶體壓力
+/// 殺掉（主進程存活，使用者看到的就是白屏）。卸載後兩者都會在下次用時自動
+/// 重載，只多一次載入延遲。
+fn free_memory_for_download(core: &Arc<pipeline::Core>) {
+    llm::unload_blocking();
+    let mut engine = core.engine.lock().unwrap();
+    if engine.is_loaded() {
+        engine.unload();
+        tracing::info!("unloaded STT before model download to reduce memory pressure");
+    }
+}
+
+/// 取消進行中的下載。`.partial` 會保留，下次點下載自動續傳。
+#[tauri::command]
+fn cancel_download(state: tauri::State<AppState>) -> Result<(), String> {
+    state.download_cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
 /// 使用者在 UI 明確點擊後才會呼叫（絕不自動下載，SPEC §6）
 #[tauri::command]
 fn download_model(
@@ -370,10 +393,16 @@ fn download_model(
     let downloading = state.downloading.clone();
     let download_gate = state.download_gate.clone();
     let core = state.core.clone();
+    let cancel = state.download_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
     let activate_after_download = activate.unwrap_or(false);
     std::thread::spawn(move || {
+        // 下載會寫入數 GB 並在結尾整檔 hash；常駐的 STT/LLM 若同時佔著數 GB，
+        // WebKit renderer 會被系統以記憶體壓力殺掉（使用者實測踩過：白屏）。
+        // 先讓出記憶體，下載結束後照原本的用時載入路徑自然回來。
+        free_memory_for_download(&core);
         let dest = registry::model_path(spec);
-        let result = models::download(spec.url, &dest, spec.sha256, |p| {
+        let result = models::download(spec.url, &dest, spec.sha256, &cancel, |p| {
             let _ = app.emit(
                 "model-download",
                 DownloadProgress {
@@ -608,9 +637,13 @@ fn download_builtin_llm(
     }
     let downloading = state.llm_downloading.clone();
     let download_gate = state.download_gate.clone();
+    let core = state.core.clone();
+    let cancel = state.download_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
     std::thread::spawn(move || {
+        free_memory_for_download(&core);
         let dest = llm::model_path(spec);
-        let result = models::download(spec.url, &dest, spec.sha256, |p| {
+        let result = models::download(spec.url, &dest, spec.sha256, &cancel, |p| {
             let _ = app.emit(
                 "llm-model-download",
                 DownloadProgress {
@@ -1176,6 +1209,7 @@ fn init_core(app: &tauri::AppHandle) {
         download_gate: Arc::new(Mutex::new(None)),
         downloading: Arc::new(Mutex::new(None)),
         llm_downloading: Arc::new(Mutex::new(None)),
+        download_cancel: Arc::new(AtomicBool::new(false)),
         mic_test,
         mic_test_passed,
         mic_test_generation,
@@ -1241,6 +1275,7 @@ pub fn run() {
             mic_test_stop,
             list_models,
             download_model,
+            cancel_download,
             set_model,
             delete_model,
             get_llm_config,
