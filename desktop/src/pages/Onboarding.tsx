@@ -596,6 +596,12 @@ export default function Onboarding({
               </div>
             </div>
           )}
+          {!polishLoading && (
+            <p className="setup-note">
+              已經在這台 Mac 使用 Codex？完成首次聽寫後，可到「設定 → AI 潤飾」連接既有登入；
+              這不是完成 Claro 的必要步驟，也不會自動安裝或登入任何工具。
+            </p>
+          )}
         </div>
       </section>
 

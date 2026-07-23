@@ -27,7 +27,7 @@ Tauri v2 桌面 app：**Rust 後端**擁有所有重活（熱鍵、錄音、STT�
 │                        ▼                                         │
 │              textproc.rs 清理 → OpenCC 繁化 → 標點正規化 → 字典    │
 │                        ▼                                         │
-│   polish.rs 潤飾（RAW/CLEAN/ORGANIZE × apple/builtin/ollama/lmstudio/custom）│
+│ polish.rs 潤飾（RAW/CLEAN/CORRECT/ORGANIZE × local/custom/Codex providers） │
 │                        ▼  （失敗一律退回原文）                     │
 │              inject.rs 剪貼簿備份 → Cmd+V → 還原                  │
 │                        ▼                                         │
@@ -126,6 +126,7 @@ StaticText/TextField/TextArea/Heading 內容性角色）。
 | `builtin` | `llm.rs`（llama-cpp-2） | in-process llama.cpp，GGUF 模型（Qwen3-4B 推薦），Metal 全層 offload |
 | `ollama`/`lmstudio` | HTTP | OpenAI-compatible chat/completions（localhost:11434 / :1234） |
 | `custom` | HTTP | 任意 OpenAI-compatible 端點，API key 存 macOS Keychain（`security` CLI），不進 JSON |
+| `codex` | `codex.rs` 子程序 | 使用既有 Codex CLI auth 的 ephemeral `codex exec`；空 cwd、無工具、stdin、structured output。CLI 在本機，但推理永遠屬 cloud |
 | `off` | — | 出廠預設。**不悄悄外連是產品鐵律** |
 
 **輸出模式（與 provider 正交，2026-07-12 P0 Meaning Lock 定案）**：
@@ -134,13 +135,17 @@ StaticText/TextField/TextArea/Heading 內容性角色）。
 |---|---|---|
 | `raw` | 無——完全逐字（也是所有失敗的安全退回） | — |
 | `clean`（新安裝預設意圖） | 刪停頓邊界純填充詞、明確改口只留最終版、補不改語氣的標點；**LLM 不得修改任何文字／英數 token**——專有詞修正交給 STT Context 偏置＋個人字典 | 錨點 multiset（數字/否定/日期/術語）＋語意字元序列比對（窄容忍：前一字元是空白且非句首的「那個/就是說」可缺席——STT 不替停頓補標點，中英間距後的填充詞實測會卡）＋相似度/新增內容比例 |
+| `correct`（首次啟用需明確同意） | 最多三個有詞彙證據的英文專業詞拼法正規化；只允許大小寫、空白、底線、連字號或標點差異，不允許猜測字母替換，也不改數字、日期、否定、URL、email、path、版本或帶數字 token | Codex structured edits 逐項驗證；replacement 必須命中使用者詞彙／正確拼法清單，或另行同意的 canonical Context terms；`from`／`to` 去除 ASCII 非英數並轉小寫後必須完全相同，proposal text 必須逐位元等於本機 deterministic 套用結果。字母不同或同音誤認只走使用者明確建立的個人字典 |
 | `organize`（首次啟用需明確同意） | 完整句讀重排、分段、明確列舉格式化、完全重複合併 | 事實錨點＋內容覆蓋比對 |
 
 **合約（不可違背）**：`transform()` 是 pipeline 唯一入口，任何失敗（provider 掛掉、
 guard 拒絕、取消）一律回 deterministic base text（個人字典後的原文），並在 history
 留下 requested/effective mode、provider、fallback 原因——UI 可顯示 raw/final 與
 復原依據。聽寫不可因 LLM 掛掉而失敗。CLEAN 不把螢幕文字送給 LLM（lexical
-contract 封閉）；只有 ORGANIZE 用 bounded Context 做可解釋的版面判斷。
+contract 封閉）；CORRECT 預設只送轉錄、正確拼法清單與使用者明確建立的個人 canonical
+terms，另行同意時才加上已抽取、清洗且有上限的畫面 canonical terms；只有 ORGANIZE
+用 bounded Context 做可解釋的版面判斷。正確拼法清單只接受逗號／換行分隔的
+ASCII canonical terms，是 stdin 中的不可信資料，不是可覆寫固定安全契約的 system prompt。
 共用底層防呆沿用：空輸出、長度 > max(3×原文, 原文+200)、低重疊（離題回覆）、
 變長且新增內容過半（答指令／提示詞洩漏）→ 退回。
 Meaning Lock fixtures 在 `desktop/tests/eval/meaning_preservation.json`，

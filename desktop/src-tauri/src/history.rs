@@ -262,6 +262,8 @@ mod tests {
                     changed: true,
                     outcome: PolishOutcome::Changed,
                     fallback_reason: None,
+                    codex_policy_epoch: None,
+                    codex_context_used: false,
                 }),
             },
             &path,

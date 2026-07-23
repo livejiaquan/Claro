@@ -1,5 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
+import CodexProviderPanel from "../components/CodexProviderPanel";
+import {
+  codexProviderReducer,
+  consumeCancelledCodexTest,
+  createCodexProviderUiState,
+  normalizeCodexStatus,
+} from "../codexProviderState";
 import DownloadStatus from "../components/DownloadStatus";
 import {
   resolveDownloadState,
@@ -10,6 +17,10 @@ import {
   isPreviewSttModel,
   resolveLlmConfig,
   type ContextAudit,
+  type CodexEnableOptions,
+  type CodexPreferences,
+  type CodexStatus,
+  type CodexTestFailureReason,
   type DictEntry,
   type DownloadProgress,
   type LlmConfig,
@@ -43,6 +54,12 @@ const POLISH_MODES: { id: PolishMode; title: string; tag?: string; description: 
     description: "只處理有停頓邊界的語助詞、明確改口與標點；不改字、不跨句重排、不濃縮。",
   },
   {
+    id: "correct",
+    title: "專業校字",
+    tag: "實驗・需確認",
+    description: "依你提供的正確詞彙，受控統一大小寫、空白與連字號；真正的錯字用個人字典。",
+  },
+  {
     id: "organize",
     title: "條理整理",
     tag: "需確認",
@@ -56,8 +73,15 @@ const OUTCOME_LABEL: Record<string, string> = {
   provider_incomplete: "處理引擎設定尚未完成",
   provider_unavailable: "處理引擎目前不可用",
   model_missing: "整理模型尚未下載",
+  correct_consent_required: "尚未確認專業校字會調整授權詞彙的拼法格式",
   organize_consent_required: "尚未確認條理整理的行為差異",
   cloud_consent_required: "尚未確認雲端資料傳送",
+  codex_not_installed: "尚未找到 Codex CLI",
+  codex_auth_required: "Codex CLI 尚未登入",
+  codex_unsupported: "Codex CLI 版本不支援安全校字",
+  codex_consent_required: "尚未確認 Codex 雲端校字",
+  codex_context_consent_required: "尚未確認有限畫面詞彙傳送",
+  codex_unavailable: "Codex CLI 目前不可用",
   local_only: "僅限本機已阻擋雲端引擎",
   invalid_endpoint: "自訂端點格式不正確",
   invalid_custom_url: "自訂端點格式不正確",
@@ -97,6 +121,23 @@ export default function Settings({
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
   const [pendingMode, setPendingMode] = useState<PolishMode | null>(null);
+  const [codexUi, dispatchCodex] = useReducer(
+    codexProviderReducer,
+    undefined,
+    () => createCodexProviderUiState(),
+  );
+  const [codexEnablePending, setCodexEnablePending] = useState(false);
+  const [codexPreferencesSaving, setCodexPreferencesSaving] = useState(false);
+  const [codexPolicySaving, setCodexPolicySaving] = useState(false);
+  const codexStatusGeneration = useRef(0);
+  const codexTestGeneration = useRef(0);
+  const cancelledCodexTests = useRef(new Set<number>());
+  const llmLoadGeneration = useRef(0);
+  const llmRef = useRef<ResolvedLlmConfig | null>(null);
+  const llmSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
+  const llmSaveSeq = useRef(0);
+  const codexSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
+  const codexMutationSeq = useRef(0);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [confirmCloud, setConfirmCloud] = useState(false);
   const [confirmDisableLocalOnly, setConfirmDisableLocalOnly] = useState(false);
@@ -114,10 +155,22 @@ export default function Settings({
   } | null>(null);
 
   const loadModels = () => invoke<ModelInfo[]>("list_models").then(setModels).catch(() => {});
-  const loadLlm = () =>
-    invoke<LlmConfig>("get_llm_config")
-      .then((config) => setLlm(resolveLlmConfig(config)))
-      .catch((e) => setError(String(e)));
+  const acceptLlmConfig = (config: LlmConfig) => {
+    ++llmLoadGeneration.current;
+    const resolved = resolveLlmConfig(config);
+    llmRef.current = resolved;
+    setLlm(resolved);
+  };
+  const loadLlm = () => {
+    const generation = ++llmLoadGeneration.current;
+    return invoke<LlmConfig>("get_llm_config")
+      .then((config) => {
+        if (generation === llmLoadGeneration.current) acceptLlmConfig(config);
+      })
+      .catch((e) => {
+        if (generation === llmLoadGeneration.current) setError(String(e));
+      });
+  };
   const loadBuiltinLlms = () =>
     invoke<ModelInfo[]>("list_builtin_llms").then(setBuiltinLlms).catch(() => {});
   const loadDict = () => invoke<DictEntry[]>("get_dictionary").then(setDict).catch(() => {});
@@ -141,12 +194,41 @@ export default function Settings({
       .catch((e) => setLocalModelsErr({ provider, msg: String(e) }));
   };
 
+  const probeCodex = () => {
+    const generation = ++codexStatusGeneration.current;
+    dispatchCodex({ type: "status_requested", generation });
+    invoke<CodexStatus>("get_codex_status")
+      .then((result) => {
+        dispatchCodex({
+          type: "status_resolved",
+          generation,
+          status: normalizeCodexStatus(result),
+        });
+        // probe 可能發現登入類型已改變；重新讀 derived consent gate。
+        loadLlm();
+      })
+      .catch(() => {
+        dispatchCodex({
+          type: "status_resolved",
+          generation,
+          status: {
+            availability: "unavailable",
+            version: null,
+            auth_mode: "unknown",
+            error_code: "probe_failed",
+          },
+        });
+      });
+  };
+
   useEffect(() => {
     loadModels();
     loadLlm();
     loadBuiltinLlms();
     loadDict();
     loadContextAudit();
+    // 僅在 mount 載入；各 loader 的 closure 每次 render 會重建。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // 內建 LLM 下載進度改變清單狀態
   useEffect(() => {
@@ -165,6 +247,12 @@ export default function Settings({
     if (llm && (llm.provider === "ollama" || llm.provider === "lmstudio")) {
       loadLocalModels(llm.provider);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [llm?.provider]);
+  useEffect(() => {
+    if (llm?.provider === "codex") probeCodex();
+    else dispatchCodex({ type: "test_reset" });
+    // provider 切換後才探測；Codex 不在首次設定的必要路徑，也不背景消耗額度。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [llm?.provider]);
   // 下載進度事件會改變模型清單狀態
@@ -250,21 +338,23 @@ export default function Settings({
   // 連續操作（選 preset 後馬上改欄位）的兩道防線：
   // 1) llmRef 即時反映最新值——閉包裡的舊 llm 不會把欄位倒退
   // 2) 寫入請求串行化——舊請求不會晚到蓋掉新請求
-  const llmRef = useRef<ResolvedLlmConfig | null>(null);
   // 刻意在 render 同步：事件可能在 effect 前連續觸發，非同步同步會重現欄位倒退 race。
   // eslint-disable-next-line react-hooks/refs
   llmRef.current = llm;
-  const llmSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
   // 第三道防線（review 發現）：佇列中「較舊請求」的後端回應不能落地——
   // 快速連續輸入時，第一個字元的回應會把畫面與 llmRef 倒退成舊前綴，
   // 後續字元再從舊值 merge，最終覆蓋掉完整的新值
-  const llmSaveSeq = useRef(0);
   const saveLlm = (next: Partial<ResolvedLlmConfig>, confirmed = false) => {
     const cur = llmRef.current;
     if (!cur) return;
     const merged = { ...cur, ...next };
     llmRef.current = merged;
+    ++llmLoadGeneration.current;
     setLlm(merged);
+    if (next.provider !== undefined) {
+      setConfirmCloud(false);
+      setConfirmDisableLocalOnly(false);
+    }
     setTestResult(null);
     const seq = ++llmSaveSeq.current;
     llmSaveQueue.current = llmSaveQueue.current.then(() =>
@@ -276,7 +366,7 @@ export default function Settings({
       })
         .then((updated) => {
           if (seq === llmSaveSeq.current) {
-            if (updated) setLlm(resolveLlmConfig(updated));
+            if (updated) acceptLlmConfig(updated);
             else loadLlm();
           }
           if (confirmed) {
@@ -293,18 +383,48 @@ export default function Settings({
 
   const applyMode = (mode: PolishMode, confirmed: boolean) => {
     setError(null);
-    invoke<LlmConfig | null>("set_polish_mode", { mode, confirmed })
-      .then((updated) => {
-        if (updated) setLlm(resolveLlmConfig(updated));
+    const invokeMode = () =>
+      invoke<LlmConfig | null>("set_polish_mode", { mode, confirmed });
+    const applyUpdated = (updated: LlmConfig | null) => {
+        if (updated) acceptLlmConfig(updated);
         else loadLlm();
         setPendingMode(null);
-        onToast(mode === "raw" ? "已切換為原樣轉錄" : mode === "clean" ? "已切換為保守校訂" : "已啟用條理整理");
-      })
-      .catch((e) => setError(String(e)));
+        onToast(
+          mode === "raw"
+            ? "已切換為原樣轉錄"
+            : mode === "clean"
+              ? "已切換為保守校訂"
+              : mode === "correct"
+                ? "已啟用專業校字"
+                : "已啟用條理整理",
+        );
+    };
+    if (llmRef.current?.provider === "codex") {
+      const seq = ++codexMutationSeq.current;
+      setCodexPolicySaving(true);
+      codexSaveQueue.current = codexSaveQueue.current
+        .then(() => llmSaveQueue.current)
+        .then(invokeMode)
+        .then((updated) => {
+          if (seq === codexMutationSeq.current) applyUpdated(updated);
+        })
+        .catch((e) => {
+          if (seq === codexMutationSeq.current) setError(String(e));
+        })
+        .finally(() => {
+          if (seq === codexMutationSeq.current) setCodexPolicySaving(false);
+        });
+      return;
+    }
+    invokeMode().then(applyUpdated).catch((e) => setError(String(e)));
   };
 
   const requestMode = (mode: PolishMode) => {
     if (!llm || mode === llm.polish_mode) return;
+    if (mode === "correct" && !llm.correct_consent_valid) {
+      setPendingMode("correct");
+      return;
+    }
     if (mode === "organize" && !llm.organize_consent_valid) {
       setPendingMode("organize");
       return;
@@ -314,15 +434,190 @@ export default function Settings({
 
   const applyLocalOnly = (enabled: boolean, confirmed: boolean) => {
     setError(null);
-    invoke<LlmConfig | null>("set_local_only", { enabled, confirmed })
-      .then((updated) => {
-        if (updated) setLlm(resolveLlmConfig(updated));
+    const invokeLocalOnly = () =>
+      invoke<LlmConfig | null>("set_local_only", { enabled, confirmed });
+    const applyUpdated = (updated: LlmConfig | null) => {
+        if (updated) acceptLlmConfig(updated);
         else loadLlm();
         setConfirmDisableLocalOnly(false);
         setConfirmCloud(false);
         onToast(enabled ? "已限制為僅限本機" : "已允許使用雲端端點");
+    };
+    if (llmRef.current?.provider === "codex") {
+      const seq = ++codexMutationSeq.current;
+      setCodexPolicySaving(true);
+      codexSaveQueue.current = codexSaveQueue.current
+        .then(() => llmSaveQueue.current)
+        .then(invokeLocalOnly)
+        .then((updated) => {
+          if (seq === codexMutationSeq.current) applyUpdated(updated);
+        })
+        .catch((e) => {
+          if (seq === codexMutationSeq.current) setError(String(e));
+        })
+        .finally(() => {
+          if (seq === codexMutationSeq.current) setCodexPolicySaving(false);
+        });
+      return;
+    }
+    invokeLocalOnly().then(applyUpdated).catch((e) => setError(String(e)));
+  };
+
+  const applyCodexConfig = (updated: LlmConfig | null) => {
+    if (updated) acceptLlmConfig(updated);
+    else loadLlm();
+    refresh();
+  };
+
+  const enableCodex = (options: CodexEnableOptions) => {
+    const seq = ++codexMutationSeq.current;
+    setCodexEnablePending(true);
+    setError(null);
+    codexSaveQueue.current = codexSaveQueue.current
+      .then(() => llmSaveQueue.current)
+      .then(() => {
+        if (llmRef.current?.provider !== "codex") return null;
+        return invoke<LlmConfig | null>("enable_codex_provider", {
+          shareContextTerms: options.share_context_terms,
+          confirmed: true,
+        });
       })
-      .catch((e) => setError(String(e)));
+      .then((updated) => {
+        if (seq === codexMutationSeq.current && llmRef.current?.provider === "codex") {
+          applyCodexConfig(updated);
+          onToast("已啟用 Codex 專業校字");
+        }
+      })
+      .catch((e) => {
+        if (String(e).includes("codex_request_stale")) {
+          loadLlm();
+          return;
+        }
+        setError(String(e));
+      })
+      .finally(() => {
+        if (seq === codexMutationSeq.current) setCodexEnablePending(false);
+      });
+  };
+
+  const setCodexPreferences = (
+    correctionPreferences: string,
+    shareContextTerms: boolean,
+    confirmed: boolean,
+  ) => {
+    const seq = ++codexMutationSeq.current;
+    setCodexPreferencesSaving(true);
+    setError(null);
+    codexSaveQueue.current = codexSaveQueue.current
+      .then(() => llmSaveQueue.current)
+      .then(() => {
+        if (llmRef.current?.provider !== "codex") return null;
+        return invoke<LlmConfig | null>("set_codex_preferences", {
+          correctionPreferences,
+          shareContextTerms,
+          confirmed,
+        });
+      })
+      .then((updated) => {
+        if (seq === codexMutationSeq.current && llmRef.current?.provider === "codex") {
+          applyCodexConfig(updated);
+          onToast(shareContextTerms ? "已更新 Codex 校字設定" : "已儲存正確拼法清單");
+        }
+      })
+      .catch((e) => setError(String(e)))
+      .finally(() => {
+        if (seq === codexMutationSeq.current) setCodexPreferencesSaving(false);
+      });
+  };
+
+  const codexTestFailure = (reason: unknown): CodexTestFailureReason => {
+    const text = String(reason).toLowerCase();
+    if (text.includes("timeout") || text.includes("逾時")) return "timeout";
+    if (text.includes("rate") || text.includes("usage") || text.includes("額度")) {
+      return "rate_limited";
+    }
+    if (text.includes("auth") || text.includes("login") || text.includes("登入")) {
+      return "auth_required";
+    }
+    if (
+      text.includes("reject") ||
+      text.includes("guard") ||
+      text.includes("invalidoutput") ||
+      text.includes("內容保護")
+    ) {
+      return "output_rejected";
+    }
+    if (
+      text.includes("unavailable") ||
+      text.includes("not_installed") ||
+      text.includes("busy")
+    ) {
+      return "unavailable";
+    }
+    return "unknown";
+  };
+
+  const runCodexTest = () => {
+    const generation = ++codexTestGeneration.current;
+    cancelledCodexTests.current.delete(generation);
+    dispatchCodex({ type: "test_started", generation });
+    codexSaveQueue.current
+      .then(() => llmSaveQueue.current)
+      .then(() => {
+        if (
+          consumeCancelledCodexTest(
+            cancelledCodexTests.current,
+            generation,
+          )
+        ) {
+          dispatchCodex({ type: "test_cancelled", generation });
+          return null;
+        }
+        return invoke<{ input: string; output: string }>("test_codex_polish");
+      })
+      .then((result) => {
+        if (!result) return;
+        if (
+          consumeCancelledCodexTest(
+            cancelledCodexTests.current,
+            generation,
+          )
+        ) {
+          dispatchCodex({ type: "test_cancelled", generation });
+          return;
+        }
+        cancelledCodexTests.current.delete(generation);
+        dispatchCodex({ type: "test_succeeded", generation, ...result });
+      })
+      .catch((reason) => {
+        if (
+          consumeCancelledCodexTest(
+            cancelledCodexTests.current,
+            generation,
+          )
+        ) {
+          dispatchCodex({ type: "test_cancelled", generation });
+          return;
+        }
+        cancelledCodexTests.current.delete(generation);
+        dispatchCodex({
+          type: "test_failed",
+          generation,
+          reason: codexTestFailure(reason),
+        });
+      });
+  };
+
+  const cancelCodexTest = () => {
+    const generation = codexTestGeneration.current;
+    cancelledCodexTests.current.add(generation);
+    dispatchCodex({ type: "test_cancel_requested", generation });
+    invoke("cancel_codex_polish")
+      .then(() => dispatchCodex({ type: "test_cancelled", generation }))
+      .catch(() => {
+        cancelledCodexTests.current.delete(generation);
+        dispatchCodex({ type: "test_failed", generation, reason: "unknown" });
+      });
   };
 
   const saveKey = () => {
@@ -375,6 +670,20 @@ export default function Settings({
   const anyDownloadActive =
     orderedModels.some((model) => sttDownloadState(model).active) ||
     builtinLlms.some((model) => llmDownloadState(model).active);
+  const codexPreferences: CodexPreferences = {
+    correction_preferences: llm?.codex_correction_preferences ?? "",
+    share_context_terms: llm?.codex_share_context_terms ?? false,
+    consent_valid: llm?.codex_consent_valid ?? false,
+    context_consent_valid: llm?.codex_context_consent_valid ?? false,
+    correct_consent_valid: llm?.correct_consent_valid ?? false,
+    correct_mode_active: llm?.polish_mode === "correct",
+  };
+  const codexMutationPending =
+    codexEnablePending ||
+    codexPreferencesSaving ||
+    codexPolicySaving ||
+    codexUi.test.phase === "running" ||
+    codexUi.test.phase === "cancelling";
 
   return (
     <div className="page-in">
@@ -602,7 +911,10 @@ export default function Settings({
       </Section>
 
       <Section title="AI 潤飾">
-        <fieldset className="mode-picker" disabled={!llm}>
+        <fieldset
+          className="mode-picker"
+          disabled={!llm || (llm.provider === "codex" && codexMutationPending)}
+        >
           <legend>文字整理模式</legend>
           <p className="mode-picker-help">模式決定 Claro 可以怎麼改文字；處理引擎與資料位置在下方另外選擇。</p>
           <div className="mode-grid">
@@ -620,13 +932,42 @@ export default function Settings({
                 />
                 <span className="mode-card-title">
                   {mode.title}
-                  {mode.tag && <span className={`pill ${mode.id === "organize" ? "amber" : "blue"}`}>{mode.tag}</span>}
+                  {mode.tag && (
+                    <span
+                      className={`pill ${
+                        mode.id === "organize" || mode.id === "correct" ? "amber" : "blue"
+                      }`}
+                    >
+                      {mode.tag}
+                    </span>
+                  )}
                 </span>
                 <span className="mode-card-description">{mode.description}</span>
               </label>
             ))}
           </div>
         </fieldset>
+
+        {pendingMode === "correct" && (
+          <section className="consent-panel" aria-labelledby="correct-confirm-title">
+            <div>
+              <div id="correct-confirm-title" className="consent-title">啟用「專業校字」？</div>
+              <p>這個實驗模式會統一已授權專業詞的拼法格式，與不改字的「保守校訂」不同。</p>
+              <ul>
+                <li><b>可能改變：</b>已授權英文詞的大小寫、空白、底線、連字號或標點。</li>
+                <li><b>不會猜字：</b>字母不同或同音誤認不自動替換；這類固定錯字請用個人字典。</li>
+                <li><b>必須保留：</b>數字、日期、否定、條件、URL、版本、句序與語氣。</li>
+                <li><b>安全退回：</b>沒有足夠證據、處理逾時或內容保護未通過時，使用本機結果。</li>
+              </ul>
+            </div>
+            <div className="consent-actions">
+              <button className="btn no-drag" onClick={() => setPendingMode(null)}>取消</button>
+              <button className="btn-primary no-drag" onClick={() => applyMode("correct", true)}>
+                我了解，啟用專業校字
+              </button>
+            </div>
+          </section>
+        )}
 
         {pendingMode === "organize" && (
           <section className="consent-panel" aria-labelledby="organize-confirm-title">
@@ -667,6 +1008,7 @@ export default function Settings({
               <option value="builtin">Claro 內建模型（不需其他 App）</option>
             </optgroup>
             <optgroup label="進階：只在你已經使用時選擇">
+              <option value="codex">Codex CLI（使用這台 Mac 的既有登入・雲端）</option>
               <option value="ollama">連接既有 Ollama</option>
               <option value="lmstudio">連接既有 LM Studio</option>
               <option value="custom">自訂 API（OpenAI 相容）</option>
@@ -674,16 +1016,49 @@ export default function Settings({
           </select>
         </Row>
 
+        {llm?.provider === "codex" && (
+          <CodexProviderPanel
+            status={codexUi.status}
+            preferences={codexPreferences}
+            testState={codexUi.test}
+            globalContextEnabled={status.context_enabled}
+            enablePending={codexEnablePending}
+            preferencesSaving={codexPreferencesSaving || codexPolicySaving}
+            onRefresh={probeCodex}
+            onEnable={enableCodex}
+            onSaveCorrectionPreferences={(value) =>
+              setCodexPreferences(value, codexPreferences.share_context_terms, false)
+            }
+            onShareContextTermsChange={(enabled) =>
+              setCodexPreferences(
+                codexPreferences.correction_preferences,
+                enabled,
+                enabled,
+              )
+            }
+            onTest={runCodexTest}
+            onCancelTest={cancelCodexTest}
+          />
+        )}
+
         <Row
           label="僅限本機"
-          sub="開啟後硬性阻擋所有雲端整理；模式與雲端設定會保留，但不會送出資料。"
+          sub={
+            llm?.provider === "codex" && llm.local_only
+              ? "已硬性阻擋 Codex。要重新啟用，請先在上方檢查登入並確認資料傳送。"
+              : "開啟後硬性阻擋所有雲端整理；模式與雲端設定會保留，但不會送出資料。"
+          }
         >
           <label className="local-only-control">
             <input
               type="checkbox"
               name="local-only"
               checked={llm?.local_only ?? false}
-              disabled={!llm}
+              disabled={
+                !llm ||
+                (llm.provider === "codex" &&
+                  (llm.local_only || codexMutationPending))
+              }
               onChange={(e) => {
                 if (!e.target.checked) setConfirmDisableLocalOnly(true);
                 else applyLocalOnly(true, true);
@@ -693,7 +1068,7 @@ export default function Settings({
           </label>
         </Row>
 
-        {confirmDisableLocalOnly && (
+        {confirmDisableLocalOnly && llm?.provider === "custom" && (
           <section className="consent-panel" aria-labelledby="network-confirm-title">
             <div>
               <div id="network-confirm-title" className="consent-title">允許使用雲端端點？</div>
@@ -718,13 +1093,13 @@ export default function Settings({
         {llm && llm.polish_mode !== "raw" && llm.effective_mode === "raw" && llm.blocked_reason && (
           <div className="config-warning" role="status">
             <span><b>目前安全退回原樣轉錄：</b>{OUTCOME_LABEL[llm.blocked_reason] ?? "整理設定尚未就緒"}，不會送出雲端資料。</span>
-            {llm.blocked_reason === "cloud_consent_required" && (
+            {llm.provider === "custom" && llm.blocked_reason === "cloud_consent_required" && (
               <button className="btn no-drag" onClick={() => setConfirmCloud(true)}>檢視並允許</button>
             )}
           </div>
         )}
 
-        {confirmCloud && llm?.execution_location === "cloud" && (
+        {confirmCloud && llm?.provider === "custom" && llm.execution_location === "cloud" && (
           <section className="consent-panel" aria-labelledby="cloud-endpoint-confirm-title">
             <div>
               <div id="cloud-endpoint-confirm-title" className="consent-title">允許雲端整理？</div>
@@ -1005,7 +1380,7 @@ export default function Settings({
           </>
         )}
 
-        {llm && llm.provider !== "off" && (
+        {llm && llm.provider !== "off" && llm.provider !== "codex" && (
           <>
             <Row label="測試潤飾" sub="送一句「嗯我們用 hyTorch，那個，跑訓練」看看效果">
               <button className="btn no-drag" onClick={runTest} disabled={testing}>
@@ -1038,6 +1413,7 @@ export default function Settings({
                 .then(() => {
                   if (!enabled) setContextAudit(null);
                   refresh();
+                  loadLlm();
                 })
                 .catch((err) => setError(String(err)));
             }}
@@ -1225,7 +1601,7 @@ export default function Settings({
       <Section title="關於">
         <Row
           label="Claro"
-          sub="語音辨識固定在本機；你明確允許的雲端整理端點只會收到轉錄文字，且只有條理整理搭配已開啟的畫面上下文時才會收到 bounded Context。"
+          sub="語音辨識與音訊固定在本機。自訂端點只收到你同意的文字範圍；Codex 主同意包含轉錄與個人正確詞彙，畫面詞彙另行同意，完整畫面內容永不送給 Codex。"
         >
           <span className="text-[12.5px]" style={{ color: "var(--faint)" }}>
             v0.1.0

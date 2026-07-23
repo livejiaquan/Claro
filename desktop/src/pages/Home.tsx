@@ -25,6 +25,7 @@ function isToday(ts: string) {
 const MODE_LABEL = {
   raw: "原樣轉錄",
   clean: "保守校訂",
+  correct: "專業校字",
   organize: "條理整理",
 } as const;
 
@@ -34,6 +35,7 @@ const PROVIDER_LABEL: Record<string, string> = {
   ollama: "Ollama",
   lmstudio: "LM Studio",
   custom: "自訂端點",
+  codex: "OpenAI Codex",
 };
 
 const BLOCKED_COPY: Record<string, string> = {
@@ -42,8 +44,15 @@ const BLOCKED_COPY: Record<string, string> = {
   provider_incomplete: "整理引擎設定尚未完成",
   provider_unavailable: "整理引擎目前不可用",
   model_missing: "整理模型尚未下載",
+  correct_consent_required: "尚未確認專業校字會調整授權詞彙的拼法格式",
   organize_consent_required: "尚未確認條理整理的行為差異",
   cloud_consent_required: "尚未確認雲端資料傳送",
+  codex_not_installed: "尚未找到 Codex CLI",
+  codex_auth_required: "Codex CLI 尚未登入",
+  codex_unsupported: "Codex CLI 版本不支援安全校字",
+  codex_consent_required: "尚未確認 Codex 雲端校字",
+  codex_context_consent_required: "尚未確認有限畫面詞彙傳送",
+  codex_unavailable: "Codex CLI 目前不可用",
   local_only: "「僅限本機」正在阻擋雲端引擎",
   invalid_endpoint: "自訂端點格式不正確",
   invalid_custom_url: "自訂端點格式不正確",
@@ -118,7 +127,13 @@ function privacyMessage(llm: ResolvedLlmConfig | null, failed: boolean, contextE
   }
 
   const mode = MODE_LABEL[llm.effective_mode];
-  const contextIsSent = llm.effective_mode === "organize" && contextEnabled;
+  const boundedContextIsSent = llm.effective_mode === "organize" && contextEnabled;
+  const codexTermsAreSent =
+    llm.provider === "codex" &&
+    llm.effective_mode === "correct" &&
+    contextEnabled &&
+    llm.codex_share_context_terms &&
+    llm.codex_context_consent_valid;
   if (llm.execution_location === "on_device") {
     return {
       tone: "local",
@@ -127,7 +142,7 @@ function privacyMessage(llm: ResolvedLlmConfig | null, failed: boolean, contextE
     };
   }
   if (llm.execution_location === "local_service") {
-    const data = contextIsSent ? "轉錄文字與畫面上下文" : "轉錄文字";
+    const data = boundedContextIsSent ? "轉錄文字與畫面上下文" : "轉錄文字";
     return {
       tone: "local",
       title: `本機服務・${mode}`,
@@ -135,11 +150,19 @@ function privacyMessage(llm: ResolvedLlmConfig | null, failed: boolean, contextE
     };
   }
   if (llm.execution_location === "cloud") {
-    const data = contextIsSent ? "轉錄文字與畫面上下文" : "轉錄文字";
+    const data = boundedContextIsSent
+      ? "轉錄文字與畫面上下文"
+      : codexTermsAreSent
+        ? "轉錄文字、校字偏好與有限畫面詞彙"
+        : llm.provider === "codex"
+          ? "轉錄文字與校字偏好"
+          : "轉錄文字";
+    const destination =
+      llm.destination_label ?? llm.endpoint_origin ?? "你設定的端點";
     return {
       tone: "cloud",
       title: `雲端整理・${mode}`,
-      detail: `${data}會送到 ${llm.endpoint_origin ?? "你設定的端點"}；音訊不傳送。`,
+      detail: `${data}會送到 ${destination}；音訊不傳送。`,
     };
   }
 

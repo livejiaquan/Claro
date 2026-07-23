@@ -2,6 +2,7 @@
 //! - `apple`：Apple Intelligence 端上模型（FoundationModels，macOS 26+，Swift bridge）
 //! - `ollama` / `lmstudio`：本機服務，OpenAI-compatible HTTP
 //! - `custom`：任何 OpenAI-compatible 端點（BYOK，key 存 Keychain）
+//! - `codex`：使用既有 Codex CLI 登入的受控 CORRECT 雲端校字
 //!
 //! 鐵律：潤飾失敗永遠退回原文，聽寫不可因 LLM 掛掉而失敗。
 
@@ -10,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::settings::{PolishMode, Settings};
@@ -91,10 +92,18 @@ pub enum ExecutionLocation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolishFallbackReason {
+    CorrectConsentRequired,
     OrganizeConsentRequired,
     ProviderUnavailable,
     LocalOnly,
     CloudConsentRequired,
+    CodexBusy,
+    CodexCancelled,
+    CodexTimeout,
+    CodexUsageLimited,
+    CodexAuthRequired,
+    CodexInvalidOutput,
+    CodexOutputRejected,
     InvalidCustomUrl,
     ProviderError,
     EmptyOutput,
@@ -113,6 +122,11 @@ pub struct PolishMetadata {
     pub outcome: PolishOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<PolishFallbackReason>,
+    /// 僅供同一 process 的 paste linearization；不得寫進 history。
+    #[serde(skip)]
+    pub codex_policy_epoch: Option<u64>,
+    #[serde(skip)]
+    pub codex_context_used: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +213,7 @@ pub fn execution_location(s: &Settings) -> ExecutionLocation {
         "off" | "" => ExecutionLocation::None,
         "apple" | "builtin" => ExecutionLocation::OnDevice,
         "ollama" | "lmstudio" => ExecutionLocation::LocalService,
+        "codex" => ExecutionLocation::Cloud,
         "custom" => match custom_endpoint_is_loopback(&s.llm_base_url()) {
             Ok(true) => ExecutionLocation::LocalService,
             // 無效 URL 也不能被誤標為本機。
@@ -212,6 +227,26 @@ pub fn endpoint_origin(s: &Settings) -> Option<String> {
     (s.llm_provider() == "custom")
         .then(|| custom_endpoint_origin(&s.llm_base_url()))
         .flatten()
+}
+
+/// 雲端同意必須綁定到可比較的精確目標。custom 綁 origin；Codex 另綁
+/// CLI 目前登入類型與 runner contract 版本，登入方式改變後不可沿用舊同意。
+pub fn cloud_consent_target(s: &Settings) -> Option<String> {
+    match s.llm_provider().as_str() {
+        "custom" if !custom_endpoint_is_loopback(&s.llm_base_url()).unwrap_or(false) => {
+            custom_endpoint_origin(&s.llm_base_url()).map(|origin| format!("custom:{origin}"))
+        }
+        "codex" => s.codex_auth_mode().map(crate::codex::consent_target),
+        _ => None,
+    }
+}
+
+pub fn destination_label(s: &Settings) -> Option<String> {
+    match s.llm_provider().as_str() {
+        "codex" => Some("OpenAI Codex".into()),
+        "custom" => endpoint_origin(s),
+        _ => None,
+    }
 }
 
 fn validate_authority(rest: &str, loopback_only: bool) -> Result<()> {
@@ -294,11 +329,29 @@ pub fn blocked_reason(s: &Settings) -> Option<&'static str> {
     if mode == PolishMode::Raw {
         return None;
     }
+    if mode == PolishMode::Correct && !s.correct_consent_valid() {
+        return Some("correct_consent_required");
+    }
     if mode == PolishMode::Organize && !s.organize_consent_valid() {
         return Some("organize_consent_required");
     }
     match s.llm_provider().as_str() {
         "off" | "" => Some("provider_missing"),
+        "codex" if mode != PolishMode::Correct => Some("provider_unavailable"),
+        "codex" if crate::codex::resolve_executable(s.codex_cli_path().as_deref()).is_none() => {
+            Some("codex_not_installed")
+        }
+        "codex" if s.codex_auth_mode().is_none() => Some("codex_auth_required"),
+        "codex" if s.local_only() => Some("local_only"),
+        "codex" if !s.cloud_consent_valid() => Some("codex_consent_required"),
+        "codex"
+            if s.context_enabled()
+                && s.codex_share_context_terms()
+                && !s.codex_context_consent_valid() =>
+        {
+            Some("codex_context_consent_required")
+        }
+        "codex" => None,
         "apple" if apple_status() != 0 => Some("provider_unavailable"),
         "builtin" => {
             let model_id =
@@ -352,6 +405,336 @@ enum GuardRejection {
     MeaningAnchorMismatch,
 }
 
+/// CORRECT provider 必須回傳可稽核的 edit 清單與完整候選文字；未知欄位直接拒絕，
+/// 避免模型在 schema 外夾帶自然語言說明或未授權資料。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CorrectionEdit {
+    pub(crate) from: String,
+    pub(crate) to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CorrectionProposal {
+    pub(crate) text: String,
+    pub(crate) replacements: Vec<CorrectionEdit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CorrectionGuardRejection {
+    TooManyEdits,
+    InvalidEdit,
+    LengthViolation,
+    UnauthorizedReplacement,
+    NonAsciiReplacement,
+    DissimilarEdit,
+    ExcessiveEdit,
+    NumericEdit,
+    ProtectedEdit,
+    SourceNotUnique,
+    OverlappingEdit,
+    CascadingEdit,
+    MeaningAnchorMismatch,
+    CleanFormatRejected,
+}
+
+#[derive(Debug)]
+struct AuthorizedEdit<'a> {
+    start: usize,
+    end: usize,
+    edit: &'a CorrectionEdit,
+}
+
+fn canonical_preference_terms(preferences: &str) -> Vec<String> {
+    // 「校字偏好」不是自由指令：只有逗號／換行分隔、整段就是 ASCII
+    // canonical spelling 的項目才有授權力。自然語言（尤其「不要用 X」）
+    // 一律不能因為剛好含有 X 就授權改字。
+    preferences
+        .split(['\n', '\r', ',', '，', '、', ';', '；'])
+        .map(str::trim)
+        .filter(|candidate| {
+            !candidate.is_empty()
+                && candidate.chars().count() <= 80
+                && candidate.split_whitespace().count() <= 5
+                && candidate.chars().any(|c| c.is_ascii_alphabetic())
+                && candidate.chars().all(|c| {
+                    c.is_ascii_alphanumeric()
+                        || c.is_ascii_whitespace()
+                        || matches!(c, '.' | '_' | '-' | '+')
+                })
+        })
+        .take(32)
+        .map(str::to_string)
+        .collect()
+}
+
+fn preference_contains_exact_term(preferences: &str, term: &str) -> bool {
+    !term.is_empty()
+        && canonical_preference_terms(preferences)
+            .iter()
+            .any(|candidate| candidate == term)
+}
+
+fn normalized_ascii_spelling(value: &str) -> Vec<u8> {
+    value
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect()
+}
+
+fn spellings_are_normalization_equivalent(left: &str, right: &str) -> bool {
+    let left = normalized_ascii_spelling(left);
+    let right = normalized_ascii_spelling(right);
+    left.len() >= 2 && left == right
+}
+
+fn safe_ascii_spelling(value: &str) -> bool {
+    value.is_ascii()
+        && value.chars().any(|c| c.is_ascii_alphabetic())
+        && value.split_whitespace().count() <= 5
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || c.is_ascii_whitespace()
+                || matches!(c, '.' | '_' | '-' | '+')
+        })
+}
+
+fn protected_english_semantic_token(value: &str) -> bool {
+    value
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .any(|token| {
+            matches!(
+                token.as_str(),
+                "no" | "not"
+                    | "never"
+                    | "none"
+                    | "without"
+                    | "cannot"
+                    | "cant"
+                    | "dont"
+                    | "wont"
+                    | "may"
+                    | "might"
+                    | "must"
+                    | "should"
+                    | "could"
+                    | "would"
+                    | "can"
+                    | "will"
+                    | "if"
+                    | "unless"
+                    | "else"
+                    | "only"
+                    | "zero"
+                    | "one"
+                    | "two"
+                    | "three"
+                    | "four"
+                    | "five"
+                    | "six"
+                    | "seven"
+                    | "eight"
+                    | "nine"
+                    | "ten"
+                    | "hundred"
+                    | "thousand"
+                    | "million"
+                    | "billion"
+                    | "first"
+                    | "second"
+                    | "third"
+            )
+        })
+}
+
+fn unique_source_span(original: &str, source: &str) -> Option<(usize, usize)> {
+    let mut found = None;
+    // `str::match_indices` 不保證找出重疊 occurrence；逐一檢查合法 UTF-8
+    // 邊界，`aaa` 中的 `aa` 才會正確視為不唯一。
+    for (start, _) in original.char_indices() {
+        if original[start..].starts_with(source) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some((start, start + source.len()));
+        }
+    }
+    found
+}
+
+fn has_ascii_spelling_boundaries(original: &str, start: usize, end: usize) -> bool {
+    let touches_left = original[..start]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    let touches_right = original[end..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    !touches_left && !touches_right
+}
+
+fn correction_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '.' | '_' | '-' | '+' | '/' | '\\' | ':' | '@' | '%' | '~' | '#' | '?' | '=' | '&'
+        )
+}
+
+fn looks_like_protected_fragment(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("http://")
+        || lower.contains("https://")
+        || lower.starts_with("www.")
+        || value.starts_with('.')
+        || value.ends_with('.')
+        || value.contains('@')
+        || value.contains('/')
+        || value.contains('\\')
+}
+
+fn looks_like_protected_token(token: &str) -> bool {
+    if looks_like_protected_fragment(token) || token.chars().any(char::is_numeric) {
+        return true;
+    }
+    let chars: Vec<char> = token.chars().collect();
+    chars.windows(3).any(|window| {
+        window[1] == '.' && window[0].is_ascii_alphanumeric() && window[2].is_ascii_alphanumeric()
+    })
+}
+
+fn edit_touches_protected_token(original: &str, start: usize, end: usize) -> bool {
+    let mut token_start = start;
+    for (index, c) in original[..start].char_indices().rev() {
+        if !correction_token_char(c) {
+            break;
+        }
+        token_start = index;
+    }
+    let mut token_end = end;
+    for c in original[end..].chars() {
+        if !correction_token_char(c) {
+            break;
+        }
+        token_end += c.len_utf8();
+    }
+    looks_like_protected_token(&original[token_start..token_end])
+}
+
+/// 授權並套用 CORRECT 的結構化 edit。所有 offset 都以原文為準且一次性
+/// 套用；`proposal.text` 必須精確等於本機套用結果，不能夾帶 CLEAN 格式化，
+/// 也不會讓前一個 replacement 產生後一個 edit 的新輸入。
+pub(crate) fn authorize_correction_proposal(
+    original: &str,
+    proposal: &CorrectionProposal,
+    approved_terms: &[String],
+    preferences: &str,
+) -> std::result::Result<String, CorrectionGuardRejection> {
+    if proposal.replacements.len() > 3 {
+        return Err(CorrectionGuardRejection::TooManyEdits);
+    }
+
+    let mut authorized = Vec::with_capacity(proposal.replacements.len());
+    let mut total_source_chars = 0_usize;
+    for edit in &proposal.replacements {
+        if edit.from.is_empty()
+            || edit.to.is_empty()
+            || edit.from == edit.to
+            || edit.from.trim() != edit.from
+            || edit.to.trim() != edit.to
+            || edit.from.chars().count() > 80
+            || edit.to.chars().count() > 80
+        {
+            return Err(CorrectionGuardRejection::InvalidEdit);
+        }
+        if !safe_ascii_spelling(&edit.from) || !safe_ascii_spelling(&edit.to) {
+            return Err(CorrectionGuardRejection::NonAsciiReplacement);
+        }
+        if protected_english_semantic_token(&edit.from)
+            || protected_english_semantic_token(&edit.to)
+        {
+            return Err(CorrectionGuardRejection::MeaningAnchorMismatch);
+        }
+        if !spellings_are_normalization_equivalent(&edit.from, &edit.to) {
+            return Err(CorrectionGuardRejection::DissimilarEdit);
+        }
+        total_source_chars += edit.from.chars().count();
+        if edit.from.chars().any(char::is_numeric) || edit.to.chars().any(char::is_numeric) {
+            return Err(CorrectionGuardRejection::NumericEdit);
+        }
+        if looks_like_protected_fragment(&edit.from) || looks_like_protected_fragment(&edit.to) {
+            return Err(CorrectionGuardRejection::ProtectedEdit);
+        }
+        let allowed = approved_terms.iter().any(|term| term == &edit.to)
+            || preference_contains_exact_term(preferences, &edit.to);
+        if !allowed {
+            return Err(CorrectionGuardRejection::UnauthorizedReplacement);
+        }
+        let Some((start, end)) = unique_source_span(original, &edit.from) else {
+            return Err(CorrectionGuardRejection::SourceNotUnique);
+        };
+        if !has_ascii_spelling_boundaries(original, start, end) {
+            return Err(CorrectionGuardRejection::InvalidEdit);
+        }
+        if edit_touches_protected_token(original, start, end) {
+            return Err(CorrectionGuardRejection::ProtectedEdit);
+        }
+        authorized.push(AuthorizedEdit { start, end, edit });
+    }
+    let original_chars = original.chars().count();
+    if total_source_chars > 24_usize.max(original_chars.saturating_mul(2) / 5) {
+        return Err(CorrectionGuardRejection::ExcessiveEdit);
+    }
+
+    authorized.sort_by_key(|item| item.start);
+    for pair in authorized.windows(2) {
+        if pair[1].start < pair[0].end {
+            return Err(CorrectionGuardRejection::OverlappingEdit);
+        }
+    }
+    for (index, edit) in proposal.replacements.iter().enumerate() {
+        if proposal
+            .replacements
+            .iter()
+            .enumerate()
+            .any(|(other_index, other)| {
+                index != other_index && edit.to.contains(other.from.as_str())
+            })
+        {
+            return Err(CorrectionGuardRejection::CascadingEdit);
+        }
+    }
+
+    let mut authorized_source = String::with_capacity(original.len());
+    let mut cursor = 0;
+    for item in authorized {
+        authorized_source.push_str(&original[cursor..item.start]);
+        authorized_source.push_str(&item.edit.to);
+        cursor = item.end;
+    }
+    authorized_source.push_str(&original[cursor..]);
+
+    let authorized_chars = authorized_source.chars().count();
+    if authorized_chars > (original_chars * 3).max(original_chars + 200) {
+        return Err(CorrectionGuardRejection::LengthViolation);
+    }
+    if critical_anchors(original) != critical_anchors(&authorized_source) {
+        return Err(CorrectionGuardRejection::MeaningAnchorMismatch);
+    }
+
+    // CORRECT 不是 CLEAN：模型的 `text` 必須逐位元等於本機依 replacements
+    // 套出的結果。零 edits 不能藉 CLEAN 的格式容忍度重排或刪除任何內容。
+    if proposal.text != authorized_source {
+        return Err(CorrectionGuardRejection::CleanFormatRejected);
+    }
+    Ok(authorized_source)
+}
+
 impl From<GuardRejection> for PolishFallbackReason {
     fn from(value: GuardRejection) -> Self {
         match value {
@@ -384,7 +767,9 @@ fn guard_candidate(
 
     match mode {
         PolishMode::Raw => Ok(original.to_string()),
-        PolishMode::Clean => {
+        // 一般 provider 尚未接結構化 CORRECT；即使設定成 CORRECT，這條舊路徑
+        // 也只能做 CLEAN 格式處理。授權改字只能走 authorize_correction_proposal。
+        PolishMode::Clean | PolishMode::Correct => {
             let comparison_source = text_without_corrected_clause(original);
             match clean_checks(original, &comparison_source, &candidate) {
                 Ok(()) => Ok(candidate),
@@ -1123,6 +1508,33 @@ fn critical_anchors(text: &str) -> std::collections::BTreeMap<String, usize> {
     }
 
     for token in ascii_semantic_tokens(&normalized) {
+        let category = if [
+            "no", "not", "never", "none", "without", "cannot", "cant", "dont", "wont",
+        ]
+        .contains(&token.as_str())
+        {
+            Some("negation")
+        } else if [
+            "may", "might", "must", "should", "could", "would", "can", "will",
+        ]
+        .contains(&token.as_str())
+        {
+            Some("modal")
+        } else if ["if", "unless", "else", "only"].contains(&token.as_str()) {
+            Some("condition")
+        } else if [
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+            "hundred", "thousand", "million", "billion", "first", "second", "third",
+        ]
+        .contains(&token.as_str())
+        {
+            Some("number_word")
+        } else {
+            None
+        };
+        if let Some(category) = category {
+            add(&mut out, category, &token);
+        }
         if [
             "enable", "disable", "allow", "deny", "accept", "reject", "increase", "decrease",
             "start", "stop", "send", "cancel", "include", "exclude", "keep", "delete", "add",
@@ -1210,7 +1622,7 @@ fn content_metrics(a: &str, b: &str) -> (f64, f64, bool) {
 
 fn system_prompt(mode: PolishMode) -> &'static str {
     match mode {
-        PolishMode::Clean => CLEAN_SYSTEM_PROMPT,
+        PolishMode::Clean | PolishMode::Correct => CLEAN_SYSTEM_PROMPT,
         PolishMode::Organize => ORGANIZE_SYSTEM_PROMPT,
         PolishMode::Raw => CLEAN_SYSTEM_PROMPT, // RAW 不會實際呼叫 provider
     }
@@ -1218,7 +1630,7 @@ fn system_prompt(mode: PolishMode) -> &'static str {
 
 fn apple_instructions(mode: PolishMode) -> &'static str {
     match mode {
-        PolishMode::Clean => APPLE_CLEAN_INSTRUCTIONS,
+        PolishMode::Clean | PolishMode::Correct => APPLE_CLEAN_INSTRUCTIONS,
         PolishMode::Organize => APPLE_ORGANIZE_INSTRUCTIONS,
         PolishMode::Raw => APPLE_CLEAN_INSTRUCTIONS,
     }
@@ -1227,6 +1639,8 @@ fn apple_instructions(mode: PolishMode) -> &'static str {
 fn user_prompt(mode: PolishMode, text: &str, context: &str) -> String {
     let surface_guidance = if mode == PolishMode::Organize {
         crate::context::surface_guidance(context)
+    } else if mode == PolishMode::Correct {
+        "CORRECT：此一般 provider 路徑只允許 CLEAN 格式處理；授權改字必須走結構化 correction proposal"
     } else {
         "CLEAN：Context 只供 STT 解碼期詞彙偏置；LLM 不得改字、語氣、格式或段落"
     };
@@ -1249,9 +1663,13 @@ fn user_prompt(mode: PolishMode, text: &str, context: &str) -> String {
 
 fn fallback_reason_for_block(reason: &str) -> PolishFallbackReason {
     match reason {
+        "correct_consent_required" => PolishFallbackReason::CorrectConsentRequired,
         "organize_consent_required" => PolishFallbackReason::OrganizeConsentRequired,
         "local_only" => PolishFallbackReason::LocalOnly,
-        "cloud_consent_required" => PolishFallbackReason::CloudConsentRequired,
+        "cloud_consent_required" | "codex_consent_required" | "codex_context_consent_required" => {
+            PolishFallbackReason::CloudConsentRequired
+        }
+        "codex_auth_required" => PolishFallbackReason::CodexAuthRequired,
         "invalid_endpoint" => PolishFallbackReason::InvalidCustomUrl,
         _ => PolishFallbackReason::ProviderUnavailable,
     }
@@ -1267,6 +1685,8 @@ fn fallback_result(settings: &Settings, text: &str, reason: PolishFallbackReason
             changed: false,
             outcome: PolishOutcome::Fallback,
             fallback_reason: Some(reason),
+            codex_policy_epoch: None,
+            codex_context_used: false,
         },
     }
 }
@@ -1285,6 +1705,8 @@ where
                 changed: false,
                 outcome: PolishOutcome::Raw,
                 fallback_reason: None,
+                codex_policy_epoch: None,
+                codex_context_used: false,
             },
         };
     }
@@ -1326,12 +1748,185 @@ where
                         PolishOutcome::Unchanged
                     },
                     fallback_reason: None,
+                    codex_policy_epoch: None,
+                    codex_context_used: false,
                 },
             }
         }
         Err(reason) => {
             tracing::warn!("polish output rejected by {:?} guard: {reason:?}", mode);
             fallback_result(settings, text, reason.into())
+        }
+    }
+}
+
+fn codex_fallback(error: crate::codex::CodexError) -> PolishFallbackReason {
+    use crate::codex::CodexError;
+    match error {
+        CodexError::Busy => PolishFallbackReason::CodexBusy,
+        CodexError::Cancelled => PolishFallbackReason::CodexCancelled,
+        CodexError::Timeout => PolishFallbackReason::CodexTimeout,
+        CodexError::RateLimited => PolishFallbackReason::CodexUsageLimited,
+        CodexError::AuthRequired | CodexError::ConsentChanged => {
+            PolishFallbackReason::CodexAuthRequired
+        }
+        CodexError::InvalidOutput | CodexError::OutputTooLarge => {
+            PolishFallbackReason::CodexInvalidOutput
+        }
+        CodexError::NotInstalled
+        | CodexError::Unavailable
+        | CodexError::NetworkUnavailable
+        | CodexError::InputTooLarge => PolishFallbackReason::ProviderUnavailable,
+    }
+}
+
+fn bounded_unique_terms(values: impl IntoIterator<Item = String>, limit: usize) -> Vec<String> {
+    let mut output = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty()
+            || value.chars().count() > 128
+            || value.chars().any(char::is_control)
+            || !value.chars().any(|c| c.is_ascii_alphabetic())
+            || value.chars().any(char::is_numeric)
+            || looks_like_protected_fragment(value)
+            || looks_like_protected_token(value)
+            || output.iter().any(|existing| existing == value)
+        {
+            continue;
+        }
+        output.push(value.to_string());
+        if output.len() >= limit {
+            break;
+        }
+    }
+    output
+}
+
+fn transform_codex_with_cancel(
+    settings: &Settings,
+    text: &str,
+    local_terms: &[String],
+    screen_terms: &[String],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> PolishResult {
+    // Pipeline 的 settings 可能早於 STT；雲端傳送前必須在 policy gate 內重讀。
+    // 這份 fresh snapshot 與 generation 一起交給 runner，任何後續撤銷都會讓
+    // stdin writer fail closed。字典／詞彙若在 STT 期間變動，也不送舊候選。
+    let (current, policy_epoch) = crate::codex::policy_snapshot(Settings::load);
+    if settings.vocabulary() != current.vocabulary()
+        || settings.dictionary() != current.dictionary()
+    {
+        return fallback_result(&current, text, PolishFallbackReason::CodexCancelled);
+    }
+    if let Some(reason) = blocked_reason(&current) {
+        return fallback_result(&current, text, fallback_reason_for_block(reason));
+    }
+    let Some(expected_auth) = current.codex_auth_mode() else {
+        return fallback_result(&current, text, PolishFallbackReason::CodexAuthRequired);
+    };
+
+    // 個人詞彙是使用者明確建立的正確拼法；畫面詞彙則只有在第二層同意有效
+    // 時加入。兩者分欄傳給 runner，避免模型誤把畫面候選當成較高權重指令。
+    let vocabulary_terms = bounded_unique_terms(local_terms.iter().cloned(), 32);
+    let shared_context_terms = if current.context_enabled()
+        && current.codex_share_context_terms()
+        && current.codex_context_consent_valid()
+    {
+        bounded_unique_terms(screen_terms.iter().cloned(), 32)
+    } else {
+        Vec::new()
+    };
+    let mut approved_terms = vocabulary_terms.clone();
+    for term in &shared_context_terms {
+        if !approved_terms.contains(term) {
+            approved_terms.push(term.clone());
+        }
+    }
+    let request = crate::codex::CodexRequest {
+        transcript: text.to_string(),
+        context_terms: shared_context_terms,
+        vocabulary_terms,
+        canonical_spellings: canonical_preference_terms(&current.codex_correction_preferences()),
+        mode: "correct".into(),
+    };
+    let output = match crate::codex::run(
+        current.codex_cli_path().as_deref(),
+        &request,
+        cancel,
+        expected_auth,
+        policy_epoch,
+        Duration::from_secs(8),
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::warn!("Codex polish failed safely: {error}");
+            return fallback_result(&current, text, codex_fallback(error));
+        }
+    };
+
+    // 外部手動改 config 不會推進 process-local generation，因此除了 epoch
+    // 還要重驗所有會改變 payload／授權範圍的欄位。
+    let (latest, latest_epoch) = crate::codex::policy_snapshot(Settings::load);
+    let context_was_shared = !request.context_terms.is_empty();
+    if latest_epoch != policy_epoch
+        || latest.llm_provider() != "codex"
+        || latest.polish_mode() != PolishMode::Correct
+        || latest.local_only()
+        || !latest.cloud_consent_valid()
+        || cloud_consent_target(&latest) != cloud_consent_target(&current)
+        || latest.codex_auth_mode() != current.codex_auth_mode()
+        || latest.codex_cli_path() != current.codex_cli_path()
+        || latest.codex_correction_preferences() != current.codex_correction_preferences()
+        || latest.vocabulary() != current.vocabulary()
+        || latest.dictionary() != current.dictionary()
+        || (context_was_shared
+            && (!latest.context_enabled()
+                || !latest.codex_share_context_terms()
+                || !latest.codex_context_consent_valid()))
+    {
+        return fallback_result(&latest, text, PolishFallbackReason::CloudConsentRequired);
+    }
+
+    let proposal = CorrectionProposal {
+        text: output.text,
+        replacements: output
+            .replacements
+            .into_iter()
+            .map(|edit| CorrectionEdit {
+                from: edit.from,
+                to: edit.to,
+            })
+            .collect(),
+    };
+    match authorize_correction_proposal(
+        text,
+        &proposal,
+        &approved_terms,
+        &current.codex_correction_preferences(),
+    ) {
+        Ok(output_text) => {
+            let changed = output_text != text;
+            PolishResult {
+                text: output_text,
+                metadata: PolishMetadata {
+                    mode: PolishMode::Correct,
+                    provider: Some("codex".into()),
+                    changed,
+                    outcome: if changed {
+                        PolishOutcome::Changed
+                    } else {
+                        PolishOutcome::Unchanged
+                    },
+                    fallback_reason: None,
+                    codex_policy_epoch: Some(policy_epoch),
+                    codex_context_used: context_was_shared,
+                },
+            }
+        }
+        Err(reason) => {
+            tracing::warn!("Codex correction rejected by local guard: {reason:?}");
+            fallback_result(&current, text, PolishFallbackReason::CodexOutputRejected)
         }
     }
 }
@@ -1348,6 +1943,21 @@ pub fn transform_with_cancel(
     context: &str,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> PolishResult {
+    transform_with_cancel_and_terms(settings, text, context, &[], &[], cancel)
+}
+
+pub fn transform_with_cancel_and_terms(
+    settings: &Settings,
+    text: &str,
+    context: &str,
+    local_terms: &[String],
+    screen_terms: &[String],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> PolishResult {
+    if settings.llm_provider() == "codex" && settings.polish_mode() == PolishMode::Correct {
+        // 完整 screen context 絕不交給 Codex；只有上面經同意且有界的詞彙清單。
+        return transform_codex_with_cancel(settings, text, local_terms, screen_terms, cancel);
+    }
     transform_with(settings, text, context, |polisher, mode, text, context| {
         polisher.generate_candidate_with_cancel(mode, text, context, cancel)
     })
@@ -1790,6 +2400,112 @@ mod tests {
             result.metadata.fallback_reason,
             Some(PolishFallbackReason::OrganizeConsentRequired)
         );
+
+        let unconfirmed = settings_from(json!({
+            "polish_mode": "correct",
+            "llm_provider": "ollama",
+            "llm_polish_model": "qwen3:4b",
+        }));
+        let result = transform_with(&unconfirmed, "原文", "", |_, _, _, _| {
+            panic!("unconfirmed CORRECT called provider")
+        });
+        assert_eq!(result.text, "原文");
+        assert_eq!(result.metadata.outcome, PolishOutcome::Fallback);
+        assert_eq!(
+            result.metadata.fallback_reason,
+            Some(PolishFallbackReason::CorrectConsentRequired)
+        );
+    }
+
+    #[test]
+    fn ordinary_provider_cannot_bypass_structured_correct_authorization() {
+        let settings = settings_from(json!({
+            "polish_mode": "correct",
+            "correct_consent_version": crate::settings::CORRECT_CONSENT_VERSION,
+            "llm_provider": "ollama",
+            "llm_polish_model": "qwen3:4b",
+        }));
+        let input = "使用 hyTorch 訓練";
+        let result = transform_with(&settings, input, "", |_, _, _, _| {
+            Ok("使用 PyTorch 訓練".to_string())
+        });
+        assert_eq!(result.text, input);
+        assert_eq!(result.metadata.outcome, PolishOutcome::Fallback);
+        assert_eq!(
+            result.metadata.fallback_reason,
+            Some(PolishFallbackReason::MeaningAnchorMismatch)
+        );
+    }
+
+    #[test]
+    fn correction_preservation_eval_fixtures_match_authorization_contract() {
+        let cases: Value = serde_json::from_str(include_str!(
+            "../../tests/eval/correction_preservation.json"
+        ))
+        .unwrap();
+        for case in cases.as_array().unwrap() {
+            let id = case["id"].as_str().unwrap();
+            let approved_terms: Vec<String> =
+                serde_json::from_value(case["approved_terms"].clone()).unwrap();
+            let preferences = case["preferences"].as_str().unwrap();
+            let result = serde_json::from_value::<CorrectionProposal>(case["proposal"].clone())
+                .map_err(|error| format!("schema: {error}"))
+                .and_then(|proposal| {
+                    authorize_correction_proposal(
+                        case["input"].as_str().unwrap(),
+                        &proposal,
+                        &approved_terms,
+                        preferences,
+                    )
+                    .map_err(|error| format!("guard: {error:?}"))
+                });
+            assert_eq!(
+                result.is_ok(),
+                case["accepted"].as_bool().unwrap(),
+                "fixture {id}: {result:?}"
+            );
+            if let Some(expected) = case["output"].as_str() {
+                assert_eq!(
+                    result.as_deref(),
+                    Ok(expected),
+                    "fixture {id} output: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn correction_source_uniqueness_detects_overlapping_occurrences() {
+        let proposal = CorrectionProposal {
+            text: "a-aa".into(),
+            replacements: vec![CorrectionEdit {
+                from: "aa".into(),
+                to: "a-a".into(),
+            }],
+        };
+        assert_eq!(
+            authorize_correction_proposal("aaa", &proposal, &["a-a".into()], ""),
+            Err(CorrectionGuardRejection::SourceNotUnique)
+        );
+    }
+
+    #[test]
+    fn correction_schema_denies_unknown_fields_at_both_levels() {
+        assert!(serde_json::from_value::<CorrectionProposal>(json!({
+            "text": "PyTorch",
+            "replacements": [{"from": "hyTorch", "to": "PyTorch"}],
+            "reason": "looks better",
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<CorrectionProposal>(json!({
+            "text": "PyTorch",
+            "replacements": [{
+                "from": "hyTorch",
+                "to": "PyTorch",
+                "confidence": 0.99,
+            }],
+        }))
+        .is_err());
     }
 
     #[test]

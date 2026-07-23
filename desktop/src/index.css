@@ -254,6 +254,26 @@ input {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
+.text-area {
+  min-height: 96px;
+  resize: vertical;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  background: #f2f2f4;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 9px 11px;
+  transition: border-color 0.12s;
+}
+.text-area:hover {
+  border-color: rgba(0, 0, 0, 0.18);
+}
+.text-area:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
 
 .btn {
   font-size: 13px;
@@ -290,7 +310,8 @@ input {
 .btn:disabled,
 .btn-primary:disabled,
 .copy-btn:disabled,
-.select:disabled {
+.select:disabled,
+.text-area:disabled {
   cursor: not-allowed;
   opacity: 0.48;
   filter: none;
@@ -648,7 +669,7 @@ input {
   user-select: text;
 }
 
-/* 三模式與同意流程 */
+/* 文字模式與同意流程 */
 .mode-picker {
   padding: 16px;
   border-bottom: 1px solid var(--hairline);
@@ -667,7 +688,7 @@ input {
 }
 .mode-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   margin-top: 12px;
 }

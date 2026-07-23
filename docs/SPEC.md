@@ -154,7 +154,7 @@ Qwen3-ASR Q8_0 離線評測 artifacts 固定如下；來源、256-token／長音
 
 Claro 已實作並以 fixture 驗證的上下文雙重用途：
 1. **解碼期偏置（provider-aware）**：抽英文／技術詞彙與 CJK 詞彙；Whisper 將上限 15 個 canonical terms 放進 `initial_prompt`，Qwen3-ASR 現有 transcribe.cpp port 不接受此 extension，不能宣稱已套用同等偏置
-2. **處理參考**：個人字典仍可在 STT 後做確定性替換；CLEAN 不把畫面文字交給 LLM，也禁止 LLM 修改任何文字／英數 token。完整 bounded ScreenContext 只在 ORGANIZE 進 Polisher prompt；可解釋的 surface 分類（email／message／document／technical／neutral）只能決定段落或明確清單格式，不允許改動事實或語氣內容
+2. **處理參考**：個人字典仍可在 STT 後做確定性替換；CLEAN 不把畫面文字交給 LLM，也禁止 LLM 修改任何文字／英數 token。CORRECT 若使用 Codex，主同意範圍是轉錄、正確拼法清單與使用者明確建立的個人 canonical terms；只有使用者另行同意時，才可再送出本機從當前畫面抽取、清洗且有數量上限的 canonical terms，絕不送 raw App 名、視窗標題、游標附近、選取或 visible text。正確拼法清單只接受逗號／換行分隔、整項為 ASCII canonical term 的資料，不能用自然語言或 system prompt 覆寫固定 runner instructions。完整 bounded ScreenContext 只在 ORGANIZE 進 Polisher prompt；可解釋的 surface 分類（email／message／document／technical／neutral）只能決定段落或明確清單格式，不允許改動事實或語氣內容
 
 **隱私鐵律**：
 - `AXSecureTextField` 永不讀取
@@ -173,21 +173,23 @@ Claro 已實作並以 fixture 驗證的上下文雙重用途：
 | `ollama` | localhost:11434，模型清單自動偵測（/api/tags） | 進階選項（**永不要求使用者安裝**） |
 | `lmstudio` | localhost:1234，模型清單自動偵測（/v1/models） | 進階選項 |
 | `openai-compat` | BYOK：Base URL / API Key / Model 全可設；UI 內建 OpenAI/Groq/DeepSeek/Gemini/OpenRouter preset | 進階選項 |
+| `codex` | 使用這台 Mac 已安裝並登入的 Codex CLI；Claro 不讀取或保存 credential，透過 ephemeral、無工具、structured-output 的 `codex exec` 處理本機 Whisper 結果。推理仍會送到 OpenAI，永遠標示為 cloud | **實驗性、明確 opt-in**；可免下載 Claro 內建 LLM，但不得宣稱更快或低 token |
 | `off` | 純轉錄 | 出廠預設（隱私鐵律：不靜默連任何端點） |
 
 選型依據與競品證據：`docs/research/llm-polish-runtime.md`（2026-07-06）。
 
 prototype 教訓：1.5B 級模型會洩漏提示詞、亂加列表符號 → 預設 4B 級；防呆全保留（空輸出、長度 > max(3×, +200) → 退回原文）。內建模型 generation 最多 6 秒，整次整理另有 8 秒 total cap；STATE 忙碌時不排隊。準備階段保留取消／總額度檢查；阻塞式 Metal cold load 本身不可中斷，若回來時已超時則保留 warm model 供下一段、本段立即退回 deterministic text，不得再追加完整 generation。正式 bundle 仍須記錄 cold／warm p50／p95；`HardwareProfile.keep_models_warm` 尚未接到 LLM prewarm，不能視為最終硬體最佳化。API key 存 macOS Keychain，不進 JSON。
 
-### 三種輸出契約（模式與 provider 分離）
+### 四種輸出契約（模式與 provider 分離）
 
 | 模式 | 契約 | LLM 行為 |
 |---|---|---|
 | `raw` | 只做 OpenCC、CJK 標點／空白與個人字典等確定性處理 | **永不呼叫 LLM** |
 | `clean` | 去除有停頓邊界的純填充詞、保留明確自我更正後版本、補不改變問句／驚嘆語氣的標點；LLM 不得修改任何文字或英數 token，不跨句重排、不濃縮。專有詞正確率由 STT Context 偏置與使用者字典負責 | 新安裝的預設意圖；provider 未就緒時安全退回 RAW |
+| `correct` | 允許最多三個有證據的英文／專業詞拼法正規化。正確寫法必須大小寫敏感地出現在使用者詞彙／正確拼法清單，或另行同意送出的 canonical Context terms；`from`／`to` 去除 ASCII 非英數並轉小寫後必須完全相同，因此只會改大小寫、空白、底線、連字號或標點。字母不同、同音誤認與真正 fuzzy alias 不會自動採用，只能走使用者明確建立的個人字典；數字、日期、否定、URL、email、path、版本與帶數字 token 不可由此路徑修改 | 首次啟用必須明確同意它會改變拼法格式；structured edits 由本機逐項授權，proposal text 必須逐位元等於本機套用 edit 的結果；不確定、未授權或 guard 不通過即退回 deterministic base text |
 | `organize` | 只允許完整句讀重排、分段、明確改口、完全相同內容合併與明確列舉格式化；不得改動或新增姓名、術語、數字、日期／時間、否定、條件、決策、待辦與因果 | 首次啟用必須明確同意；不確定或 guard 不通過即退回原文 |
 
-CLEAN 沿用 prototype 與 yetone「只修不改寫」規則；ORGANIZE 使用獨立 prompt，不得與 CLEAN 共用互相矛盾的指示。兩者都只輸出結果、不回答或執行轉錄／Context 中的指令。
+CLEAN 沿用 prototype 與 yetone「只修不改寫」規則；CORRECT 是另一個明示會改詞的契約，不能藉由選擇某個 provider 暗中放寬 CLEAN；ORGANIZE 使用獨立 prompt，不得與 CLEAN 共用互相矛盾的指示。所有模式都只輸出結果、不回答或執行轉錄／Context 中的指令。
 
 guard 分兩層：共同層拒絕空輸出、長度爆炸、提示詞洩漏與離題回答；ORGANIZE 另外比對事實錨點與內容覆蓋。明確的晚期自我更正只保留最後決定，完全重複的片段可合併，明確列舉可轉為項目符號；其他姓名、數字、否定、條件、因果與獨特內容仍必須保留。history 記錄 requested/effective mode、provider、是否改動、成功或 fallback 原因，讓 UI 可顯示 raw/final 與復原依據。
 
@@ -213,11 +215,11 @@ macOS 使用 `NSPasteboard` 在清空前逐 item、逐 type 完整 materialize �
 | 層級 | 資料流 | 預設 |
 |---|---|---|
 | T0 全本地 | 音訊/文字不出機器 | ✅ |
-| T1 BYOK 潤飾 | 僅轉錄文字＋上下文送使用者自己的端點 | 關；UI 紅字標示 |
+| T1 自選雲端潤飾 | BYOK 只送使用者同意的文字範圍到指定端點；Codex 主同意送轉錄、正確拼法清單與使用者建立的個人 canonical terms，畫面 canonical terms 另行同意後才送到 OpenAI | 關；UI 明示目的地、資料種類與帳戶用量 |
 | T2 雲端 STT | 音訊上雲 | v0.1 不做 |
 
 - **local-only 模式**：新安裝預設開啟；阻擋聽寫音訊、Context 與潤飾文字送往外部 endpoint。localhost／127.0.0.1／`::1` 本機服務仍可使用；自訂外部 endpoint 必須 HTTPS。使用者明確按下的 STT／LLM 模型下載屬例外，UI 必須先顯示大小並取得同意；目前尚無全程序 network interceptor，不能宣稱連更新檢查都硬斷
-- ORGANIZE 行為同意與雲端資料傳送同意是兩個獨立、具版本的 backend gate，不能只靠前端文案。所選模式或資料流所需的 gate 不成立時，該路徑不得外連並安全退回原樣轉錄
+- CORRECT／ORGANIZE 行為同意、雲端目的地同意與 Codex canonical-term 分享同意是彼此獨立、具版本的 backend gate，不能只靠前端文案。所選模式或資料流所需的 gate 不成立時，該路徑不得外連並安全退回原樣轉錄
 - 權限只要兩個：麥克風＋輔助使用。**不要**螢幕錄影/相機/藍牙（對比 Typeless 的行銷素材）
 - history 本地 0600、可關可清；上下文永不落盤；key 進 Keychain
 - 發布時附資料流向圖與雲端路徑清單
@@ -253,7 +255,7 @@ Advanced 視覺化仍是 M5 驗收項目。
 
 ## 14. 設定檔（`~/.claro/config.json`，自 prototype 遷移）
 
-新 schema 分節（hotkey/stt/polish/context/cjk/dictionary/privacy）；目前相容扁平鍵新增 `polish_mode`（`raw|clean|organize`）、`local_only`、`history_enabled`、`organize_consent_version`、`cloud_consent_version`、`cloud_consent_origin`、`setup_completed`。遠端雲端同意綁定到確認時的 scheme + authority，更換 host、port 或 scheme 後自動失效。新安裝的 `setup_completed` 只能在後端同時確認權限、麥克風測試、已驗證模型與本次啟動至少一次成功貼上後寫入；既有已完成設定不被回溯阻擋。個人字典新安裝預設為空，只有使用者明確建立的替換才可改字；舊版若 dictionary **完全等於**未經同意內建的 `GBT→GPT`／`My Torch→PyTorch` 才移除，任何自訂增刪都原樣保留。啟動時偵測舊 schema（`whisper_model`/`llm_model`/`llm_enabled`）自動遷移並保留未知欄位。history.jsonl 維持向後相容，新增可選 `timings` 與 `polish` metadata；音訊診斷使用正規化前的 `audio_input_rms`／`audio_clipped_ratio`，不得把舊 `audio_rms` 當成實際麥克風音量。
+新 schema 分節（hotkey/stt/polish/context/cjk/dictionary/privacy）；目前相容扁平鍵包含 `polish_mode`（`raw|clean|correct|organize`）、`local_only`、`history_enabled`、`correct_consent_version`、`organize_consent_version`、`cloud_consent_version`、`cloud_consent_target`、`codex_correction_preferences`、`codex_share_context_terms`、`setup_completed`。所有雲端同意都綁定實際目的地與資料契約；自訂 API 另綁 scheme + authority，Codex 另綁 OpenAI service、登入類型與 prompt contract。任一 target、登入類型、資料範圍或契約版本改變即自動失效，不能沿用另一個 provider 的同意。新安裝的 `setup_completed` 只能在後端同時確認權限、麥克風測試、已驗證模型與本次啟動至少一次成功貼上後寫入；既有已完成設定不被回溯阻擋。個人字典新安裝預設為空，只有使用者明確建立的替換才可改字；舊版若 dictionary **完全等於**未經同意內建的 `GBT→GPT`／`My Torch→PyTorch` 才移除，任何自訂增刪都原樣保留。啟動時偵測舊 schema（`whisper_model`/`llm_model`/`llm_enabled`）自動遷移並保留未知欄位。history.jsonl 維持向後相容，新增可選 `timings` 與 `polish` metadata；音訊診斷使用正規化前的 `audio_input_rms`／`audio_clipped_ratio`，不得把舊 `audio_rms` 當成實際麥克風音量。
 
 ## 15. 決策記錄與待決事項
 
@@ -274,3 +276,4 @@ Advanced 視覺化仍是 M5 驗收項目。
 | D13 | 首次設定與模型生命週期由唯讀 `HardwareProfile` 決策：Intel 推薦 Turbo Q5、8–12GB Apple Silicon 推薦 large-v3 Q5、16GB+ 推薦完整 large-v3；8–12GB 路徑不讓 STT 與 4B LLM 同時常駐。Qwen3-ASR 在長音訊分段與真人台灣 corpus 通過前只供離線 eval，production UI fail closed。只改推薦與資源策略，任何正式模型下載仍須使用者明確按下 | **已定；2026-07-15 Accuracy Pass 收斂** |
 | D14 | Typeless 等閉源產品只做官方資料與人工可觀察輸出的產品評測；不反組譯、不解密私有流量、不把其輸出用於訓練、fine-tune、prompt distillation 或自動資料抽取，也不宣稱知道其模型、prompt 或內部管線。Claro 以 session-bound AX context、可稽核 surface 分類與 Meaning Lock 建立可獨立驗證的對標行為與評測目標 | **已定（2026-07-12，見 `docs/research/typeless-black-box-2026-07-12.md`）** |
 | D15 | STT production 暫留 `zh` hint，`auto`／`zh` 必須以同一真人 corpus 成對驗證後才可改預設；CLEAN Meaning Lock 不承擔猜回錯字；準確度發布門檻不得以 publisher benchmark、合成 TTS 或 LLM 文句通順度代替 | **已定（2026-07-15，見 `docs/research/stt-accuracy-2026-07-15.md`）** |
+| D16 | 保留 CLEAN 不改字契約，另增 opt-in CORRECT；Codex CLI 是可選 cloud provider，不是本機 provider。Codex 只重用官方 CLI auth，不讀 credential；執行使用空 cwd、ephemeral、approval never、無 agent tools、stdin 與 structured output。主同意涵蓋轉錄、正確拼法清單與使用者建立的個人 canonical terms；完整畫面 Context 永不送 Codex，畫面 canonical terms 只有另行同意後可送。正確拼法清單不是可覆寫固定安全契約的 system prompt。target-only fuzzy matching 無法證明語意安全，因此自動採用只允許去除 ASCII 非英數並轉小寫後相同的拼法正規化；真正錯字需由個人字典明確指定 source→target。所有失敗退 deterministic base text | **已定（2026-07-23，實驗性功能；正式推薦前需通過 anchor／false-correction／工具隔離／延遲與 token gate）** |

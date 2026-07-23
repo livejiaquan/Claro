@@ -71,9 +71,76 @@ export function displaySttModelLabel(model: Pick<ModelInfo, "label" | "preview">
   return isPreviewSttModel(model) ? model.label.replace(/\s*[（(]預覽[）)]\s*$/, "") : model.label;
 }
 
-export type PolishMode = "raw" | "clean" | "organize";
+export type PolishMode = "raw" | "clean" | "correct" | "organize";
 
 export type ExecutionLocation = "none" | "on_device" | "local_service" | "cloud";
+
+export type CodexAvailability =
+  | "checking"
+  | "ready"
+  | "not_installed"
+  | "auth_required"
+  | "unsupported"
+  | "unavailable";
+
+export type CodexAuthMode = "chatgpt" | "api_key" | "unknown";
+
+/** Rust runner 的原始 probe 契約；UI 必須先正規化，不能直接顯示 error_code。 */
+export type CodexRunnerAvailability =
+  | "ready"
+  | "not_installed"
+  | "unsupported"
+  | "missing_capability"
+  | "not_authenticated"
+  | "probe_failed";
+
+export type CodexRunnerAuthMode = "chat_gpt" | "api_key";
+
+export interface CodexStatus {
+  availability: CodexRunnerAvailability;
+  version: string | null;
+  auth_mode: CodexRunnerAuthMode | null;
+  executable_path: string | null;
+  error_code: string | null;
+}
+
+/** 不含執行檔路徑與原始診斷內容、可直接交給 UI 的狀態。 */
+export interface CodexCliStatus {
+  availability: CodexAvailability;
+  version: string | null;
+  auth_mode: CodexAuthMode;
+  /** 後端清理過、可安全映射成 UI 文案的代碼；不可放 CLI 原始 stderr。 */
+  error_code: string | null;
+}
+
+export interface CodexPreferences {
+  correction_preferences: string;
+  share_context_terms: boolean;
+  consent_valid: boolean;
+  context_consent_valid: boolean;
+  correct_consent_valid: boolean;
+  correct_mode_active: boolean;
+}
+
+export interface CodexEnableOptions {
+  share_context_terms: boolean;
+}
+
+export type CodexTestFailureReason =
+  | "timeout"
+  | "rate_limited"
+  | "auth_required"
+  | "unavailable"
+  | "output_rejected"
+  | "unknown";
+
+export type CodexTestState =
+  | { phase: "idle" }
+  | { phase: "running" }
+  | { phase: "cancelling" }
+  | { phase: "cancelled" }
+  | { phase: "success"; input: string; output: string }
+  | { phase: "failed"; reason: CodexTestFailureReason };
 
 export type PolishBlockedReason =
   | "provider_missing"
@@ -82,10 +149,17 @@ export type PolishBlockedReason =
   | "provider_unavailable"
   | "model_missing"
   | "organize_consent_required"
+  | "correct_consent_required"
   | "cloud_consent_required"
   | "local_only"
   | "invalid_endpoint"
   | "invalid_custom_url"
+  | "codex_not_installed"
+  | "codex_auth_required"
+  | "codex_unsupported"
+  | "codex_consent_required"
+  | "codex_context_consent_required"
+  | "codex_unavailable"
   | null;
 
 export interface LlmConfig {
@@ -101,9 +175,15 @@ export interface LlmConfig {
   effective_mode?: PolishMode;
   local_only?: boolean;
   organize_consent_valid?: boolean;
+  correct_consent_valid?: boolean;
   cloud_consent_valid?: boolean;
   execution_location?: ExecutionLocation;
   endpoint_origin?: string | null;
+  destination_label?: string | null;
+  codex_consent_valid?: boolean;
+  codex_context_consent_valid?: boolean;
+  codex_share_context_terms?: boolean;
+  codex_correction_preferences?: string;
   blocked_reason?: PolishBlockedReason;
 }
 
@@ -112,9 +192,15 @@ export interface ResolvedLlmConfig extends LlmConfig {
   effective_mode: PolishMode;
   local_only: boolean;
   organize_consent_valid: boolean;
+  correct_consent_valid: boolean;
   cloud_consent_valid: boolean;
   execution_location: ExecutionLocation;
   endpoint_origin: string | null;
+  destination_label: string | null;
+  codex_consent_valid: boolean;
+  codex_context_consent_valid: boolean;
+  codex_share_context_terms: boolean;
+  codex_correction_preferences: string;
   blocked_reason: PolishBlockedReason;
 }
 
@@ -141,12 +227,16 @@ export function resolveLlmConfig(config: LlmConfig): ResolvedLlmConfig {
 
   let inferredLocation: ExecutionLocation;
   let inferredOrigin: string | null = null;
+  let inferredDestinationLabel: string | null = null;
   if (config.provider === "off" || !config.provider) {
     inferredLocation = "none";
   } else if (config.provider === "apple" || config.provider === "builtin") {
     inferredLocation = "on_device";
   } else if (config.provider === "ollama" || config.provider === "lmstudio") {
     inferredLocation = "local_service";
+  } else if (config.provider === "codex") {
+    inferredLocation = "cloud";
+    inferredDestinationLabel = "OpenAI Codex";
   } else if (config.provider === "custom") {
     const info = endpointInfo(config.base_url);
     inferredLocation = info.location;
@@ -156,14 +246,48 @@ export function resolveLlmConfig(config: LlmConfig): ResolvedLlmConfig {
     inferredLocation = "cloud";
   }
 
-  const executionLocation = config.execution_location ?? inferredLocation;
-  const endpointOrigin = config.endpoint_origin ?? inferredOrigin;
+  // Codex 永遠是 OpenAI 雲端服務；即使舊後端誤標也不可在 UI 宣稱為本機。
+  const executionLocation =
+    config.provider === "codex" ? "cloud" : (config.execution_location ?? inferredLocation);
+  const endpointOrigin =
+    config.provider === "codex" ? null : (config.endpoint_origin ?? inferredOrigin);
+  const destinationLabel =
+    config.provider === "codex"
+      ? "OpenAI Codex"
+      : (config.destination_label ?? inferredDestinationLabel);
   const organizeConsentValid = config.organize_consent_valid ?? false;
-  const cloudConsentValid = config.cloud_consent_valid ?? executionLocation !== "cloud";
+  const correctConsentValid = config.correct_consent_valid ?? false;
+  const codexConsentValid = config.codex_consent_valid ?? false;
+  const codexContextConsentValid = config.codex_context_consent_valid ?? false;
+  const codexShareContextTerms = config.codex_share_context_terms ?? false;
+  const codexCorrectionPreferences = config.codex_correction_preferences ?? "";
+  const cloudConsentValid =
+    config.cloud_consent_valid ??
+    (config.provider === "codex" ? codexConsentValid : executionLocation !== "cloud");
 
   let blockedReason = config.blocked_reason ?? null;
   if (!blockedReason && polishMode === "organize" && !organizeConsentValid) {
     blockedReason = "organize_consent_required";
+  }
+  if (!blockedReason && polishMode === "correct" && !correctConsentValid) {
+    blockedReason = "correct_consent_required";
+  }
+  if (
+    !blockedReason &&
+    polishMode !== "raw" &&
+    config.provider === "codex" &&
+    !codexConsentValid
+  ) {
+    blockedReason = "codex_consent_required";
+  }
+  if (
+    !blockedReason &&
+    polishMode !== "raw" &&
+    config.provider === "codex" &&
+    codexShareContextTerms &&
+    !codexContextConsentValid
+  ) {
+    blockedReason = "codex_context_consent_required";
   }
   if (!blockedReason && polishMode !== "raw" && executionLocation === "cloud" && localOnly) {
     blockedReason = "local_only";
@@ -178,12 +302,19 @@ export function resolveLlmConfig(config: LlmConfig): ResolvedLlmConfig {
   return {
     ...config,
     polish_mode: polishMode,
-    effective_mode: config.effective_mode ?? (blockedReason ? "raw" : polishMode),
+    // 前端新認得的隱私 gate 必須能覆蓋舊後端傳回的過時 effective_mode。
+    effective_mode: blockedReason ? "raw" : (config.effective_mode ?? polishMode),
     local_only: localOnly,
     organize_consent_valid: organizeConsentValid,
+    correct_consent_valid: correctConsentValid,
     cloud_consent_valid: cloudConsentValid,
     execution_location: executionLocation,
     endpoint_origin: endpointOrigin,
+    destination_label: destinationLabel,
+    codex_consent_valid: codexConsentValid,
+    codex_context_consent_valid: codexContextConsentValid,
+    codex_share_context_terms: codexShareContextTerms,
+    codex_correction_preferences: codexCorrectionPreferences,
     blocked_reason: blockedReason,
   };
 }

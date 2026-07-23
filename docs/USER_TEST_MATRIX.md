@@ -15,6 +15,7 @@
 | 慢網路／磁碟接近滿 | 可續傳、不浪費流量 | 「失敗後是不是重來？」 | Range partial、SHA-256、磁碟預檢、持久錯誤與續傳文案 |
 | VoiceOver／鍵盤使用者 | 控制可讀、焦點清楚 | 「狀態只靠動畫或顏色」 | semantic headings/labels、ARIA live/meter、focus-visible、reduced-motion；原生 overlay 仍需實測 |
 | 中英混講開發者 | 專案詞、姓名、email 與識別字正確 | 「句子通順，但關鍵 token 一錯就不能用」 | 完整 large-v3、AX ASCII+CJK 詞彙偏置、確定性字典、Meaning Lock；email／URL 仍列真人 corpus gate |
+| 已使用 Codex 的 vibe coder | 不再下載另一個大 LLM，又能校正框架／產品名稱 | 「CLI 明明登入了卻找不到」、「怎麼等更久／用量變多」、「會不會讀我的 repo？」 | Codex 只作可選實驗 provider；固定路徑探測、明示 cloud／帳戶用量、無工具空 cwd、逾時回本機結果，不承諾更快 |
 
 ## 核心旅程
 
@@ -46,6 +47,10 @@
 | 23 | 按下即說／放開最後一字 | audio post-roll tests | 內建麥克風、AirPods、USB | 開麥與 AX seed 並行；正常停止保留 200ms 尾音；取消與裝置斷線不等待；真人首尾漏字率仍待量測 |
 | 24 | 下載完成時仍在聽寫／模型載入失敗 | atomic swap＋race regressions | 大模型切換 | 不覆寫現役引擎或 config；不吞掉 Up／Esc；明示已下載但需重按「使用」，不假裝自動切換 |
 | 25 | 內建整理冷啟動超時 | budget／cancel／try-lock tests | release bundle cold/warm | 不排隊、不讓 LLM 失敗拖垮聽寫；超時安全退回原文並保留 warm model；阻塞式 hash／Metal load 仍須量 p50／p95 |
+| 26 | 既有 Codex CLI＋ChatGPT 登入啟用專業校字 | fake CLI integration＋UI QA | release bundle＋合成文字 | 不讀 credential；先明示資料與用量；`Py Torch→PyTorch`／`Git Hub→GitHub`，數字與否定不變；`Pie Torch` 等字母不同的 fuzzy 誤認不自動採用，改由個人字典明確指定 |
+| 27 | Codex 未安裝／未登入／版本不支援 | probe parser＋frontend state tests | Finder 啟動 `.app` | 不阻塞 Onboarding；Homebrew、nvm、Volta launcher 可由短 PATH 啟動；提供重新檢查與可行說明；不自動安裝、登入或更新 |
+| 28 | Codex timeout／取消／忙碌／額度限制 | fake process group tests | throttled network | single-flight 不排隊；取消與 timeout kill＋reap；聽寫仍貼 deterministic base text，History 只記非內容原因 |
+| 29 | Codex prompt injection／未授權 edit／Context 撤回 | strict schema＋CORRECT guard＋argv/env leak tests | 合成 adversarial payload | command/MCP/file access 為零；未授權替換、anchor 變動與 Context 新增內容一律拒絕；重新開啟 local-only 立即中止 in-flight request |
 
 ## keyDown AX 延遲：最小可驗證實作方案
 
@@ -57,7 +62,7 @@
 
 ## 黑箱競品對照語料
 
-同一段錄音在 Email、Message、Document、Technical 四種 App 各跑 RAW/CLEAN/ORGANIZE，記錄：
+同一段錄音在 Email、Message、Document、Technical 四種 App 各跑 RAW/CLEAN/CORRECT/ORGANIZE，記錄：
 
 - fact anchor retention
 - content coverage

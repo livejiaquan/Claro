@@ -12,7 +12,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 pub const ORGANIZE_CONSENT_VERSION: u64 = 1;
-pub const CLOUD_CONSENT_VERSION: u64 = 1;
+pub const CORRECT_CONSENT_VERSION: u64 = 1;
+// v2：同意由單純 custom origin 擴充成「provider + destination + auth + contract」
+// 目標。舊版同意保留在檔案中但不自動套用到 Codex。
+pub const CLOUD_CONSENT_VERSION: u64 = 2;
+pub const CODEX_CONTEXT_CONSENT_VERSION: u64 = 1;
+pub const CODEX_CORRECTION_PREFERENCES_MAX_CHARS: usize = 1_000;
 const DICTIONARY_DEFAULTS_VERSION: u64 = 1;
 
 fn default_stt_model() -> &'static str {
@@ -27,6 +32,7 @@ pub enum PolishMode {
     Raw,
     #[default]
     Clean,
+    Correct,
     Organize,
 }
 
@@ -35,6 +41,7 @@ impl PolishMode {
         match self {
             Self::Raw => "raw",
             Self::Clean => "clean",
+            Self::Correct => "correct",
             Self::Organize => "organize",
         }
     }
@@ -47,6 +54,7 @@ impl FromStr for PolishMode {
         match value {
             "raw" => Ok(Self::Raw),
             "clean" => Ok(Self::Clean),
+            "correct" => Ok(Self::Correct),
             "organize" => Ok(Self::Organize),
             _ => Err(format!("未知的潤飾模式：{value}")),
         }
@@ -63,10 +71,14 @@ pub fn default_config() -> Map<String, Value> {
         "polish_mode": "clean",
         // 預設硬斷自訂雲端潤飾；只允許使用者經明確同意解除。
         "local_only": true,
+        // CORRECT 可替換使用者授權的英文字詞，須獨立於格式整理與雲端傳送同意。
+        "correct_consent_version": 0,
         "organize_consent_version": 0,
         "cloud_consent_version": 0,
         // 雲端同意綁定到當時確認的 scheme + authority；改端點後必須重新確認。
         "cloud_consent_origin": null,
+        // v2 統一同意目標；Codex 還會綁登入類型與 runner contract 版本。
+        "cloud_consent_target": null,
         // 必須完成權限、本次麥克風測試與模型檢查才由 UI 寫入。
         "setup_completed": false,
         // 本地聽寫歷史預設開啟；可由使用者關閉並清除。
@@ -78,6 +90,14 @@ pub fn default_config() -> Map<String, Value> {
         "dictionary_defaults_version": DICTIONARY_DEFAULTS_VERSION,
         // 螢幕上下文（AX）：抓前景視窗詞彙給辨識與潤飾；內容永不落盤
         "context_enabled": true,
+        // Codex CORRECT 的使用者偏好與額外螢幕詞彙分享皆預設關閉／空白。
+        "codex_correction_preferences": "",
+        "codex_share_context_terms": false,
+        "codex_context_consent_version": 0,
+        "codex_context_consent_target": null,
+        "codex_auth_kind": null,
+        // 進階救援欄位；UI 不要求一般使用者自行找路徑。
+        "codex_cli_path": "",
     }) else {
         unreachable!()
     };
@@ -235,8 +255,8 @@ impl Settings {
             .to_string()
     }
 
-    /// RAW / CLEAN / ORGANIZE。未知或損壞值一律安全退回 RAW；缺值（舊設定）
-    /// 採用新的產品預設 CLEAN。
+    /// RAW / CLEAN / CORRECT / ORGANIZE。未知或損壞值一律安全退回 RAW；
+    /// 缺值（舊設定）採用新的產品預設 CLEAN。
     pub fn polish_mode(&self) -> PolishMode {
         match self.raw.get("polish_mode").and_then(Value::as_str) {
             None => PolishMode::Clean,
@@ -262,29 +282,45 @@ impl Settings {
             == Some(ORGANIZE_CONSENT_VERSION)
     }
 
+    pub fn correct_consent_valid(&self) -> bool {
+        self.raw
+            .get("correct_consent_version")
+            .and_then(Value::as_u64)
+            == Some(CORRECT_CONSENT_VERSION)
+    }
+
     pub fn cloud_consent_valid(&self) -> bool {
         let version_valid = self
             .raw
             .get("cloud_consent_version")
             .and_then(Value::as_u64)
             == Some(CLOUD_CONSENT_VERSION);
-        if !version_valid || self.llm_provider() != "custom" {
-            return version_valid;
+        if !version_valid {
+            return false;
         }
 
-        // loopback 不是雲端，本來就不需要 cloud consent。遠端自訂 API
-        // 必須與當時同意的 origin 完全一致；更換 host/port/scheme 即失效。
-        if matches!(
-            crate::polish::custom_endpoint_is_loopback(&self.llm_base_url()),
-            Ok(true)
-        ) {
+        let Some(current_target) = crate::polish::cloud_consent_target(self) else {
+            return true;
+        };
+        if self
+            .raw
+            .get("cloud_consent_target")
+            .and_then(Value::as_str)
+            .is_some_and(|target| target == current_target)
+        {
             return true;
         }
-        let current_origin = crate::polish::custom_endpoint_origin(&self.llm_base_url());
-        let consented_origin = self.raw.get("cloud_consent_origin").and_then(Value::as_str);
-        current_origin
-            .as_deref()
-            .is_some_and(|origin| Some(origin) == consented_origin)
+
+        // custom origin 是 v1 已有的精確目標，v2 過渡期仍接受「使用目前
+        // CLOUD_CONSENT_VERSION 寫入的 exact origin」；Codex 沒有此後門。
+        if self.llm_provider() == "custom" {
+            let current_origin = crate::polish::custom_endpoint_origin(&self.llm_base_url());
+            let consented_origin = self.raw.get("cloud_consent_origin").and_then(Value::as_str);
+            return current_origin
+                .as_deref()
+                .is_some_and(|origin| Some(origin) == consented_origin);
+        }
+        false
     }
 
     /// 詞彙表：只餵給 STT 做解碼期偏置，不做任何字面替換。
@@ -306,6 +342,63 @@ impl Settings {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// CORRECT 的使用者偏好。讀取時以 Unicode scalar value 截到固定上限，
+    /// 避免舊版或手動修改的 config 把任意長文字送進後續 provider。
+    pub fn codex_correction_preferences(&self) -> String {
+        self.raw
+            .get("codex_correction_preferences")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .chars()
+            .take(CODEX_CORRECTION_PREFERENCES_MAX_CHARS)
+            .collect()
+    }
+
+    /// 是否允許把本機抽取、清理且有界的候選詞另行提供給 Codex。
+    /// 這只是資料範圍選項，不取代獨立的同意 gate。
+    pub fn codex_share_context_terms(&self) -> bool {
+        self.raw
+            .get("codex_share_context_terms")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn codex_auth_mode(&self) -> Option<crate::codex::CodexAuthMode> {
+        match self.raw.get("codex_auth_kind").and_then(Value::as_str) {
+            Some("chat_gpt") => Some(crate::codex::CodexAuthMode::ChatGpt),
+            Some("api_key") => Some(crate::codex::CodexAuthMode::ApiKey),
+            _ => None,
+        }
+    }
+
+    pub fn codex_cli_path(&self) -> Option<String> {
+        self.raw
+            .get("codex_cli_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
+    pub fn codex_context_consent_valid(&self) -> bool {
+        let Some(auth_mode) = self.codex_auth_mode() else {
+            return false;
+        };
+        let target = format!(
+            "{}:context-terms-v1",
+            crate::codex::consent_target(auth_mode)
+        );
+        self.raw
+            .get("codex_context_consent_version")
+            .and_then(Value::as_u64)
+            == Some(CODEX_CONTEXT_CONSENT_VERSION)
+            && self
+                .raw
+                .get("codex_context_consent_target")
+                .and_then(Value::as_str)
+                .is_some_and(|consented| consented == target)
     }
 
     /// 個人字典（誤認詞 → 正確詞）。config 缺鍵時回預設字典。
@@ -420,6 +513,20 @@ mod tests {
             Some(false)
         );
         assert_eq!(cfg.get("dictionary"), Some(&json!({})));
+        assert_eq!(
+            cfg.get("correct_consent_version").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            cfg.get("codex_correction_preferences")
+                .and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            cfg.get("codex_share_context_terms")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
         assert!(path.exists());
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -547,6 +654,7 @@ mod tests {
         for (raw, expected) in [
             ("raw", PolishMode::Raw),
             ("clean", PolishMode::Clean),
+            ("correct", PolishMode::Correct),
             ("organize", PolishMode::Organize),
         ] {
             assert_eq!(PolishMode::from_str(raw).unwrap(), expected);
@@ -558,14 +666,53 @@ mod tests {
         fs::write(
             &path,
             format!(
-                r#"{{"organize_consent_version":{},"cloud_consent_version":{}}}"#,
-                ORGANIZE_CONSENT_VERSION, CLOUD_CONSENT_VERSION
+                r#"{{"correct_consent_version":{},"organize_consent_version":{},"cloud_consent_version":{}}}"#,
+                CORRECT_CONSENT_VERSION, ORGANIZE_CONSENT_VERSION, CLOUD_CONSENT_VERSION
             ),
         )
         .unwrap();
         let settings = Settings::from_path(&path);
+        assert!(settings.correct_consent_valid());
         assert!(settings.organize_consent_valid());
         assert!(settings.cloud_consent_valid());
+
+        update_config_key(
+            &path,
+            "correct_consent_version",
+            Value::from(CORRECT_CONSENT_VERSION + 1),
+        )
+        .unwrap();
+        assert!(!Settings::from_path(&path).correct_consent_valid());
+    }
+
+    #[test]
+    fn codex_correction_preferences_are_bounded_and_context_terms_default_off() {
+        let dir = tempdir();
+        let defaults = Settings::from_path(&dir.join("defaults.json"));
+        assert_eq!(defaults.codex_correction_preferences(), "");
+        assert!(!defaults.codex_share_context_terms());
+        assert!(!defaults.correct_consent_valid());
+
+        let path = dir.join("codex-preferences.json");
+        let preferences = format!("{}🧪不應讀到", "a".repeat(999));
+        fs::write(
+            &path,
+            json!({
+                "codex_correction_preferences": preferences,
+                "codex_share_context_terms": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let settings = Settings::from_path(&path);
+        let bounded = settings.codex_correction_preferences();
+        assert_eq!(
+            bounded.chars().count(),
+            CODEX_CORRECTION_PREFERENCES_MAX_CHARS
+        );
+        assert!(bounded.ends_with('🧪'));
+        assert!(!bounded.contains("不應讀到"));
+        assert!(settings.codex_share_context_terms());
     }
 
     #[test]
@@ -586,6 +733,53 @@ mod tests {
             &path,
             "llm_base_url",
             Value::String("https://other.example.com/v1".into()),
+        )
+        .unwrap();
+        assert!(!Settings::from_path(&path).cloud_consent_valid());
+    }
+
+    #[test]
+    fn codex_consent_is_bound_to_auth_contract_and_separate_context_scope() {
+        let dir = tempdir();
+        let path = dir.join("codex-consent.json");
+        let chat_target = crate::codex::consent_target(crate::codex::CodexAuthMode::ChatGpt);
+        fs::write(
+            &path,
+            json!({
+                "llm_provider": "codex",
+                "local_only": false,
+                "codex_auth_kind": "chat_gpt",
+                "cloud_consent_version": CLOUD_CONSENT_VERSION,
+                "cloud_consent_target": chat_target,
+                "codex_context_consent_version": CODEX_CONTEXT_CONSENT_VERSION,
+                "codex_context_consent_target": format!("{chat_target}:context-terms-v1"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let settings = Settings::from_path(&path);
+        assert!(settings.cloud_consent_valid());
+        assert!(settings.codex_context_consent_valid());
+
+        update_config_key(&path, "codex_auth_kind", Value::String("api_key".into())).unwrap();
+        let changed_auth = Settings::from_path(&path);
+        assert!(!changed_auth.cloud_consent_valid());
+        assert!(!changed_auth.codex_context_consent_valid());
+
+        // 任何 custom provider 的 version/origin 同意都不可變成 Codex 同意。
+        update_config_keys(
+            &path,
+            vec![
+                ("codex_auth_kind".into(), "chat_gpt".into()),
+                (
+                    "cloud_consent_target".into(),
+                    "custom:https://api.example.com".into(),
+                ),
+                (
+                    "cloud_consent_origin".into(),
+                    "https://api.example.com".into(),
+                ),
+            ],
         )
         .unwrap();
         assert!(!Settings::from_path(&path).cloud_consent_valid());

@@ -16,6 +16,7 @@ const bridge = String.raw`
   const failDownloads = scenario === "download-error";
   const downloadTerminalDelay = failDownloads ? 1200 : 30000;
   const micTimesOut = scenario === "mic-timeout";
+  const codexTestTimesOut = scenario === "codex-timeout";
   let nextCallback = 1;
   let nextEvent = 1;
   let micGeneration = 0;
@@ -55,8 +56,11 @@ const bridge = String.raw`
     llm: {
       provider: "off", model: "", base_url: "", has_key: false, apple_status: 2,
       polish_mode: "clean", effective_mode: "raw", local_only: true,
-      organize_consent_valid: false, cloud_consent_valid: true,
-      execution_location: "none", endpoint_origin: null, blocked_reason: "provider_missing",
+      organize_consent_valid: false, correct_consent_valid: false,
+      cloud_consent_valid: false, execution_location: "none", endpoint_origin: null,
+      destination_label: null, codex_consent_valid: false,
+      codex_context_consent_valid: false, codex_share_context_terms: false,
+      codex_correction_preferences: "", blocked_reason: "provider_missing",
     },
     hardware: {
       architecture: "aarch64", memory_gb: 8, tier: "compact", low_memory_mode: true,
@@ -103,6 +107,32 @@ const bridge = String.raw`
       recommended_stt: "large-v3", recommended_llm_provider: "apple",
       reason: "16 GB Apple Silicon：語音模型採 balanced 配置，文字整理交由 macOS 端上模型",
     });
+  }
+
+  if (scenario === "codex-ready" || scenario === "codex-connected" || scenario === "codex-timeout") {
+    Object.assign(state.status, {
+      model_present: true, accessibility: true, hotkey_active: true, setup_completed: true,
+      successful_pastes_this_launch: 3, mic_test_passed_this_launch: true,
+      polish_mode: "correct", effective_mode: scenario === "codex-connected" ? "correct" : "raw",
+      llm_provider: "codex", local_only: scenario !== "codex-connected",
+      execution_location: "cloud",
+      blocked_reason: scenario === "codex-connected" ? null : "codex_consent_required",
+    });
+    Object.assign(state.llm, {
+      provider: "codex", polish_mode: "correct",
+      effective_mode: scenario === "codex-connected" ? "correct" : "raw",
+      local_only: scenario !== "codex-connected",
+      correct_consent_valid: scenario === "codex-connected",
+      cloud_consent_valid: scenario === "codex-connected",
+      execution_location: "cloud", endpoint_origin: null,
+      destination_label: "OpenAI Codex",
+      codex_consent_valid: scenario === "codex-connected",
+      codex_context_consent_valid: false,
+      codex_share_context_terms: false,
+      codex_correction_preferences: scenario === "codex-connected" ? "MLX\nPyTorch\nTauri" : "",
+      blocked_reason: scenario === "codex-connected" ? null : "codex_consent_required",
+    });
+    modelById("large-v3-turbo").downloaded = true;
   }
 
   if (scenario === "accuracy-upgrade" || scenario === "accuracy-no-downgrade" || scenario === "ready-organize" || scenario === "history-errors" || scenario === "context-audit" || scenario === "history-off-pending") {
@@ -201,6 +231,14 @@ const bridge = String.raw`
       case "list_models": return structuredClone(state.models);
       case "list_builtin_llms": return structuredClone(state.builtin);
       case "get_llm_config": return structuredClone(state.llm);
+      case "get_codex_status":
+        return {
+          availability: "ready",
+          version: "0.145.0",
+          auth_mode: "chat_gpt",
+          executable_path: "/opt/homebrew/bin/codex",
+          error_code: null,
+        };
       case "get_dictionary": return structuredClone(state.dictionary);
       case "get_context_audit": return structuredClone(state.contextAudit);
       case "get_pending_result": return structuredClone(state.pendingResult);
@@ -290,16 +328,30 @@ const bridge = String.raw`
         return null;
       }
       case "set_llm_config":
+        {
+        const previousProvider = state.llm.provider;
         Object.assign(state.llm, { provider: args.provider, model: args.model, base_url: args.baseUrl });
         if (["apple", "builtin"].includes(args.provider)) state.llm.execution_location = "on_device";
         else if (args.provider === "off") state.llm.execution_location = "none";
+        else if (args.provider === "codex") {
+          state.llm.execution_location = "cloud";
+          state.llm.destination_label = "OpenAI Codex";
+          if (previousProvider !== "codex") {
+            state.llm.local_only = true;
+            state.llm.codex_consent_valid = false;
+            state.llm.cloud_consent_valid = false;
+            state.llm.codex_share_context_terms = false;
+          }
+        }
         else if (args.provider === "custom") {
           const url = new URL(args.baseUrl || "https://invalid.example");
           const loopback = ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
           state.llm.execution_location = loopback ? "local_service" : "cloud";
           state.llm.endpoint_origin = loopback ? null : url.origin;
         } else state.llm.execution_location = "local_service";
-        state.llm.blocked_reason = args.provider === "builtin" && !state.builtin[0].downloaded
+        state.llm.blocked_reason = args.provider === "codex" && !state.llm.codex_consent_valid
+          ? "codex_consent_required"
+          : args.provider === "builtin" && !state.builtin[0].downloaded
           ? "model_missing"
           : args.provider === "off"
             ? "provider_missing"
@@ -309,15 +361,45 @@ const bridge = String.raw`
         state.llm.effective_mode = state.llm.blocked_reason ? "raw" : state.llm.polish_mode;
         syncLlm();
         return structuredClone(state.llm);
+        }
       case "set_polish_mode":
+        if (args.mode === "correct" && !state.llm.correct_consent_valid && !args.confirmed) {
+          throw new Error("CORRECT 需要明確同意");
+        }
         if (args.mode === "organize" && !state.llm.organize_consent_valid && !args.confirmed) {
           throw new Error("ORGANIZE 需要明確同意");
         }
         state.llm.polish_mode = args.mode;
         state.llm.effective_mode = args.mode === "raw" || state.llm.blocked_reason ? "raw" : args.mode;
         state.llm.organize_consent_valid ||= args.mode === "organize" && args.confirmed;
+        state.llm.correct_consent_valid ||= args.mode === "correct" && args.confirmed;
         syncLlm();
         return structuredClone(state.llm);
+      case "enable_codex_provider":
+        Object.assign(state.llm, {
+          provider: "codex", polish_mode: "correct", effective_mode: "correct",
+          local_only: false, correct_consent_valid: true, cloud_consent_valid: true,
+          execution_location: "cloud", endpoint_origin: null,
+          destination_label: "OpenAI Codex", codex_consent_valid: true,
+          codex_context_consent_valid: !!args.shareContextTerms,
+          codex_share_context_terms: !!args.shareContextTerms,
+          blocked_reason: null,
+        });
+        syncLlm();
+        return structuredClone(state.llm);
+      case "set_codex_preferences":
+        state.llm.codex_correction_preferences = args.correctionPreferences.trim();
+        state.llm.codex_share_context_terms = !!args.shareContextTerms;
+        state.llm.codex_context_consent_valid = !!args.shareContextTerms;
+        syncLlm();
+        return structuredClone(state.llm);
+      case "test_codex_polish":
+        if (codexTestTimesOut) throw new Error("CodexTimeout");
+        return {
+          input: "今天用 Py Torch 跑 training，版本是 2.7.1，不要升級到 3.0。",
+          output: "今天用 PyTorch 跑 training，版本是 2.7.1，不要升級到 3.0。",
+        };
+      case "cancel_codex_polish": return null;
       case "download_builtin_llm":
         if (activeDownload) throw new Error("已有模型正在下載");
         {
@@ -374,13 +456,29 @@ const bridge = String.raw`
         return null;
       }
       case "set_local_only":
+        if (!args.enabled && state.llm.provider === "codex") {
+          throw new Error("Codex 必須從專用面板重新確認");
+        }
         if (!args.enabled && !args.confirmed) throw new Error("關閉僅限本機需要明確同意");
         state.llm.local_only = args.enabled;
+        if (args.enabled) {
+          state.llm.cloud_consent_valid = false;
+          state.llm.codex_consent_valid = false;
+          state.llm.codex_share_context_terms = false;
+          state.llm.codex_context_consent_valid = false;
+        }
         state.llm.blocked_reason = state.llm.execution_location === "cloud" && args.enabled ? "local_only" : null;
         state.llm.effective_mode = state.llm.blocked_reason ? "raw" : state.llm.polish_mode;
         syncLlm();
         return structuredClone(state.llm);
-      case "set_context_enabled": state.status.context_enabled = args.enabled; if (!args.enabled) state.contextAudit = null; return null;
+      case "set_context_enabled":
+        state.status.context_enabled = args.enabled;
+        if (!args.enabled) {
+          state.contextAudit = null;
+          state.llm.codex_share_context_terms = false;
+          state.llm.codex_context_consent_valid = false;
+        }
+        return null;
       case "clear_context_audit": state.contextAudit = null; return null;
       case "clear_pending_result": state.pendingResult = null; return null;
       case "set_history_enabled": state.status.history_enabled = args.enabled; return null;

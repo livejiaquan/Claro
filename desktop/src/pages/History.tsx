@@ -38,6 +38,7 @@ const STATUS_RECOVERY: Record<string, string> = {
 const MODE_LABEL: Record<PolishMode, string> = {
   raw: "原樣轉錄",
   clean: "保守校訂",
+  correct: "專業校字",
   organize: "條理整理",
 };
 
@@ -47,6 +48,7 @@ const PROVIDER_LABEL: Record<string, string> = {
   ollama: "Ollama",
   lmstudio: "LM Studio",
   custom: "自訂端點",
+  codex: "OpenAI Codex",
 };
 
 const OUTCOME_LABEL: Record<string, string> = {
@@ -57,12 +59,22 @@ const OUTCOME_LABEL: Record<string, string> = {
 };
 
 const FALLBACK_LABEL: Record<string, string> = {
+  correct_consent_required: "尚未確認專業校字",
   organize_consent_required: "尚未確認條理整理",
   provider_unavailable: "整理引擎不可用",
+  codex_not_installed: "尚未找到 Codex CLI",
+  codex_auth_required: "Codex CLI 尚未登入",
+  codex_unsupported: "Codex CLI 版本不支援安全校字",
   local_only: "僅限本機已阻擋雲端",
   cloud_consent_required: "尚未確認雲端資料傳送",
   invalid_custom_url: "自訂端點格式不正確",
   provider_error: "整理引擎執行失敗",
+  codex_busy: "Codex 正在處理上一段文字",
+  codex_cancelled: "Codex 校字已取消",
+  codex_timeout: "Codex 校字逾時",
+  codex_usage_limited: "Codex 額度目前不可用",
+  codex_invalid_output: "Codex 回傳格式不安全",
+  codex_output_rejected: "Codex 校字未通過內容保護",
   empty_output: "整理結果為空",
   length_violation: "整理結果長度異常",
   low_overlap: "內容重疊度過低",

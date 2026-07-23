@@ -5,6 +5,7 @@
 pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub mod audio;
+pub mod codex;
 pub mod context;
 pub mod hardware;
 pub mod history;
@@ -617,9 +618,15 @@ struct LlmConfig {
     effective_mode: settings::PolishMode,
     local_only: bool,
     organize_consent_valid: bool,
+    correct_consent_valid: bool,
     cloud_consent_valid: bool,
     execution_location: polish::ExecutionLocation,
     endpoint_origin: Option<String>,
+    destination_label: Option<String>,
+    codex_consent_valid: bool,
+    codex_context_consent_valid: bool,
+    codex_share_context_terms: bool,
+    codex_correction_preferences: String,
     blocked_reason: Option<String>,
 }
 
@@ -634,9 +641,15 @@ fn llm_config_from_settings(s: &settings::Settings) -> LlmConfig {
         effective_mode: polish::effective_mode(s),
         local_only: s.local_only(),
         organize_consent_valid: s.organize_consent_valid(),
+        correct_consent_valid: s.correct_consent_valid(),
         cloud_consent_valid: s.cloud_consent_valid(),
         execution_location: polish::execution_location(s),
         endpoint_origin: polish::endpoint_origin(s),
+        destination_label: polish::destination_label(s),
+        codex_consent_valid: s.llm_provider() == "codex" && s.cloud_consent_valid(),
+        codex_context_consent_valid: s.codex_context_consent_valid(),
+        codex_share_context_terms: s.codex_share_context_terms(),
+        codex_correction_preferences: s.codex_correction_preferences(),
         blocked_reason: polish::blocked_reason(s).map(str::to_string),
     }
 }
@@ -808,46 +821,91 @@ fn set_llm_config(
     base_url: String,
     confirmed: bool,
 ) -> Result<LlmConfig, String> {
-    if !["off", "apple", "builtin", "ollama", "lmstudio", "custom"].contains(&provider.as_str()) {
+    if ![
+        "off", "apple", "builtin", "ollama", "lmstudio", "codex", "custom",
+    ]
+    .contains(&provider.as_str())
+    {
         return Err("未知的處理引擎".into());
     }
     // confirmed 保留在 command contract，讓 UI 能明確表達敏感操作；雲端權限
     // 只允許由 set_local_only 寫入，單純改 provider/URL 絕不順便解除隱私 gate。
     let _ = confirmed;
-    settings::update_config_keys(
-        &settings::config_path(),
-        vec![
-            ("llm_provider".into(), provider.into()),
+    codex::with_policy_change(|| {
+        // provider 必須在 policy gate 內重讀；否則延遲中的 Codex enable
+        // 可能超車 gate 外快照，讓這次設定變更漏掉 epoch invalidation。
+        let current = settings::Settings::load();
+        let mut pairs = vec![
+            ("llm_provider".into(), provider.clone().into()),
             ("llm_polish_model".into(), model.into()),
             ("llm_base_url".into(), base_url.into()),
-        ],
-    )
-    .map_err(|e| e.to_string())?;
+        ];
+        // 下拉選到 Codex 只表示「想設定」；真正雲端同意只能由專用 panel寫入。
+        if provider == "codex" && current.llm_provider() != "codex" {
+            pairs.extend([
+                ("local_only".into(), true.into()),
+                ("cloud_consent_version".into(), 0.into()),
+                ("cloud_consent_target".into(), serde_json::Value::Null),
+                ("codex_share_context_terms".into(), false.into()),
+                ("codex_context_consent_version".into(), 0.into()),
+                (
+                    "codex_context_consent_target".into(),
+                    serde_json::Value::Null,
+                ),
+            ]);
+        } else if current.llm_provider() == "codex" && provider != "codex" {
+            pairs.extend([
+                ("codex_share_context_terms".into(), false.into()),
+                ("codex_context_consent_version".into(), 0.into()),
+                (
+                    "codex_context_consent_target".into(),
+                    serde_json::Value::Null,
+                ),
+            ]);
+        }
+        settings::update_config_keys(&settings::config_path(), pairs).map_err(|e| e.to_string())
+    })?;
     Ok(get_llm_config())
 }
 
 #[tauri::command]
 fn set_polish_mode(mode: String, confirmed: bool) -> Result<LlmConfig, String> {
     let mode = mode.parse::<settings::PolishMode>()?;
-    let current = settings::Settings::load();
-    validate_polish_mode_consent(mode, current.organize_consent_valid(), confirmed)?;
-    let mut pairs = vec![("polish_mode".into(), mode.as_str().into())];
-    if mode == settings::PolishMode::Organize && confirmed {
-        pairs.push((
-            "organize_consent_version".into(),
-            settings::ORGANIZE_CONSENT_VERSION.into(),
-        ));
-    }
-    settings::update_config_keys(&settings::config_path(), pairs).map_err(|e| e.to_string())?;
+    codex::with_policy_change(|| {
+        let current = settings::Settings::load();
+        validate_polish_mode_consent(
+            mode,
+            current.correct_consent_valid(),
+            current.organize_consent_valid(),
+            confirmed,
+        )?;
+        let mut pairs = vec![("polish_mode".into(), mode.as_str().into())];
+        if mode == settings::PolishMode::Correct && confirmed {
+            pairs.push((
+                "correct_consent_version".into(),
+                settings::CORRECT_CONSENT_VERSION.into(),
+            ));
+        }
+        if mode == settings::PolishMode::Organize && confirmed {
+            pairs.push((
+                "organize_consent_version".into(),
+                settings::ORGANIZE_CONSENT_VERSION.into(),
+            ));
+        }
+        settings::update_config_keys(&settings::config_path(), pairs).map_err(|e| e.to_string())
+    })?;
     Ok(get_llm_config())
 }
 
 fn validate_polish_mode_consent(
     mode: settings::PolishMode,
+    correct_consent_valid: bool,
     organize_consent_valid: bool,
     confirmed: bool,
 ) -> Result<(), String> {
-    if mode == settings::PolishMode::Organize && !organize_consent_valid && !confirmed {
+    if mode == settings::PolishMode::Correct && !correct_consent_valid && !confirmed {
+        Err("啟用 CORRECT 前必須明確確認它會調整授權詞彙的拼法格式".into())
+    } else if mode == settings::PolishMode::Organize && !organize_consent_valid && !confirmed {
         Err("啟用 ORGANIZE 前必須明確確認它會重排句序與段落".into())
     } else {
         Ok(())
@@ -856,25 +914,317 @@ fn validate_polish_mode_consent(
 
 #[tauri::command]
 fn set_local_only(enabled: bool, confirmed: bool) -> Result<LlmConfig, String> {
-    let current = settings::Settings::load();
-    if !enabled && current.local_only() && !confirmed {
-        return Err("關閉「僅限本機」前必須明確確認雲端資料傳送".into());
-    }
-    let mut pairs = vec![("local_only".into(), enabled.into())];
-    if !enabled && confirmed {
-        pairs.push((
-            "cloud_consent_version".into(),
-            settings::CLOUD_CONSENT_VERSION.into(),
-        ));
-        pairs.push((
-            "cloud_consent_origin".into(),
-            polish::endpoint_origin(&current)
-                .map(serde_json::Value::String)
-                .unwrap_or(serde_json::Value::Null),
-        ));
-    }
-    settings::update_config_keys(&settings::config_path(), pairs).map_err(|e| e.to_string())?;
+    codex::with_policy_change(|| {
+        let current = settings::Settings::load();
+        if !enabled && current.llm_provider() == "codex" {
+            return Err("Codex 的雲端同意必須從「Codex CLI 校字」面板重新確認".into());
+        }
+        if !enabled && current.local_only() && !confirmed {
+            return Err("關閉「僅限本機」前必須明確確認雲端資料傳送".into());
+        }
+        let mut pairs = vec![("local_only".into(), enabled.into())];
+        if enabled {
+            pairs.extend([
+                ("cloud_consent_version".into(), 0.into()),
+                ("cloud_consent_origin".into(), serde_json::Value::Null),
+                ("cloud_consent_target".into(), serde_json::Value::Null),
+                ("codex_share_context_terms".into(), false.into()),
+                ("codex_context_consent_version".into(), 0.into()),
+                (
+                    "codex_context_consent_target".into(),
+                    serde_json::Value::Null,
+                ),
+            ]);
+        }
+        if !enabled && confirmed {
+            let target = polish::cloud_consent_target(&current);
+            pairs.push((
+                "cloud_consent_version".into(),
+                settings::CLOUD_CONSENT_VERSION.into(),
+            ));
+            pairs.push((
+                "cloud_consent_origin".into(),
+                polish::endpoint_origin(&current)
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
+            ));
+            pairs.push((
+                "cloud_consent_target".into(),
+                target
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
+            ));
+        }
+        settings::update_config_keys(&settings::config_path(), pairs).map_err(|e| e.to_string())
+    })?;
     Ok(get_llm_config())
+}
+
+#[tauri::command]
+async fn get_codex_status() -> codex::CodexStatus {
+    tauri::async_runtime::spawn_blocking(|| {
+        let (current, policy_epoch) = codex::policy_snapshot(settings::Settings::load);
+        let result = codex::probe(current.codex_cli_path().as_deref());
+        if current.llm_provider() == "codex" {
+            let auth_changed = result.availability == codex::CodexAvailability::Ready
+                && result.auth_mode != current.codex_auth_mode();
+            let explicitly_unusable = matches!(
+                result.availability,
+                codex::CodexAvailability::NotInstalled
+                    | codex::CodexAvailability::NotAuthenticated
+                    | codex::CodexAvailability::Unsupported
+                    | codex::CodexAvailability::MissingCapability
+            );
+            if auth_changed || explicitly_unusable {
+                let auth_value = result
+                    .auth_mode
+                    .map(|auth_mode| serde_json::Value::String(auth_mode.as_str().into()))
+                    .unwrap_or(serde_json::Value::Null);
+                let _ = codex::with_policy_change_if(policy_epoch, || {
+                    if settings::Settings::load().llm_provider() != "codex" {
+                        return Err("codex_request_stale".into());
+                    }
+                    settings::update_config_keys(
+                        &settings::config_path(),
+                        vec![
+                            ("local_only".into(), true.into()),
+                            ("codex_auth_kind".into(), auth_value),
+                            ("cloud_consent_version".into(), 0.into()),
+                            ("cloud_consent_origin".into(), serde_json::Value::Null),
+                            ("cloud_consent_target".into(), serde_json::Value::Null),
+                            ("codex_share_context_terms".into(), false.into()),
+                            ("codex_context_consent_version".into(), 0.into()),
+                            (
+                                "codex_context_consent_target".into(),
+                                serde_json::Value::Null,
+                            ),
+                        ],
+                    )
+                    .map_err(|error| error.to_string())
+                });
+            }
+        }
+        result
+    })
+    .await
+    .unwrap_or_else(|_| codex::CodexStatus {
+        availability: codex::CodexAvailability::ProbeFailed,
+        version: None,
+        auth_mode: None,
+        executable_path: None,
+        error_code: Some("probe_join_failed".into()),
+    })
+}
+
+#[tauri::command]
+async fn enable_codex_provider(
+    share_context_terms: bool,
+    confirmed: bool,
+) -> Result<LlmConfig, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if !confirmed {
+            return Err("啟用 Codex 前必須明確確認校字與雲端資料傳送".into());
+        }
+        let (current, policy_epoch) = codex::policy_snapshot(settings::Settings::load);
+        if current.llm_provider() != "codex" {
+            return Err("codex_request_stale".into());
+        }
+        if share_context_terms && !current.context_enabled() {
+            return Err("螢幕上下文已關閉，無法啟用畫面詞彙分享".into());
+        }
+        let probe = codex::probe(current.codex_cli_path().as_deref());
+        if probe.availability != codex::CodexAvailability::Ready {
+            return Err(match probe.availability {
+                codex::CodexAvailability::NotInstalled => "codex_not_installed",
+                codex::CodexAvailability::NotAuthenticated => "codex_auth_required",
+                codex::CodexAvailability::Unsupported
+                | codex::CodexAvailability::MissingCapability => "codex_unsupported",
+                _ => "codex_unavailable",
+            }
+            .into());
+        }
+        let auth_mode = probe.auth_mode.ok_or("codex_auth_required")?;
+        let target = codex::consent_target(auth_mode);
+        let context_target = format!("{target}:context-terms-v1");
+        codex::with_policy_change_if(policy_epoch, || {
+            let latest = settings::Settings::load();
+            if latest.llm_provider() != "codex" {
+                return Err("codex_request_stale".into());
+            }
+            settings::update_config_keys(
+                &settings::config_path(),
+                vec![
+                    ("llm_provider".into(), "codex".into()),
+                    ("polish_mode".into(), "correct".into()),
+                    ("local_only".into(), false.into()),
+                    (
+                        "correct_consent_version".into(),
+                        settings::CORRECT_CONSENT_VERSION.into(),
+                    ),
+                    (
+                        "codex_auth_kind".into(),
+                        serde_json::Value::String(auth_mode.as_str().into()),
+                    ),
+                    (
+                        "codex_cli_path".into(),
+                        probe
+                            .executable_path
+                            .map(serde_json::Value::String)
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "cloud_consent_version".into(),
+                        settings::CLOUD_CONSENT_VERSION.into(),
+                    ),
+                    (
+                        "cloud_consent_target".into(),
+                        serde_json::Value::String(target),
+                    ),
+                    ("cloud_consent_origin".into(), serde_json::Value::Null),
+                    (
+                        "codex_share_context_terms".into(),
+                        share_context_terms.into(),
+                    ),
+                    (
+                        "codex_context_consent_version".into(),
+                        if share_context_terms {
+                            settings::CODEX_CONTEXT_CONSENT_VERSION.into()
+                        } else {
+                            0.into()
+                        },
+                    ),
+                    (
+                        "codex_context_consent_target".into(),
+                        if share_context_terms {
+                            serde_json::Value::String(context_target)
+                        } else {
+                            serde_json::Value::Null
+                        },
+                    ),
+                ],
+            )
+            .map_err(|error| error.to_string())
+        })?;
+        Ok(get_llm_config())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn set_codex_preferences(
+    correction_preferences: String,
+    share_context_terms: bool,
+    confirmed: bool,
+) -> Result<LlmConfig, String> {
+    let (current, policy_epoch) = codex::policy_snapshot(settings::Settings::load);
+    if current.llm_provider() != "codex" {
+        return Err("目前未選擇 Codex".into());
+    }
+    let correction_preferences = correction_preferences.trim().to_string();
+    if correction_preferences.chars().count() > settings::CODEX_CORRECTION_PREFERENCES_MAX_CHARS {
+        return Err("校字偏好最多 1000 字".into());
+    }
+    if share_context_terms && !current.context_enabled() {
+        return Err("螢幕上下文已關閉，無法啟用畫面詞彙分享".into());
+    }
+    if share_context_terms && !current.codex_context_consent_valid() && !confirmed {
+        return Err("啟用畫面詞彙分享前必須明確確認資料傳送".into());
+    }
+    let auth_mode = current.codex_auth_mode().ok_or("codex_auth_required")?;
+    let context_target = format!("{}:context-terms-v1", codex::consent_target(auth_mode));
+    codex::with_policy_change_if(policy_epoch, || {
+        if settings::Settings::load().llm_provider() != "codex" {
+            return Err("codex_request_stale".into());
+        }
+        settings::update_config_keys(
+            &settings::config_path(),
+            vec![
+                (
+                    "codex_correction_preferences".into(),
+                    correction_preferences.into(),
+                ),
+                (
+                    "codex_share_context_terms".into(),
+                    share_context_terms.into(),
+                ),
+                (
+                    "codex_context_consent_version".into(),
+                    if share_context_terms {
+                        settings::CODEX_CONTEXT_CONSENT_VERSION.into()
+                    } else {
+                        0.into()
+                    },
+                ),
+                (
+                    "codex_context_consent_target".into(),
+                    if share_context_terms {
+                        serde_json::Value::String(context_target)
+                    } else {
+                        serde_json::Value::Null
+                    },
+                ),
+            ],
+        )
+        .map_err(|error| error.to_string())
+    })?;
+    Ok(get_llm_config())
+}
+
+#[derive(Serialize)]
+struct CodexTestResult {
+    input: String,
+    output: String,
+}
+
+#[tauri::command]
+async fn test_codex_polish() -> Result<CodexTestResult, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let settings = settings::Settings::load();
+        if settings.llm_provider() != "codex" {
+            return Err("codex_unavailable".into());
+        }
+        let input = "今天用 Py Torch 跑 training，版本是 2.7.1，不要升級到 3.0。".to_string();
+        let local_terms = vec!["PyTorch".to_string()];
+        let cancel = AtomicBool::new(false);
+        let result = polish::transform_with_cancel_and_terms(
+            &settings,
+            &input,
+            "",
+            &local_terms,
+            &[],
+            &cancel,
+        );
+        if result.metadata.outcome == polish::PolishOutcome::Fallback {
+            return Err(match result.metadata.fallback_reason {
+                Some(reason) => format!("{reason:?}"),
+                None => "codex_unavailable".into(),
+            });
+        }
+        if !result.text.contains("PyTorch")
+            || result.text.contains("Py Torch")
+            || !result.text.contains("2.7.1")
+            || !result.text.contains("不要")
+            || !result.text.contains("3.0")
+        {
+            return Err("codex_output_rejected".into());
+        }
+        Ok(CodexTestResult {
+            input,
+            output: result.text,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn cancel_codex_polish() -> Result<(), String> {
+    if codex::cancel_active_and_wait() {
+        Ok(())
+    } else {
+        Err("codex_cancel_failed".into())
+    }
 }
 
 #[tauri::command]
@@ -938,28 +1288,48 @@ fn set_dictionary(entries: Vec<DictEntry>, state: tauri::State<AppState>) -> Res
             map.insert(from.to_string(), serde_json::Value::String(to.to_string()));
         }
     }
-    settings::update_config_key(
-        &settings::config_path(),
-        "dictionary",
-        serde_json::Value::Object(map),
-    )
-    .map_err(|e| e.to_string())?;
-    *state.core.dict.lock().unwrap() = settings::Settings::load().dictionary();
-    Ok(())
+    let update = || {
+        settings::update_config_key(
+            &settings::config_path(),
+            "dictionary",
+            serde_json::Value::Object(map),
+        )
+        .map_err(|e| e.to_string())?;
+        *state.core.dict.lock().unwrap() = settings::Settings::load().dictionary();
+        Ok(())
+    };
+    codex::with_policy_change(update)
 }
 
 #[tauri::command]
 fn set_context_enabled(enabled: bool, state: tauri::State<AppState>) -> Result<(), String> {
-    if !enabled {
-        *state.core.last_context.lock().unwrap() = None;
-        *state.core.context_capture.lock().unwrap() = None;
-    }
-    settings::update_config_key(
-        &settings::config_path(),
-        "context_enabled",
-        serde_json::Value::Bool(enabled),
-    )
-    .map_err(|e| e.to_string())
+    let update = || {
+        if !enabled {
+            *state.core.last_context.lock().unwrap() = None;
+            *state.core.context_capture.lock().unwrap() = None;
+            settings::update_config_keys(
+                &settings::config_path(),
+                vec![
+                    ("context_enabled".into(), false.into()),
+                    ("codex_share_context_terms".into(), false.into()),
+                    ("codex_context_consent_version".into(), 0.into()),
+                    (
+                        "codex_context_consent_target".into(),
+                        serde_json::Value::Null,
+                    ),
+                ],
+            )
+            .map_err(|e| e.to_string())
+        } else {
+            settings::update_config_key(
+                &settings::config_path(),
+                "context_enabled",
+                serde_json::Value::Bool(true),
+            )
+            .map_err(|e| e.to_string())
+        }
+    };
+    codex::with_policy_change(update)
 }
 
 #[tauri::command]
@@ -1326,10 +1696,19 @@ mod product_gate_tests {
 
     #[test]
     fn fresh_user_can_choose_raw_or_clean_before_provider_is_ready() {
-        assert!(validate_polish_mode_consent(settings::PolishMode::Raw, false, false).is_ok());
-        assert!(validate_polish_mode_consent(settings::PolishMode::Clean, false, false).is_ok());
         assert!(
-            validate_polish_mode_consent(settings::PolishMode::Organize, false, false).is_err()
+            validate_polish_mode_consent(settings::PolishMode::Raw, false, false, false).is_ok()
+        );
+        assert!(
+            validate_polish_mode_consent(settings::PolishMode::Clean, false, false, false).is_ok()
+        );
+        assert!(
+            validate_polish_mode_consent(settings::PolishMode::Correct, false, false, false)
+                .is_err()
+        );
+        assert!(
+            validate_polish_mode_consent(settings::PolishMode::Organize, false, false, false)
+                .is_err()
         );
     }
 
@@ -1430,6 +1809,11 @@ pub fn run() {
             set_llm_config,
             set_polish_mode,
             set_local_only,
+            get_codex_status,
+            enable_codex_provider,
+            set_codex_preferences,
+            test_codex_polish,
+            cancel_codex_polish,
             set_llm_key,
             list_provider_models,
             test_polish,
@@ -1498,6 +1882,7 @@ pub fn run() {
             tauri::RunEvent::Exit => {
                 // 先立旗再卸載：擋住所有還在排隊的背景載入（見 SHUTTING_DOWN 註解）
                 crate::SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = codex::cancel_active_and_wait();
                 if let Some(state) = app.try_state::<AppState>() {
                     state.core.overlay.stop();
                     // 主動釋放 whisper/llama 的 Metal 資源：留給 atexit teardown 會

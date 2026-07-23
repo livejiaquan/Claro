@@ -1,0 +1,506 @@
+[
+  {
+    "id": "approved_term_correction_preserves_all_other_text",
+    "input": "嗯我們用 Py Torch 跑訓練",
+    "approved_terms": ["PyTorch"],
+    "preferences": "",
+    "proposal": {
+      "text": "嗯我們用 PyTorch 跑訓練",
+      "replacements": [
+        { "from": "Py Torch", "to": "PyTorch" }
+      ]
+    },
+    "accepted": true,
+    "output": "嗯我們用 PyTorch 跑訓練"
+  },
+  {
+    "id": "codex_smoke_py_torch_preserves_numeric_and_negation_anchors",
+    "input": "今天用 Py Torch 跑 training，版本是 2.7.1，不要升級到 3.0。",
+    "approved_terms": ["PyTorch"],
+    "preferences": "",
+    "proposal": {
+      "text": "今天用 PyTorch 跑 training，版本是 2.7.1，不要升級到 3.0。",
+      "replacements": [
+        { "from": "Py Torch", "to": "PyTorch" }
+      ]
+    },
+    "accepted": true,
+    "output": "今天用 PyTorch 跑 training，版本是 2.7.1，不要升級到 3.0。"
+  },
+  {
+    "id": "preference_exact_term_authorizes_replacement",
+    "input": "請使用 Clau-de",
+    "approved_terms": [],
+    "preferences": "Claude",
+    "proposal": {
+      "text": "請使用 Claude",
+      "replacements": [
+        { "from": "Clau-de", "to": "Claude" }
+      ]
+    },
+    "accepted": true,
+    "output": "請使用 Claude"
+  },
+  {
+    "id": "cjk_source_can_map_to_approved_english_term",
+    "input": "用派頭曲跑訓練",
+    "approved_terms": ["PyTorch"],
+    "preferences": "",
+    "proposal": {
+      "text": "用 PyTorch 跑訓練。",
+      "replacements": [
+        { "from": "派頭曲", "to": "PyTorch" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "ordinary_word_cannot_become_acronym",
+    "input": "set it to half width",
+    "approved_terms": ["HAL"],
+    "preferences": "",
+    "proposal": {
+      "text": "set it to HAL width",
+      "replacements": [
+        { "from": "half", "to": "HAL" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "month_name_cannot_become_product_name",
+    "input": "ship in June",
+    "approved_terms": ["Juno"],
+    "preferences": "",
+    "proposal": {
+      "text": "ship in Juno",
+      "replacements": [
+        { "from": "June", "to": "Juno" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "negation_word_cannot_become_product_name",
+    "input": "use neither option",
+    "approved_terms": ["Nether"],
+    "preferences": "",
+    "proposal": {
+      "text": "use Nether option",
+      "replacements": [
+        { "from": "neither", "to": "Nether" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "boolean_literal_cannot_become_library_name",
+    "input": "return false",
+    "approved_terms": ["Faiss"],
+    "preferences": "",
+    "proposal": {
+      "text": "return Faiss",
+      "replacements": [
+        { "from": "false", "to": "Faiss" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "null_literal_cannot_become_framework_name",
+    "input": "value is null",
+    "approved_terms": ["Nuxt"],
+    "preferences": "",
+    "proposal": {
+      "text": "value is Nuxt",
+      "replacements": [
+        { "from": "null", "to": "Nuxt" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "three_simultaneous_edits_are_applied_by_original_offsets",
+    "input": "Py Torch 搭配 Clau-de 和 G PT",
+    "approved_terms": ["PyTorch", "Claude", "GPT"],
+    "preferences": "",
+    "proposal": {
+      "text": "PyTorch 搭配 Claude 和 GPT",
+      "replacements": [
+        { "from": "G PT", "to": "GPT" },
+        { "from": "Py Torch", "to": "PyTorch" },
+        { "from": "Clau-de", "to": "Claude" }
+      ]
+    },
+    "accepted": true,
+    "output": "PyTorch 搭配 Claude 和 GPT"
+  },
+  {
+    "id": "zero_edits_cannot_use_clean_formatting",
+    "input": "嗯我們用 PyTorch，那個，跑訓練",
+    "approved_terms": [],
+    "preferences": "",
+    "proposal": {
+      "text": "我們用 PyTorch 跑訓練。",
+      "replacements": []
+    },
+    "accepted": false
+  },
+  {
+    "id": "unrelated_number_anchor_is_preserved",
+    "input": "用 Py Torch 跑 3 次",
+    "approved_terms": ["PyTorch"],
+    "preferences": "",
+    "proposal": {
+      "text": "用 PyTorch 跑 3 次",
+      "replacements": [
+        { "from": "Py Torch", "to": "PyTorch" }
+      ]
+    },
+    "accepted": true,
+    "output": "用 PyTorch 跑 3 次"
+  },
+  {
+    "id": "single_edit_does_not_cascade_inside_its_own_target",
+    "input": "使用 Py Torch 訓練",
+    "approved_terms": ["PyTorch"],
+    "preferences": "",
+    "proposal": {
+      "text": "使用 PyTorch 訓練",
+      "replacements": [
+        { "from": "Py Torch", "to": "PyTorch" }
+      ]
+    },
+    "accepted": true,
+    "output": "使用 PyTorch 訓練"
+  },
+  {
+    "id": "unauthorized_term_is_rejected",
+    "input": "切換到 ModelA",
+    "approved_terms": ["ModelC"],
+    "preferences": "",
+    "proposal": {
+      "text": "切換到 ModelB。",
+      "replacements": [
+        { "from": "ModelA", "to": "ModelB" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "preference_substring_is_not_an_exact_term",
+    "input": "使用 hyTorch",
+    "approved_terms": [],
+    "preferences": "不要使用 PyTorchX",
+    "proposal": {
+      "text": "使用 PyTorch。",
+      "replacements": [
+        { "from": "hyTorch", "to": "PyTorch" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "natural_language_preference_cannot_authorize_a_negated_term",
+    "input": "使用 hyTorch",
+    "approved_terms": [],
+    "preferences": "不要使用 PyTorch",
+    "proposal": {
+      "text": "使用 PyTorch。",
+      "replacements": [
+        { "from": "hyTorch", "to": "PyTorch" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "approved_term_matching_is_case_sensitive",
+    "input": "使用 hyTorch",
+    "approved_terms": ["pytorch"],
+    "preferences": "",
+    "proposal": {
+      "text": "使用 PyTorch。",
+      "replacements": [
+        { "from": "hyTorch", "to": "PyTorch" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "more_than_three_edits_is_rejected",
+    "input": "aa bb cc dd",
+    "approved_terms": ["Alpha", "Beta", "Gamma", "Delta"],
+    "preferences": "",
+    "proposal": {
+      "text": "Alpha Beta Gamma Delta",
+      "replacements": [
+        { "from": "aa", "to": "Alpha" },
+        { "from": "bb", "to": "Beta" },
+        { "from": "cc", "to": "Gamma" },
+        { "from": "dd", "to": "Delta" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "repeated_source_is_not_unique",
+    "input": "hyTorch 和 hyTorch",
+    "approved_terms": ["PyTorch"],
+    "preferences": "",
+    "proposal": {
+      "text": "PyTorch 和 PyTorch",
+      "replacements": [
+        { "from": "hyTorch", "to": "PyTorch" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "overlapping_sources_are_rejected",
+    "input": "請使用 Open AI",
+    "approved_terms": ["OpenAI", "A-I"],
+    "preferences": "",
+    "proposal": {
+      "text": "請使用 OpenA-I",
+      "replacements": [
+        { "from": "Open AI", "to": "OpenAI" },
+        { "from": "AI", "to": "A-I" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "cross_edit_cascade_is_rejected",
+    "input": "hyTorch 搭配 TorchX",
+    "approved_terms": ["PyTorchX", "OpenAI"],
+    "preferences": "",
+    "proposal": {
+      "text": "PyTorchX 搭配 OpenAI",
+      "replacements": [
+        { "from": "hyTorch", "to": "PyTorchX" },
+        { "from": "TorchX", "to": "OpenAI" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "numeric_replacement_is_rejected",
+    "input": "使用 ModelA",
+    "approved_terms": ["Model2"],
+    "preferences": "",
+    "proposal": {
+      "text": "使用 Model2",
+      "replacements": [
+        { "from": "ModelA", "to": "Model2" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "url_edit_is_rejected",
+    "input": "開啟 https://exampel.com/docs",
+    "approved_terms": ["example"],
+    "preferences": "",
+    "proposal": {
+      "text": "開啟 https://example.com/docs",
+      "replacements": [
+        { "from": "exampel", "to": "example" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "email_edit_is_rejected",
+    "input": "寄到 me@gmal.com",
+    "approved_terms": ["gmail"],
+    "preferences": "",
+    "proposal": {
+      "text": "寄到 me@gmail.com",
+      "replacements": [
+        { "from": "gmal", "to": "gmail" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "path_edit_is_rejected",
+    "input": "放在 /Users/me/hyTorch/model",
+    "approved_terms": ["PyTorch"],
+    "preferences": "",
+    "proposal": {
+      "text": "放在 /Users/me/PyTorch/model",
+      "replacements": [
+        { "from": "hyTorch", "to": "PyTorch" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "version_token_edit_is_rejected",
+    "input": "套件是 hyTorch-v2",
+    "approved_terms": ["PyTorch"],
+    "preferences": "",
+    "proposal": {
+      "text": "套件是 PyTorch-v2",
+      "replacements": [
+        { "from": "hyTorch", "to": "PyTorch" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "non_ascii_target_is_out_of_phase_one_scope",
+    "input": "使用 ModelA",
+    "approved_terms": ["模型甲"],
+    "preferences": "",
+    "proposal": {
+      "text": "使用模型甲",
+      "replacements": [
+        { "from": "ModelA", "to": "模型甲" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "critical_state_action_anchor_cannot_change",
+    "input": "enable feature",
+    "approved_terms": ["disable"],
+    "preferences": "",
+    "proposal": {
+      "text": "disable feature",
+      "replacements": [
+        { "from": "enable", "to": "disable" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "candidate_must_apply_declared_edit",
+    "input": "使用 hyTorch",
+    "approved_terms": ["PyTorch"],
+    "preferences": "",
+    "proposal": {
+      "text": "使用 hyTorch。",
+      "replacements": [
+        { "from": "hyTorch", "to": "PyTorch" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "candidate_cannot_add_an_undeclared_context_term",
+    "input": "使用 hyTorch 訓練",
+    "approved_terms": ["PyTorch", "OpenAI"],
+    "preferences": "",
+    "proposal": {
+      "text": "使用 PyTorch 和 OpenAI 訓練",
+      "replacements": [
+        { "from": "hyTorch", "to": "PyTorch" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "missing_source_is_rejected",
+    "input": "使用 Torch",
+    "approved_terms": ["PyTorch"],
+    "preferences": "",
+    "proposal": {
+      "text": "使用 PyTorch",
+      "replacements": [
+        { "from": "hyTorch", "to": "PyTorch" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "english_negation_cannot_be_deleted_into_approved_term",
+    "input": "no API",
+    "approved_terms": ["API"],
+    "preferences": "",
+    "proposal": {
+      "text": "API",
+      "replacements": [
+        { "from": "no API", "to": "API" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "cjk_semantics_cannot_be_deleted_into_approved_term",
+    "input": "藍色 API",
+    "approved_terms": ["API"],
+    "preferences": "",
+    "proposal": {
+      "text": "API",
+      "replacements": [
+        { "from": "藍色 API", "to": "API" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "english_number_word_cannot_become_code_term",
+    "input": "one",
+    "approved_terms": ["None"],
+    "preferences": "",
+    "proposal": {
+      "text": "None",
+      "replacements": [
+        { "from": "one", "to": "None" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "leading_dot_path_token_is_protected",
+    "input": "編輯 .env",
+    "approved_terms": ["ENV"],
+    "preferences": "",
+    "proposal": {
+      "text": "編輯 ENV",
+      "replacements": [
+        { "from": ".env", "to": "ENV" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "zero_edits_cannot_resurrect_superseded_text",
+    "input": "寄小王，不對，寄小李",
+    "approved_terms": [],
+    "preferences": "",
+    "proposal": {
+      "text": "寄小李、小王",
+      "replacements": []
+    },
+    "accepted": false
+  },
+  {
+    "id": "unknown_proposal_field_is_rejected_by_schema",
+    "input": "使用 hyTorch",
+    "approved_terms": ["PyTorch"],
+    "preferences": "",
+    "proposal": {
+      "text": "使用 PyTorch",
+      "replacements": [
+        { "from": "hyTorch", "to": "PyTorch" }
+      ],
+      "reason": "looks better"
+    },
+    "accepted": false
+  },
+  {
+    "id": "unknown_edit_field_is_rejected_by_schema",
+    "input": "使用 hyTorch",
+    "approved_terms": ["PyTorch"],
+    "preferences": "",
+    "proposal": {
+      "text": "使用 PyTorch",
+      "replacements": [
+        { "from": "hyTorch", "to": "PyTorch", "confidence": 0.99 }
+      ]
+    },
+    "accepted": false
+  }
+]

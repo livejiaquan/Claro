@@ -48,6 +48,85 @@ fn enqueue_pending_result(queue: &Mutex<VecDeque<PendingResult>>, result: Pendin
     queue.lock().unwrap().push_back(result);
 }
 
+fn codex_adoption_policy_is_current(metadata: &polish::PolishMetadata) -> Result<(), String> {
+    let current = Settings::load();
+    if current.llm_provider() != "codex"
+        || current.polish_mode() != PolishMode::Correct
+        || polish::blocked_reason(&current).is_some()
+        || (metadata.codex_context_used
+            && (!current.context_enabled()
+                || !current.codex_share_context_terms()
+                || !current.codex_context_consent_valid()))
+    {
+        Err("codex_policy_changed".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Codex 結果在真正貼上前若因取消或焦點切換而要提早持久化，history／pending
+/// 也屬於「採用」行為。必須與撤銷共用 policy gate；若已失效，只保存本機
+/// deterministic base text，不能留下晚到的雲端改字。
+#[allow(clippy::too_many_arguments)]
+fn persist_pre_paste_result(
+    pending_results: &Mutex<VecDeque<PendingResult>>,
+    raw: &str,
+    base_text: &str,
+    candidate_text: &str,
+    duration_s: f64,
+    status: &'static str,
+    timings: &serde_json::Value,
+    metadata: &polish::PolishMetadata,
+    pending_reason: Option<&'static str>,
+) {
+    let persist = |text: &str, polish_metadata: &polish::PolishMetadata| {
+        let _ = history::append_entry(
+            NewEntry {
+                raw,
+                text,
+                duration_s,
+                status,
+                timings: Some(timings.clone()),
+                polish: Some(polish_metadata.clone()),
+            },
+            &history::history_path(),
+        );
+        if let Some(reason) = pending_reason {
+            enqueue_pending_result(
+                pending_results,
+                PendingResult {
+                    raw: raw.to_string(),
+                    text: text.to_string(),
+                    reason,
+                },
+            );
+        }
+    };
+
+    if let Some(epoch) = metadata.codex_policy_epoch {
+        let adopted = crate::codex::with_policy_permit(epoch, || {
+            codex_adoption_policy_is_current(metadata)?;
+            persist(candidate_text, metadata);
+            Ok(())
+        });
+        if adopted.is_ok() {
+            return;
+        }
+
+        let fallback_text = textproc::normalize_cjk_punct(&textproc::to_traditional(base_text));
+        let mut fallback_metadata = metadata.clone();
+        fallback_metadata.changed = false;
+        fallback_metadata.outcome = polish::PolishOutcome::Fallback;
+        fallback_metadata.fallback_reason = Some(polish::PolishFallbackReason::CodexCancelled);
+        fallback_metadata.codex_policy_epoch = None;
+        fallback_metadata.codex_context_used = false;
+        persist(&fallback_text, &fallback_metadata);
+        return;
+    }
+
+    persist(candidate_text, metadata);
+}
+
 /// 共享槽只交給建立它的 session。舊 processing thread 不可先 take 再比較，
 /// 否則 Esc 後立刻開始的新 session 會被舊 thread 偷走 target/context。
 fn take_session_slot<T>(slot: &Mutex<Option<(u64, T)>>, session: u64) -> Option<T> {
@@ -405,6 +484,9 @@ pub fn run_dispatcher(core: Arc<Core>, rx: crossbeam_channel::Receiver<Msg>) {
                     SmAction::CancelRecording => cancel_recording(&core),
                     SmAction::CancelProcessing => {
                         core.cancel.lock().unwrap().store(true, Ordering::SeqCst);
+                        // Codex writer 另以 policy gate 保護 stdin；同步推進 generation，
+                        // 避免 Esc 正好落在 session cancel check 與第一個 byte 之間。
+                        crate::codex::cancel_active();
                         core.overlay.send("cancel");
                         tracing::info!("cancelled (processing result goes to history only)");
                     }
@@ -661,7 +743,9 @@ fn context_matches_target(
 }
 
 fn async_feedback_allowed(core: &Core, session: u64, cancel: &AtomicBool) -> bool {
-    !cancel.load(Ordering::SeqCst) && core.sm.lock().unwrap().session() == session
+    !crate::SHUTTING_DOWN.load(Ordering::SeqCst)
+        && !cancel.load(Ordering::SeqCst)
+        && core.sm.lock().unwrap().session() == session
 }
 
 fn commit_paste_for_session(
@@ -671,7 +755,11 @@ fn commit_paste_for_session(
     paste: &dyn Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let sm = sm.lock().unwrap();
-    if cancel.load(Ordering::SeqCst) || sm.session() != session || sm.state() != State::Processing {
+    if crate::SHUTTING_DOWN.load(Ordering::SeqCst)
+        || cancel.load(Ordering::SeqCst)
+        || sm.session() != session
+        || sm.state() != State::Processing
+    {
         anyhow::bail!("paste session changed before Cmd+V");
     }
     paste()
@@ -757,6 +845,11 @@ fn process_session(
     // 的上限只是避免無謂地掃過長的畫面文字。
     let mut bias_terms = settings.vocabulary();
     bias_terms.extend(dict_pairs.iter().map(|(_, right)| right.clone()));
+    // Codex 的雲端資料界線需要能區分「使用者明確建立的本機正確詞」與
+    // 「當前畫面臨時萃取詞」。STT 仍使用合併後清單，但雲端路徑分欄傳遞，
+    // 畫面詞只有第二層同意有效時才會送出。
+    let local_terms = crate::context::context_terms(&bias_terms, "", PROMPT_TERM_LIMIT);
+    let screen_terms = crate::context::context_terms(&[], &screen_ctx, PROMPT_TERM_LIMIT);
     let terms = crate::context::context_terms(&bias_terms, &screen_ctx, PROMPT_TERM_LIMIT);
     let (stt_model, stt_family, prompt_term_count) = {
         let model = *core.active_model.lock().unwrap();
@@ -836,20 +929,27 @@ fn process_session(
         }
     }
 
-    // RAW / CLEAN / ORGANIZE 共用同一入口。provider 不可用、未同意或 guard
+    // RAW / CLEAN / CORRECT / ORGANIZE 共用同一入口。provider 不可用、未同意或 guard
     // 拒絕時 transform 一律回 deterministic base text，並留下可稽核 metadata。
     let t1 = Instant::now();
     let polish::PolishResult {
         text: output,
-        metadata: polish_metadata,
-    } = polish::transform_with_cancel(&settings, &base_text, &screen_ctx, cancel);
+        metadata: mut polish_metadata,
+    } = polish::transform_with_cancel_and_terms(
+        &settings,
+        &base_text,
+        &screen_ctx,
+        &local_terms,
+        &screen_terms,
+        cancel,
+    );
     if low_memory_builtin {
         crate::llm::unload_blocking();
         tracing::info!("low-memory handoff: unloaded builtin LLM after polishing");
     }
     let polish_ms =
         (settings.polish_mode() != PolishMode::Raw).then(|| t1.elapsed().as_millis() as u64);
-    let text = textproc::normalize_cjk_punct(&textproc::to_traditional(&output));
+    let mut text = textproc::normalize_cjk_punct(&textproc::to_traditional(&output));
 
     // 只記錄除錯所需的模型／解碼 profile 與聚合音量，不保存 Context 詞彙內容。
     // 讓未來的準確率回報能分辨「哪個模型」與「是否有詞彙偏置」，不再盲猜。
@@ -866,16 +966,16 @@ fn process_session(
     });
 
     if !async_feedback_allowed(core, session, cancel) {
-        let _ = history::append_entry(
-            NewEntry {
-                raw: &raw,
-                text: &text,
-                duration_s: dur,
-                status: "cancelled",
-                timings: Some(timings),
-                polish: Some(polish_metadata),
-            },
-            &history::history_path(),
+        persist_pre_paste_result(
+            &core.pending_results,
+            &raw,
+            &base_text,
+            &text,
+            dur,
+            "cancelled",
+            &timings,
+            &polish_metadata,
+            None,
         );
         return;
     }
@@ -884,16 +984,16 @@ fn process_session(
     let current_target = crate::context::capture_paste_target();
     // Esc 或新 session 可能在 bounded AX 驗證期間發生；貼上前必須再檢查一次。
     if !async_feedback_allowed(core, session, cancel) {
-        let _ = history::append_entry(
-            NewEntry {
-                raw: &raw,
-                text: &text,
-                duration_s: dur,
-                status: "cancelled",
-                timings: Some(timings),
-                polish: Some(polish_metadata),
-            },
-            &history::history_path(),
+        persist_pre_paste_result(
+            &core.pending_results,
+            &raw,
+            &base_text,
+            &text,
+            dur,
+            "cancelled",
+            &timings,
+            &polish_metadata,
+            None,
         );
         return;
     }
@@ -901,31 +1001,24 @@ fn process_session(
     if !paste_target_matches(target_app_id.as_ref(), current_target.as_ref()) {
         tracing::warn!("paste target changed or is unavailable — preserving result in history");
         send_overlay_for_session(core, session, cancel, "error");
-        let _ = history::append_entry(
-            NewEntry {
-                raw: &raw,
-                text: &text,
-                duration_s: dur,
-                status: "focus_changed",
-                timings: Some(timings),
-                polish: Some(polish_metadata),
-            },
-            &history::history_path(),
-        );
         // 一律保留於 process-memory queue：處理途中切換 history 開關、磁碟滿或
         // 寫入失敗都不能形成沒有落盤、也沒有救援副本的資料遺失窗口。
-        enqueue_pending_result(
+        persist_pre_paste_result(
             &core.pending_results,
-            PendingResult {
-                raw: raw.clone(),
-                text: text.clone(),
-                reason: "focus_changed",
-            },
+            &raw,
+            &base_text,
+            &text,
+            dur,
+            "focus_changed",
+            &timings,
+            &polish_metadata,
+            Some("focus_changed"),
         );
         return;
     }
 
     let focus_guard_ms = focus_guard_started.elapsed().as_millis();
+    let codex_policy_epoch = polish_metadata.codex_policy_epoch;
     let pre_paste_commit = |paste: &dyn Fn() -> anyhow::Result<()>| -> anyhow::Result<()> {
         let current = crate::context::capture_paste_target();
         if !paste_target_matches(target_app_id.as_ref(), current.as_ref()) {
@@ -936,44 +1029,73 @@ fn process_session(
         commit_paste_for_session(&core.sm, cancel, session, paste)
     };
     let inject_started = Instant::now();
-    let inject_result = core.injector.inject(&text, &pre_paste_commit);
+    let inject_result = if let Some(epoch) = codex_policy_epoch {
+        match crate::codex::with_policy_permit(epoch, || {
+            codex_adoption_policy_is_current(&polish_metadata)?;
+            core.injector
+                .inject(&text, &pre_paste_commit)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(()) => Ok(()),
+            Err(reason)
+                if reason == "codex_policy_changed"
+                    && crate::SHUTTING_DOWN.load(Ordering::SeqCst) =>
+            {
+                text = textproc::normalize_cjk_punct(&textproc::to_traditional(&base_text));
+                polish_metadata.changed = false;
+                polish_metadata.outcome = polish::PolishOutcome::Fallback;
+                polish_metadata.fallback_reason =
+                    Some(polish::PolishFallbackReason::CodexCancelled);
+                polish_metadata.codex_policy_epoch = None;
+                polish_metadata.codex_context_used = false;
+                Err(anyhow::Error::msg("app_shutting_down"))
+            }
+            Err(reason) if reason == "codex_policy_changed" => {
+                // 撤銷先線性化：Codex text 尚未進剪貼簿，改貼 deterministic
+                // 本機 base text；history/pending 也不得保留已撤銷的晚到結果。
+                text = textproc::normalize_cjk_punct(&textproc::to_traditional(&base_text));
+                polish_metadata.changed = false;
+                polish_metadata.outcome = polish::PolishOutcome::Fallback;
+                polish_metadata.fallback_reason =
+                    Some(polish::PolishFallbackReason::CodexCancelled);
+                polish_metadata.codex_policy_epoch = None;
+                polish_metadata.codex_context_used = false;
+                core.injector.inject(&text, &pre_paste_commit)
+            }
+            Err(reason) => Err(anyhow::Error::msg(reason)),
+        }
+    } else {
+        core.injector.inject(&text, &pre_paste_commit)
+    };
     timings["focus_guard_ms"] = json!(focus_guard_ms.min(u64::MAX as u128) as u64);
     timings["inject_ms"] = json!(inject_started.elapsed().as_millis().min(u64::MAX as u128) as u64);
     if let Err(e) = inject_result {
         tracing::error!("paste failed: {e}");
         if !async_feedback_allowed(core, session, cancel) {
-            let _ = history::append_entry(
-                NewEntry {
-                    raw: &raw,
-                    text: &text,
-                    duration_s: dur,
-                    status: "cancelled",
-                    timings: Some(timings),
-                    polish: Some(polish_metadata),
-                },
-                &history::history_path(),
+            persist_pre_paste_result(
+                &core.pending_results,
+                &raw,
+                &base_text,
+                &text,
+                dur,
+                "cancelled",
+                &timings,
+                &polish_metadata,
+                None,
             );
             return;
         }
         send_overlay_for_session(core, session, cancel, "error");
-        let _ = history::append_entry(
-            NewEntry {
-                raw: &raw,
-                text: &text,
-                duration_s: dur,
-                status: "paste_failed",
-                timings: Some(timings),
-                polish: Some(polish_metadata),
-            },
-            &history::history_path(),
-        );
-        enqueue_pending_result(
+        persist_pre_paste_result(
             &core.pending_results,
-            PendingResult {
-                raw: raw.clone(),
-                text: text.clone(),
-                reason: "paste_failed",
-            },
+            &raw,
+            &base_text,
+            &text,
+            dur,
+            "paste_failed",
+            &timings,
+            &polish_metadata,
+            Some("paste_failed"),
         );
         return;
     }
