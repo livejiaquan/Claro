@@ -221,6 +221,12 @@ export interface HistoryEntry {
   timings?: {
     stt_ms?: number;
     polish_ms?: number | null;
+    /** 使用者放開熱鍵到文字完成貼上的端到端延遲。 */
+    release_to_paste_ms?: number;
+    /** 貼上前第一次 bounded AX 目標驗證。 */
+    focus_guard_ms?: number;
+    /** 剪貼簿交易、最後焦點驗證、Cmd+V 與還原等待。 */
+    inject_ms?: number;
     stt_model?: string;
     stt_family?: "Whisper" | "Qwen3Asr" | string;
     stt_language?: string;

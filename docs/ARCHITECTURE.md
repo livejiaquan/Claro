@@ -91,23 +91,24 @@ IDLE ──keyDown──▶ HOLD ──放開<0.35s──▶ HANDSFREE（免持�
 - 模型目錄：`registry.rs` 宣告式清單（id/label/url/size/recommended），
   檔案放 `~/Library/Application Support/Claro/models/`。加模型＝加一行。
 - `condition_on_prev_tokens: false`：降低幻覺循環（prototype 實測）。
-- **initial_prompt 是準確度關鍵**：`build_initial_prompt(terms)` 產
-  「以下是繁體中文為主、夾雜英文技術術語的口語內容，可能提到：X、Y。」
-  terms = 個人字典的正確詞 ＋ 螢幕上下文抽出的英文/技術詞（上限 15）。
+- **initial_prompt 是準確度關鍵**：`build_initial_prompt(terms)` 只產生
+  `X、Y。` 形式的正規詞彙清單，不把 prompt 寫成指令句；以保守 180-token
+  預算從前端截斷，保留排序在尾端的高價值詞。
+  terms = 使用者詞彙表／個人字典正確詞 ＋ 螢幕上下文抽出的英文、技術與 CJK 詞。
   這讓 Whisper 在解碼階段就偏向正確拼法，而不是事後修。
 
 ## 5. 螢幕上下文（`context.rs`）
 
 macOS Accessibility API 抓：前景 app 名稱、視窗標題、焦點元件游標前後文（±500 字）、
-選取文字（200 字）、視窗可見文字 BFS（1200 字/400 節點，只收
+選取文字（200 字）、視窗可見文字 BFS（3000 字/800 節點，只收
 StaticText/TextField/TextArea/Heading 內容性角色）。
 
 **踩過的坑與防護（改這個檔前必讀）：**
 - system-wide AX 元素查 `AXFocusedApplication` 會回 -25204（CannotComplete）——
   **必須走 NSWorkspace 拿前景 pid** 再 `AXUIElementCreateApplication`。
-- AX 呼叫可能無限卡住：開機第一次 capture 時對 system-wide 元素設
-  `AXUIElementSetMessagingTimeout(0.25s)`（全程序生效）；BFS 另有 800ms 牆鐘預算；
-  pipeline 端再包一層 2 秒 `recv_timeout`。三層保險，聽寫永不被上下文卡死。
+- AX 呼叫可能卡住：一般 Context capture 有 380ms 整批預算；貼上目標只讀
+  metadata，單次 AX timeout 40ms、整批 240ms。Context 在 keyDown 後背景擷取，
+  放開後 pipeline 最多再等到 250ms deadline；逾時即 fail closed。
 - CF 記憶體：AX 回傳都是 create rule（+1 retain），用 `Owned` RAII 包，drop 時 CFRelease。
   CFArray 的元素歸陣列持有，要留用必須自己 CFRetain。
 - **隱私鐵律**：焦點元件 role/subrole 是 `AXSecureTextField` 整塊跳過；
@@ -191,9 +192,10 @@ ggml/Metal 資源**留給 atexit teardown 會 `ggml_abort`**（SIGABRT＋crash �
 
 ## 8. 貼上（`inject.rs`）
 
-剪貼簿備份（純文字）→ 寫入結果 → CGEvent 合成 Cmd+V → **等 300ms** → 還原剪貼簿。
-300ms 是 prototype 實測值；Handy 用 50ms 會跟慢的目標 app race（貼到一半剪貼簿被還原）。
-已知限制：富文本/圖片剪貼簿內容不還原（只備份純文字）。
+逐 item／type eager 備份 NSPasteboard（任一格式讀取失敗就不注入）→ 寫入文字與
+私有 ownership marker → 等 50ms → 再驗 changeCount／marker／session／焦點 →
+CGEvent 合成 Cmd+V → 成功時等 300ms → 只在 ownership 未改變時完整還原。
+富文字、圖片與檔案格式都保留；使用者在期間 Copy 的新內容不會被 Claro 覆蓋。
 
 ## 9. 設定與資料（`settings.rs`、`history.rs`）
 
@@ -209,6 +211,8 @@ ggml/Metal 資源**留給 atexit teardown 會 `ggml_abort`**（SIGABRT＋crash �
 
 - `App.tsx`：側欄殼＋每 2s 輪詢 `get_status`＋事件監聽（模型下載進度、麥克風電平）。
 - 頁面：`Home`（統計卡＋未就緒 banner）、`History`、`Settings`（所有設定列）。
+- `downloadState.ts` 合併事件與後端模型清單：準備、下載、取消中、已取消、
+  失敗可續傳與完成都有單一狀態；終態優先於可能過期的 `downloading=true`。
 - **視窗拖曳（連踩兩坑，使用者實測才暴露）**：`-webkit-app-region` 是 Electron 的，
   在 Tauri 完全無效；改用 `data-tauri-drag-region` 後仍拖不動，因為
   (1) **`core:window:default` 權限集只含唯讀 getter，不含 `allow-start-dragging`**，
@@ -242,6 +246,8 @@ ggml/Metal 資源**留給 atexit teardown 會 `ggml_abort`**（SIGABRT＋crash �
   app 內建補救：啟動時跳系統授權提示＋首頁 banner（含「重設授權」按鈕，
   走 `tccutil reset Accessibility <bundle id>` 清舊條目再重新觸發詢問）＋
   每 2s 輪詢授權後自動啟用。正式發布（M6）簽章後此問題消失。
+- production WebView 使用明確 CSP，capability 只開 event listen/unlisten 與
+  window dragging；遠端 provider 的 HTTP 全由 Rust 執行，不放寬 WebView 網路來源。
 - 熱鍵可設定（config `hotkey`，handy-keys 字串格式），換鍵走 `Ctl::SetMain`
   熱換註冊，不用重啟。
 
@@ -255,8 +261,9 @@ ggml/Metal 資源**留給 atexit teardown 會 `ggml_abort`**（SIGABRT＋crash �
 | 內建 LLM | `cargo run --example builtin_polish [x.wav]` | whisper＋llama 同程序共存＋糾錯品質 |
 | HTTP 潤飾 | `cargo run --example test_polish`＋mock server | 防呆三路徑（正常/空輸出/長度爆炸） |
 | 上下文 | `cargo run --example show_context` | AX 擷取＋詞彙抽取（需輔助使用權限的終端機） |
-| 前端 | happy-dom 探測 dist bundle | mock IPC 渲染設定頁，驗證各區塊存在 |
-| CI | GitHub Actions（macOS） | `npm run build`＋`cargo test --lib`（stub 路徑） |
+| 前端 | `npm test` | Vitest/happy-dom 驗證下載狀態與 ARIA；Node test 驗證隱私安全的效能摘要 |
+| UI QA | `npm run qa:prepare`＋Playwright | mock IPC 實際渲染 Home/Onboarding/Settings/History、下載取消/錯誤/續傳、最小視窗與 console |
+| CI | GitHub Actions（macOS） | frontend lint/test/build、Rust fmt/clippy/test/all-target check、debug `.app` bundle contract |
 
 **驗證鐵律：絕不透過喇叭播音、絕不合成全域鍵盤事件**（會干擾正在用電腦的人）。
 

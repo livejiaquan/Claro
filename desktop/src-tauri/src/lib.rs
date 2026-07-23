@@ -2,8 +2,7 @@
 /// （STT 預載/回載、LLM 冷生成載入）都必須先看它——否則 exit handler 卸載
 /// 完成後，還在等鎖的背景執行緒會把 Metal 模型又載回來，atexit teardown
 /// 再度 ggml_abort（review 抓到的競態）。
-pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub mod audio;
 pub mod context;
@@ -215,14 +214,12 @@ fn mic_test_start(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
                 break;
             }
             let current_level = level.get();
-            if current_level > 0.01 {
-                if mic_test_generation.load(Ordering::SeqCst) == generation {
-                    mic_test_passed.store(true, Ordering::SeqCst);
-                    passed = true;
-                    if mic_test_generation.load(Ordering::SeqCst) != generation {
-                        mic_test_passed.store(false, Ordering::SeqCst);
-                        passed = false;
-                    }
+            if current_level > 0.01 && mic_test_generation.load(Ordering::SeqCst) == generation {
+                mic_test_passed.store(true, Ordering::SeqCst);
+                passed = true;
+                if mic_test_generation.load(Ordering::SeqCst) != generation {
+                    mic_test_passed.store(false, Ordering::SeqCst);
+                    passed = false;
                 }
             }
             if mic_test_generation.load(Ordering::SeqCst) != generation {
@@ -349,40 +346,99 @@ fn release_download(gate: &Mutex<Option<&'static str>>) {
 /// 被記憶體壓力殺掉（主進程存活，使用者看到的就是白屏）。
 pub static DOWNLOAD_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+const DOWNLOAD_PREPARE_RETRY: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// 等待模型資源讓出時仍要能回應「取消」。`Mutex::lock()` 無法被 AtomicBool
+/// 中斷，因此用有上限的 park 週期搭配 try_lock；沒有持續佔用 CPU 的 busy spin。
+fn wait_for_download_resource(
+    cancel: &AtomicBool,
+    mut try_prepare: impl FnMut() -> Result<bool, String>,
+) -> Result<(), String> {
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(models::DOWNLOAD_CANCELLED.into());
+        }
+        if try_prepare()? {
+            return Ok(());
+        }
+        std::thread::park_timeout(DOWNLOAD_PREPARE_RETRY);
+    }
+}
+
 /// 下載期間的狀態持有者。用 Drop 收尾，背景執行緒即使 panic（例如 mutex
 /// poisoned）也不會把 downloading／gate 永久卡住而必須重開 app。
 struct DownloadSession {
     slot: Arc<Mutex<Option<&'static str>>>,
     gate: Arc<Mutex<Option<&'static str>>>,
+    active: &'static AtomicBool,
 }
 
 impl DownloadSession {
-    fn new(
+    fn new(slot: Arc<Mutex<Option<&'static str>>>, gate: Arc<Mutex<Option<&'static str>>>) -> Self {
+        Self::with_active(slot, gate, &DOWNLOAD_ACTIVE)
+    }
+
+    fn with_active(
         slot: Arc<Mutex<Option<&'static str>>>,
         gate: Arc<Mutex<Option<&'static str>>>,
-        core: &Arc<pipeline::Core>,
+        active: &'static AtomicBool,
     ) -> Self {
-        DOWNLOAD_ACTIVE.store(true, Ordering::SeqCst);
-        llm::unload_blocking();
-        if let Ok(mut engine) = core.engine.lock() {
-            if engine.is_loaded() {
-                engine.unload();
-                tracing::info!("unloaded STT before model download to reduce memory pressure");
+        active.store(true, Ordering::SeqCst);
+        Self { slot, gate, active }
+    }
+
+    /// 下載前卸載大型模型。等待推論／轉錄釋放鎖的期間可以取消；一旦拿到鎖，
+    /// 實際的 Metal drop/unload 仍須完整做完，不能在資源析構中途硬切。
+    fn prepare(&self, core: &Arc<pipeline::Core>, cancel: &AtomicBool) -> Result<(), String> {
+        wait_for_download_resource(cancel, || {
+            llm::try_unload_for_download().map_err(|error| error.to_string())
+        })?;
+        wait_for_download_resource(cancel, || match core.engine.try_lock() {
+            Ok(mut engine) => {
+                if engine.is_loaded() {
+                    engine.unload();
+                    tracing::info!("unloaded STT before model download to reduce memory pressure");
+                }
+                Ok(true)
             }
+            Err(std::sync::TryLockError::WouldBlock) => Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Err("語音模型狀態異常，請重新啟動 Claro".into())
+            }
+        })?;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(models::DOWNLOAD_CANCELLED.into());
         }
-        Self { slot, gate }
+        Ok(())
+    }
+
+    /// final event 必須在 Drop 清除 downloading、共用 gate 與
+    /// DOWNLOAD_ACTIVE 之後送出，讓事件處理器立即 refetch 時讀到權威狀態。
+    fn finish(self, emit: impl FnOnce()) {
+        drop(self);
+        emit();
     }
 }
 
 impl Drop for DownloadSession {
     fn drop(&mut self) {
-        DOWNLOAD_ACTIVE.store(false, Ordering::SeqCst);
-        if let Ok(mut slot) = self.slot.lock() {
-            *slot = None;
-        }
-        if let Ok(mut gate) = self.gate.lock() {
-            *gate = None;
-        }
+        self.active.store(false, Ordering::SeqCst);
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = None;
+        self.slot.clear_poison();
+        drop(slot);
+
+        // gate 最後釋放：下一個 session 只能在這個 session 的 active/slot
+        // 都清理完成後開始，避免舊 Drop 把新 session 的狀態覆寫掉。
+        let mut gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *gate = None;
+        self.gate.clear_poison();
     }
 }
 
@@ -415,6 +471,8 @@ fn download_model(
     {
         let mut guard = state.downloading.lock().unwrap();
         if guard.is_some() {
+            drop(guard);
+            release_download(&state.download_gate);
             return Err("已有模型在下載中".into());
         }
         *guard = Some(spec.id);
@@ -429,21 +487,24 @@ fn download_model(
         // 下載會寫入數 GB 並在結尾整檔 hash；常駐的 STT/LLM 若同時佔著數 GB，
         // WebKit renderer 會被系統以記憶體壓力殺掉（使用者實測踩過：白屏）。
         // 先讓出記憶體，下載結束後照原本的用時載入路徑自然回來。
-        let _session = DownloadSession::new(downloading, download_gate, &core);
+        let session = DownloadSession::new(downloading, download_gate);
         let dest = registry::model_path(spec);
-        let result = models::download(spec.url, &dest, spec.sha256, &cancel, |p| {
-            let _ = app.emit(
-                "model-download",
-                DownloadProgress {
-                    model_id: spec.id,
-                    downloaded_mb: p.downloaded / 1_048_576,
-                    total_mb: p.total.map(|t| t / 1_048_576),
-                    done: false,
-                    downloaded: false,
-                    activation_status: "none",
-                    error: None,
-                },
-            );
+        let result = session.prepare(&core, &cancel).and_then(|()| {
+            models::download(spec.url, &dest, spec.sha256, &cancel, |p| {
+                let _ = app.emit(
+                    "model-download",
+                    DownloadProgress {
+                        model_id: spec.id,
+                        downloaded_mb: p.downloaded / 1_048_576,
+                        total_mb: p.total.map(|t| t / 1_048_576),
+                        done: false,
+                        downloaded: false,
+                        activation_status: "none",
+                        error: None,
+                    },
+                );
+            })
+            .map_err(|error| error.to_string())
         });
         let payload = match result {
             Ok(()) if activate_after_download => match core.swap_model(spec, || {
@@ -499,7 +560,9 @@ fn download_model(
                 error: Some(e.to_string()),
             },
         };
-        let _ = app.emit("model-download", payload);
+        session.finish(|| {
+            let _ = app.emit("model-download", payload);
+        });
     });
     Ok(())
 }
@@ -658,6 +721,8 @@ fn download_builtin_llm(
     {
         let mut guard = state.llm_downloading.lock().unwrap();
         if guard.is_some() {
+            drop(guard);
+            release_download(&state.download_gate);
             return Err("已有模型在下載中".into());
         }
         *guard = Some(spec.id);
@@ -668,21 +733,24 @@ fn download_builtin_llm(
     let cancel = state.download_cancel.clone();
     cancel.store(false, Ordering::SeqCst);
     std::thread::spawn(move || {
-        let _session = DownloadSession::new(downloading, download_gate, &core);
+        let session = DownloadSession::new(downloading, download_gate);
         let dest = llm::model_path(spec);
-        let result = models::download(spec.url, &dest, spec.sha256, &cancel, |p| {
-            let _ = app.emit(
-                "llm-model-download",
-                DownloadProgress {
-                    model_id: spec.id,
-                    downloaded_mb: p.downloaded / 1_048_576,
-                    total_mb: p.total.map(|t| t / 1_048_576),
-                    done: false,
-                    downloaded: false,
-                    activation_status: "none",
-                    error: None,
-                },
-            );
+        let result = session.prepare(&core, &cancel).and_then(|()| {
+            models::download(spec.url, &dest, spec.sha256, &cancel, |p| {
+                let _ = app.emit(
+                    "llm-model-download",
+                    DownloadProgress {
+                        model_id: spec.id,
+                        downloaded_mb: p.downloaded / 1_048_576,
+                        total_mb: p.total.map(|t| t / 1_048_576),
+                        done: false,
+                        downloaded: false,
+                        activation_status: "none",
+                        error: None,
+                    },
+                );
+            })
+            .map_err(|error| error.to_string())
         });
         let payload = match result {
             Ok(()) => DownloadProgress {
@@ -704,7 +772,9 @@ fn download_builtin_llm(
                 error: Some(e.to_string()),
             },
         };
-        let _ = app.emit("llm-model-download", payload);
+        session.finish(|| {
+            let _ = app.emit("llm-model-download", payload);
+        });
     });
     Ok(())
 }
@@ -1242,6 +1312,7 @@ fn init_core(app: &tauri::AppHandle) {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod product_gate_tests {
     use super::*;
 
@@ -1277,6 +1348,58 @@ mod product_gate_tests {
         assert!(reserve_download(&gate, "llm").is_err());
         release_download(&gate);
         assert!(reserve_download(&gate, "llm").is_ok());
+    }
+
+    #[test]
+    fn final_download_event_observes_authoritative_idle_state() {
+        static TEST_DOWNLOAD_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+        let downloading = Arc::new(Mutex::new(Some("stt")));
+        let gate = Arc::new(Mutex::new(Some("stt")));
+        let session =
+            DownloadSession::with_active(downloading.clone(), gate.clone(), &TEST_DOWNLOAD_ACTIVE);
+        assert!(TEST_DOWNLOAD_ACTIVE.load(Ordering::SeqCst));
+
+        let mut emitted = false;
+        session.finish(|| {
+            assert_eq!(*downloading.lock().unwrap(), None);
+            assert_eq!(*gate.lock().unwrap(), None);
+            assert!(!TEST_DOWNLOAD_ACTIVE.load(Ordering::SeqCst));
+            emitted = true;
+        });
+
+        assert!(emitted);
+    }
+
+    #[test]
+    fn cancelling_download_interrupts_resource_wait() {
+        use std::sync::mpsc;
+
+        let resource = Arc::new(Mutex::new(()));
+        let held = resource.lock().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiter_resource = resource.clone();
+        let waiter_cancel = cancel.clone();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+
+        let waiter = std::thread::spawn(move || {
+            let mut announced = false;
+            wait_for_download_resource(&waiter_cancel, || {
+                if !announced {
+                    attempt_tx.send(()).unwrap();
+                    announced = true;
+                }
+                Ok(waiter_resource.try_lock().is_ok())
+            })
+        });
+
+        attempt_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("waiter should try the held resource");
+        cancel.store(true, Ordering::SeqCst);
+        let result = waiter.join().expect("waiter should not panic");
+        assert_eq!(result, Err(models::DOWNLOAD_CANCELLED.into()));
+        drop(held);
     }
 }
 

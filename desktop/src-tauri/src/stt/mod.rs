@@ -88,7 +88,10 @@ mod tests {
         let mut terms: Vec<String> = (0..300).map(|i| format!("詞彙{i}")).collect();
         terms.push("MostImportant".into());
         let prompt = build_initial_prompt(&terms).expect("應該產生 prompt");
-        assert!(prompt.ends_with("MostImportant。"), "尾端必須保留最重要的詞");
+        assert!(
+            prompt.ends_with("MostImportant。"),
+            "尾端必須保留最重要的詞"
+        );
         assert!(!prompt.contains("詞彙0、"), "最前面的詞應該被丟掉");
         assert!(approx_tokens(&prompt) <= 223, "不可超過 Whisper 硬上限");
     }

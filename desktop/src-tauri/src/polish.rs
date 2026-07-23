@@ -2,6 +2,7 @@
 //! - `apple`：Apple Intelligence 端上模型（FoundationModels，macOS 26+，Swift bridge）
 //! - `ollama` / `lmstudio`：本機服務，OpenAI-compatible HTTP
 //! - `custom`：任何 OpenAI-compatible 端點（BYOK，key 存 Keychain）
+//!
 //! 鐵律：潤飾失敗永遠退回原文，聽寫不可因 LLM 掛掉而失敗。
 
 use std::io::Write;
@@ -393,7 +394,8 @@ fn guard_candidate(
                     // 「Alpha 那個版本」），不放行刪除、也不整句退回：把原詞塞回
                     // 對齊位置再重跑全部嚴格檢查。其餘清理（語助詞、標點）照常
                     // 生效，指示詞永不消失。
-                    if let Some(repaired) = reinsert_ambiguous_fillers(&comparison_source, &candidate)
+                    if let Some(repaired) =
+                        reinsert_ambiguous_fillers(&comparison_source, &candidate)
                     {
                         if clean_checks(original, &comparison_source, &repaired).is_ok() {
                             return Ok(repaired);
@@ -1944,10 +1946,16 @@ mod tests {
         // 模型刪了嗯（嚴格規則允許）＋那個（語意不明）→ 那個被塞回、嗯的清理保留
         let input = "嗯我們用 hyTorch 那個跑訓練然後把模型存到 S3";
         let candidate = "我們用 hyTorch 跑訓練然後把模型存到 S3".to_string();
-        assert_eq!(guard(input, candidate), "我們用 hyTorch 那個跑訓練然後把模型存到 S3");
+        assert_eq!(
+            guard(input, candidate),
+            "我們用 hyTorch 那個跑訓練然後把模型存到 S3"
+        );
         // review H1 反例：名詞修飾的指示詞——塞回後輸出等於原文
         let input = "採用 Alpha 那個版本";
-        assert_eq!(guard(input, "採用 Alpha 版本".to_string()), "採用 Alpha 那個版本");
+        assert_eq!(
+            guard(input, "採用 Alpha 版本".to_string()),
+            "採用 Alpha 那個版本"
+        );
     }
 
     // 修補範圍刻意窄：句首「那個」是指示詞（fixture）；純 CJK 無空白邊界
@@ -1987,7 +1995,10 @@ mod tests {
             Some("跑那個訓練")
         );
         // 候選保留了填充詞 → 沒東西可修
-        assert_eq!(reinsert_ambiguous_fillers("跑 那個訓練", "跑 那個訓練"), None);
+        assert_eq!(
+            reinsert_ambiguous_fillers("跑 那個訓練", "跑 那個訓練"),
+            None
+        );
         // 候選多出字元 → 不修
         assert_eq!(reinsert_ambiguous_fillers("好", "很好"), None);
         // 少掉的不是可修補填充詞 → 不修

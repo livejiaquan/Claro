@@ -1,5 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
+import DownloadStatus from "../components/DownloadStatus";
+import {
+  resolveDownloadState,
+  type DownloadKind,
+} from "../downloadState";
 import {
   displaySttModelLabel,
   isPreviewSttModel,
@@ -71,6 +76,7 @@ export default function Settings({
   mic,
   progress,
   llmProgress,
+  onDownloadStart,
   refresh,
   onToast,
   onOpenSetup,
@@ -79,6 +85,7 @@ export default function Settings({
   mic: MicLevel;
   progress: DownloadProgress | null;
   llmProgress: DownloadProgress | null;
+  onDownloadStart: (kind: DownloadKind) => void;
   refresh: () => void;
   onToast: (msg: string) => void;
   onOpenSetup: () => void;
@@ -101,6 +108,10 @@ export default function Settings({
   const [dict, setDict] = useState<DictEntry[] | null>(null);
   const [dictDraft, setDictDraft] = useState<DictEntry>({ from: "", to: "" });
   const [contextAudit, setContextAudit] = useState<ContextAudit | null>(null);
+  const [downloadIntent, setDownloadIntent] = useState<{
+    key: string;
+    phase: "starting" | "cancelling";
+  } | null>(null);
 
   const loadModels = () => invoke<ModelInfo[]>("list_models").then(setModels).catch(() => {});
   const loadLlm = () =>
@@ -140,7 +151,14 @@ export default function Settings({
   // 內建 LLM 下載進度改變清單狀態
   useEffect(() => {
     loadBuiltinLlms();
-  }, [llmProgress?.model_id, llmProgress?.done, llm?.model, llm?.provider]);
+  }, [
+    llmProgress?.model_id,
+    llmProgress?.done,
+    llmProgress?.downloaded,
+    llmProgress?.error,
+    llm?.model,
+    llm?.provider,
+  ]);
 
   // 選到本機服務時偵測其模型清單
   useEffect(() => {
@@ -172,10 +190,69 @@ export default function Settings({
       .catch((e) => setError(String(e)));
   };
 
+  const requestDownload = async (
+    kind: DownloadKind,
+    modelId: string,
+    command: string,
+    args: Record<string, unknown>,
+  ) => {
+    const key = `${kind}:${modelId}`;
+    setError(null);
+    setDownloadIntent({ key, phase: "starting" });
+    onDownloadStart(kind);
+    try {
+      await invoke(command, args);
+      refresh();
+      if (kind === "stt") loadModels();
+      else loadBuiltinLlms();
+    } catch (reason) {
+      setDownloadIntent((current) => (current?.key === key ? null : current));
+      setError(String(reason));
+    }
+  };
+
+  const cancelDownload = (kind: DownloadKind, modelId: string) => {
+    const key = `${kind}:${modelId}`;
+    setError(null);
+    setDownloadIntent({ key, phase: "cancelling" });
+    invoke("cancel_download").catch((reason) => {
+      setDownloadIntent((current) => (current?.key === key ? null : current));
+      setError(`無法取消下載：${String(reason)}`);
+    });
+  };
+
+  const intentMatches = (
+    kind: DownloadKind,
+    modelId: string,
+    phase: "starting" | "cancelling",
+  ) => downloadIntent?.key === `${kind}:${modelId}` && downloadIntent.phase === phase;
+
+  const sttDownloadState = (model: ModelInfo) =>
+    resolveDownloadState({
+      modelId: model.id,
+      downloaded: model.downloaded,
+      backendDownloading: model.downloading,
+      progress,
+      startRequested: intentMatches("stt", model.id, "starting"),
+      cancelRequested: intentMatches("stt", model.id, "cancelling"),
+    });
+
+  const llmDownloadState = (model: ModelInfo) =>
+    resolveDownloadState({
+      modelId: model.id,
+      downloaded: model.downloaded,
+      backendDownloading: model.downloading,
+      progress: llmProgress,
+      startRequested: intentMatches("llm", model.id, "starting"),
+      cancelRequested: intentMatches("llm", model.id, "cancelling"),
+    });
+
   // 連續操作（選 preset 後馬上改欄位）的兩道防線：
   // 1) llmRef 即時反映最新值——閉包裡的舊 llm 不會把欄位倒退
   // 2) 寫入請求串行化——舊請求不會晚到蓋掉新請求
   const llmRef = useRef<ResolvedLlmConfig | null>(null);
+  // 刻意在 render 同步：事件可能在 effect 前連續觸發，非同步同步會重現欄位倒退 race。
+  // eslint-disable-next-line react-hooks/refs
   llmRef.current = llm;
   const llmSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
   // 第三道防線（review 發現）：佇列中「較舊請求」的後端回應不能落地——
@@ -295,6 +372,9 @@ export default function Settings({
     .map((model, index) => ({ model, index }))
     .sort((a, b) => sttModelSortRank(a.model) - sttModelSortRank(b.model) || a.index - b.index)
     .map(({ model }) => model);
+  const anyDownloadActive =
+    orderedModels.some((model) => sttDownloadState(model).active) ||
+    builtinLlms.some((model) => llmDownloadState(model).active);
 
   return (
     <div className="page-in">
@@ -316,6 +396,7 @@ export default function Settings({
             <Hotkey combo={status.hotkey} />
             <select
               className="select no-drag"
+              name="hotkey"
               value={status.hotkey}
               onChange={(e) =>
                 invoke("set_hotkey", { combo: e.target.value })
@@ -340,6 +421,7 @@ export default function Settings({
         <Row label="輸入裝置" sub={!status.input_device ? "跟隨系統預設" : "已固定，不隨系統切換"}>
           <select
             className="select no-drag"
+            name="input-device"
             value={status.input_device ?? ""}
             onChange={(e) => {
               if (mic.active) invoke("mic_test_stop").catch(() => {});
@@ -384,25 +466,16 @@ export default function Settings({
       <Section title="語音模型">
         {orderedModels.map((m) => {
           const available = m.available === true;
-          // 後端清單的 downloading 是真值：進度事件還沒到（下載剛起步、頁面
-          // 重開）時也要顯示下載中，否則按鈕看似可再按、實際會回「已有下載」
-          const isDownloading =
-            available &&
-            ((progress?.model_id === m.id && !progress.done && !progress.error) || m.downloading);
+          const downloadState = sttDownloadState(m);
           const activationStatus = progress?.model_id === m.id ? progress.activation_status : "none";
           const activationPending = activationStatus !== "none";
-          const downloadError = progress?.model_id === m.id && !activationPending ? progress.error : null;
-          // 後端在 spawn 前就把 downloading 設為真，第一個進度事件要累積 1MB
-          // 才送出（下載前的模型卸載又拉長了這個空窗），所以 progress 可能還是
-          // null。這裡不能用 `!` 斷言——runtime 沒有它，會直接拋錯白屏。
-          const activeProgress =
-            progress?.model_id === m.id && isDownloading ? progress : null;
-          const pct =
-            activeProgress?.total_mb
-              ? Math.min(100, (activeProgress.downloaded_mb / activeProgress.total_mb) * 100)
-              : null;
           return (
-            <div className="row" key={m.id} style={{ alignItems: "flex-start" }}>
+            <div
+              className="row"
+              key={m.id}
+              style={{ alignItems: "flex-start" }}
+              aria-busy={downloadState.active}
+            >
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="row-label">{displaySttModelLabel(m)}</span>
@@ -414,6 +487,9 @@ export default function Settings({
                       使用中
                     </span>
                   )}
+                  {available && !m.active && m.downloaded && (
+                    <span className="pill green">已下載</span>
+                  )}
                   {available && m.active && !m.downloaded && <span className="pill amber">已選擇・待下載</span>}
                 </div>
                 <div className="row-sub">
@@ -424,34 +500,12 @@ export default function Settings({
                     完成長音訊分段與台灣真人語料驗收前，不提供下載或啟用。
                   </div>
                 )}
-                {isDownloading && (
-                  <div className="mt-2 w-[240px]">
-                    <div className="progress-track">
-                      <div
-                        className="progress-fill"
-                        style={{ width: pct !== null ? `${pct}%` : "30%" }}
-                      />
-                    </div>
-                    <div className="text-[11px] mt-1 flex items-center gap-2" style={{ color: "var(--muted)" }}>
-                      <span>
-                        {activeProgress
-                          ? `${activeProgress.downloaded_mb}/${activeProgress.total_mb ?? "?"} MB`
-                          : "準備中…"}
-                      </span>
-                      <button
-                        className="btn danger-quiet no-drag"
-                        onClick={() => call("cancel_download")}
-                      >
-                        取消
-                      </button>
-                    </div>
-                  </div>
-                )}
-                {downloadError && (
-                  <div className="config-error mt-2" role="alert">
-                    下載中斷：{downloadError}。再次按下會從已完成的位置續傳。
-                  </div>
-                )}
+                <DownloadStatus
+                  state={downloadState}
+                  label={displaySttModelLabel(m)}
+                  className="w-[240px]"
+                  onCancel={() => cancelDownload("stt", m.id)}
+                />
                 {activationPending && (
                   <div className="model-validation-note" role="status">
                     {activationStatus === "waiting_for_idle"
@@ -522,9 +576,23 @@ export default function Settings({
                     )}
                   </>
                 )}
-                {available && !m.downloaded && !isDownloading && (
-                  <button className="btn no-drag" onClick={() => call("download_model", { id: m.id })}>
-                    {downloadError ? "重試並續傳" : "下載"}
+                {available && !m.downloaded && downloadState.canStart && (
+                  <button
+                    className="btn no-drag"
+                    disabled={anyDownloadActive}
+                    title={anyDownloadActive ? "請先完成目前的模型下載" : undefined}
+                    onClick={() =>
+                      void requestDownload(
+                        "stt",
+                        m.id,
+                        "download_model",
+                        { id: m.id },
+                      )
+                    }
+                  >
+                    {downloadState.phase === "failed" || downloadState.phase === "cancelled"
+                      ? "重試並續傳"
+                      : "下載"}
                   </button>
                 )}
               </div>
@@ -587,6 +655,7 @@ export default function Settings({
           <select
             className="select no-drag"
             aria-label="文字整理位置"
+            name="polish-provider"
             value={llm?.provider ?? "off"}
             onChange={(e) => saveLlm({ provider: e.target.value })}
           >
@@ -612,6 +681,7 @@ export default function Settings({
           <label className="local-only-control">
             <input
               type="checkbox"
+              name="local-only"
               checked={llm?.local_only ?? false}
               disabled={!llm}
               onChange={(e) => {
@@ -674,18 +744,14 @@ export default function Settings({
         {llm?.provider === "builtin" && (
           <>
             {builtinLlms.map((m) => {
-              const isDownloading =
-                (llmProgress?.model_id === m.id && !llmProgress.done && !llmProgress.error) ||
-                m.downloading;
-              const downloadError = llmProgress?.model_id === m.id ? llmProgress.error : null;
-              const activeProgress =
-                llmProgress?.model_id === m.id && isDownloading ? llmProgress : null;
-              const pct =
-                activeProgress?.total_mb
-                  ? Math.min(100, (activeProgress.downloaded_mb / activeProgress.total_mb) * 100)
-                  : null;
+              const downloadState = llmDownloadState(m);
               return (
-                <div className="row" key={m.id} style={{ alignItems: "flex-start" }}>
+                <div
+                  className="row"
+                  key={m.id}
+                  style={{ alignItems: "flex-start" }}
+                  aria-busy={downloadState.active}
+                >
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
                       <span className="row-label">{m.label}</span>
@@ -696,39 +762,18 @@ export default function Settings({
                           使用中
                         </span>
                       )}
+                      {!m.active && m.downloaded && <span className="pill green">已下載</span>}
                     </div>
                     <div className="row-sub">
                       {m.desc}・{m.size_mb >= 1024 ? `${(m.size_mb / 1024).toFixed(1)} GB` : `${m.size_mb} MB`}
                       ・閒置 5 分鐘自動釋放記憶體
                     </div>
-                    {isDownloading && (
-                      <div className="mt-2 w-[240px]">
-                        <div className="progress-track">
-                          <div
-                            className="progress-fill"
-                            style={{ width: pct !== null ? `${pct}%` : "30%" }}
-                          />
-                        </div>
-                        <div className="text-[11px] mt-1 flex items-center gap-2" style={{ color: "var(--muted)" }}>
-                          <span>
-                            {activeProgress
-                              ? `${activeProgress.downloaded_mb}/${activeProgress.total_mb ?? "?"} MB`
-                              : "準備中…"}
-                          </span>
-                          <button
-                            className="btn danger-quiet no-drag"
-                            onClick={() => call("cancel_download")}
-                          >
-                            取消
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                    {downloadError && (
-                      <div className="config-error mt-2" role="alert">
-                        下載中斷：{downloadError}。再次按下會從已完成的位置續傳。
-                      </div>
-                    )}
+                    <DownloadStatus
+                      state={downloadState}
+                      label={m.label}
+                      className="w-[240px]"
+                      onCancel={() => cancelDownload("llm", m.id)}
+                    />
                   </div>
                   <div className="flex items-center gap-2 pt-0.5">
                     {m.downloaded && !m.active && (
@@ -765,16 +810,24 @@ export default function Settings({
                         )}
                       </>
                     )}
-                    {!m.downloaded && !isDownloading && (
+                    {!m.downloaded && downloadState.canStart && (
                       <button
                         className="btn no-drag"
+                        disabled={anyDownloadActive}
+                        title={anyDownloadActive ? "請先完成目前的模型下載" : undefined}
                         onClick={() =>
-                          invoke("download_builtin_llm", { id: m.id }).catch((e) =>
-                            setError(String(e)),
+                          void requestDownload(
+                            "llm",
+                            m.id,
+                            "download_builtin_llm",
+                            { id: m.id },
                           )
                         }
                       >
-                        {downloadError ? "重試並續傳" : "下載"}
+                        {downloadState.phase === "failed" ||
+                        downloadState.phase === "cancelled"
+                          ? "重試並續傳"
+                          : "下載"}
                       </button>
                     )}
                   </div>
@@ -836,6 +889,7 @@ export default function Settings({
                   <select
                     className="select no-drag"
                     style={{ minWidth: 200 }}
+                    name="local-model"
                     value={llm.model}
                     onChange={(e) => saveLlm({ model: e.target.value })}
                   >
@@ -852,8 +906,12 @@ export default function Settings({
                   <input
                     className="select no-drag"
                     style={{ minWidth: 200 }}
+                    name="local-model"
+                    autoComplete="off"
+                    spellCheck={false}
+                    translate="no"
                     value={llm.model}
-                    placeholder="qwen3:4b"
+                    placeholder="例如 qwen3:4b…"
                     onChange={(e) => saveLlm({ model: e.target.value })}
                   />
                 )}
@@ -871,6 +929,7 @@ export default function Settings({
               <select
                 className="select no-drag"
                 aria-label="常用雲端服務"
+                name="cloud-preset"
                 value={CUSTOM_PRESETS.find((p) => p.baseUrl === llm.base_url)?.id ?? ""}
                 onChange={(e) => {
                   const p = CUSTOM_PRESETS.find((x) => x.id === e.target.value);
@@ -890,8 +949,14 @@ export default function Settings({
                 className="select no-drag"
                 aria-label="自訂 API Base URL"
                 style={{ minWidth: 260 }}
+                type="url"
+                inputMode="url"
+                name="custom-api-base-url"
+                autoComplete="off"
+                spellCheck={false}
+                translate="no"
                 value={llm.base_url}
-                placeholder="https://api.openai.com/v1"
+                placeholder="例如 https://api.openai.com/v1…"
                 onChange={(e) => saveLlm({ base_url: e.target.value })}
               />
             </Row>
@@ -900,8 +965,12 @@ export default function Settings({
                 className="select no-drag"
                 aria-label="自訂 API 模型名稱"
                 style={{ minWidth: 200 }}
+                name="custom-api-model"
+                autoComplete="off"
+                spellCheck={false}
+                translate="no"
                 value={llm.model}
-                placeholder="gpt-4o-mini"
+                placeholder="例如 gpt-4o-mini…"
                 onChange={(e) => saveLlm({ model: e.target.value })}
               />
             </Row>
@@ -915,6 +984,10 @@ export default function Settings({
                   aria-label="API Key"
                   style={{ minWidth: 180 }}
                   type="password"
+                  name="custom-api-key"
+                  autoComplete="off"
+                  spellCheck={false}
+                  translate="no"
                   value={keyDraft}
                   placeholder={llm.has_key ? "••••••••" : "sk-…"}
                   onChange={(e) => setKeyDraft(e.target.value)}
@@ -957,6 +1030,7 @@ export default function Settings({
         >
           <select
             className="select no-drag"
+            name="context-enabled"
             value={status.context_enabled ? "on" : "off"}
             onChange={(e) => {
               const enabled = e.target.value === "on";
@@ -1015,6 +1089,7 @@ export default function Settings({
           <label className="local-only-control">
             <input
               type="checkbox"
+              name="history-enabled"
               checked={status.history_enabled}
               onChange={(event) =>
                 invoke("set_history_enabled", { enabled: event.target.checked })
@@ -1041,6 +1116,9 @@ export default function Settings({
                 className="select no-drag"
                 aria-label={`誤認詞 ${i + 1}`}
                 style={{ minWidth: 140 }}
+                name={`dictionary-from-${i + 1}`}
+                autoComplete="off"
+                spellCheck={false}
                 value={e.from}
                 onChange={(ev) => {
                   const next = [...(dict ?? [])];
@@ -1053,6 +1131,9 @@ export default function Settings({
                 className="select no-drag"
                 aria-label={`正確詞 ${i + 1}`}
                 style={{ minWidth: 140 }}
+                name={`dictionary-to-${i + 1}`}
+                autoComplete="off"
+                spellCheck={false}
                 value={e.to}
                 onChange={(ev) => {
                   const next = [...(dict ?? [])];
@@ -1076,7 +1157,10 @@ export default function Settings({
               className="select no-drag"
               aria-label="新增誤認詞"
               style={{ minWidth: 140 }}
-              placeholder="常被聽錯的詞（如 克拉洛）"
+              name="dictionary-new-from"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="常被聽錯的詞（如 克拉洛）…"
               value={dictDraft.from}
               onChange={(e) => setDictDraft({ ...dictDraft, from: e.target.value })}
             />
@@ -1085,7 +1169,10 @@ export default function Settings({
               className="select no-drag"
               aria-label="新增正確詞"
               style={{ minWidth: 140 }}
-              placeholder="你的正確寫法（如 Claro）"
+              name="dictionary-new-to"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="你的正確寫法（如 Claro）…"
               value={dictDraft.to}
               onChange={(e) => setDictDraft({ ...dictDraft, to: e.target.value })}
             />
@@ -1136,7 +1223,10 @@ export default function Settings({
       </Section>
 
       <Section title="關於">
-        <Row label="Claro" sub="語音辨識在本機完成；只有你明確允許的雲端整理端點會收到轉錄文字與已啟用的畫面上下文。">
+        <Row
+          label="Claro"
+          sub="語音辨識固定在本機；你明確允許的雲端整理端點只會收到轉錄文字，且只有條理整理搭配已開啟的畫面上下文時才會收到 bounded Context。"
+        >
           <span className="text-[12.5px]" style={{ color: "var(--faint)" }}>
             v0.1.0
           </span>

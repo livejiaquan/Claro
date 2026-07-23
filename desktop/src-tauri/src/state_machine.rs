@@ -134,7 +134,10 @@ mod tests {
     fn long_hold_release_stops_and_processes() {
         let mut sm = make();
         sm.hotkey_down(10.0);
-        assert_eq!(sm.hotkey_up(10.0 + TAP_THRESHOLD_S + 0.1), SmAction::StopAndProcess);
+        assert_eq!(
+            sm.hotkey_up(10.0 + TAP_THRESHOLD_S + 0.1),
+            SmAction::StopAndProcess
+        );
         assert_eq!(sm.state(), State::Processing);
     }
 

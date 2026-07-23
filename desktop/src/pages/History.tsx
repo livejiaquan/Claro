@@ -84,6 +84,9 @@ function historyMetadata(entry: HistoryEntry) {
   const fallbackReason = entry.polish?.fallback_reason ?? entry.fallback_reason;
   const sttMs = entry.timings?.stt_ms ?? entry.timings?.stt;
   const polishMs = entry.timings?.polish_ms ?? entry.timings?.polish;
+  const releaseToPasteMs = entry.timings?.release_to_paste_ms;
+  const focusGuardMs = entry.timings?.focus_guard_ms;
+  const injectMs = entry.timings?.inject_ms;
   const sttModel = entry.timings?.stt_model;
   const promptTermCount = entry.timings?.prompt_term_count;
   const contextTermCount = entry.timings?.context_term_count;
@@ -96,6 +99,9 @@ function historyMetadata(entry: HistoryEntry) {
     fallbackReason,
     sttMs,
     polishMs,
+    releaseToPasteMs,
+    focusGuardMs,
+    injectMs,
     sttModel,
     promptTermCount,
     contextTermCount,
@@ -359,8 +365,11 @@ export default function History({
                     <div>
                       <dt>耗時</dt>
                       <dd>
-                        語音辨識 {formatDuration(meta.sttMs) ?? "未記錄"}
+                        放開到貼上 {formatDuration(meta.releaseToPasteMs) ?? "未記錄"}
+                        ・語音辨識 {formatDuration(meta.sttMs) ?? "未記錄"}
                         {meta.polishMs !== null && meta.polishMs !== undefined && `・整理 ${formatDuration(meta.polishMs)}`}
+                        {meta.focusGuardMs !== undefined && `・焦點驗證 ${formatDuration(meta.focusGuardMs)}`}
+                        {meta.injectMs !== undefined && `・貼上交易 ${formatDuration(meta.injectMs)}`}
                       </dd>
                     </div>
                     {meta.fallbackReason && (

@@ -7,6 +7,10 @@
     "build:indicator": "bash scripts/build-indicator.sh",
     "dev": "npm run build:indicator && vite",
     "build": "npm run build:indicator && tsc && vite build",
+    "lint": "eslint src",
+    "test": "vitest run && node --test scripts/*.test.mjs",
+    "test:watch": "vitest",
+    "perf:summary": "node scripts/summarize-performance.mjs",
     "qa:prepare": "npm run build && node scripts/prepare-ui-qa.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
@@ -23,12 +27,21 @@
     "tailwindcss": "^4.3.2"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@tauri-apps/cli": "^2",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "eslint": "^10.7.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.3",
+    "globals": "^17.7.0",
     "happy-dom": "^20.10.6",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "typescript-eslint": "^8.65.0",
+    "vite": "^7.0.4",
+    "vitest": "^4.1.10"
   }
 }

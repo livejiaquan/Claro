@@ -399,7 +399,7 @@ fn available_space_near(path: &Path) -> Option<u64> {
         return None;
     }
     let stats = unsafe { stats.assume_init() };
-    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize))
 }
 
 #[cfg(not(unix))]
@@ -488,7 +488,10 @@ pub fn download(
             tracing::warn!("stale .partial larger than remote artifact — restarting download");
             fs::remove_file(&partial).ok();
             resume_from = 0;
-            agent.get(url).call().context("model download restart after 416")?
+            agent
+                .get(url)
+                .call()
+                .context("model download restart after 416")?
         }
         Err(e) => return Err(e).context("model download request"),
     };
@@ -736,7 +739,14 @@ mod tests {
         let dest = dir.join("model.bin");
         fs::write(&dest, b"already verified").unwrap();
         let expected = digest(b"already verified");
-        download("not a URL", &dest, &expected, &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
+        download(
+            "not a URL",
+            &dest,
+            &expected,
+            &std::sync::atomic::AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"already verified");
         fs::remove_dir_all(dir).unwrap();
     }
@@ -871,7 +881,14 @@ mod tests {
             body.len(),
             String::from_utf8_lossy(body)
         ));
-        download(&url, &dest, &digest(body), &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
+        download(
+            &url,
+            &dest,
+            &digest(body),
+            &std::sync::atomic::AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(fs::read(&dest).unwrap(), body);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -885,7 +902,14 @@ mod tests {
             "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/6\r\nContent-Length: 3\r\nConnection: close\r\n\r\ndef"
                 .to_string(),
         );
-        download(&url, &dest, &digest(b"abcdef"), &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
+        download(
+            &url,
+            &dest,
+            &digest(b"abcdef"),
+            &std::sync::atomic::AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"abcdef");
         fs::remove_dir_all(dir).unwrap();
     }
@@ -899,9 +923,11 @@ mod tests {
         let dir = tempdir();
         let dest = dir.join("model.bin");
         let body = vec![b'x'; 3 * 1024 * 1024];
-        let mut response =
-            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
-                .into_bytes();
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
         response.extend_from_slice(&body);
         let url = serve_once_bytes(response);
 
@@ -936,7 +962,14 @@ mod tests {
             "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-5/6\r\nContent-Length: 2\r\nConnection: close\r\n\r\nef"
                 .to_string(),
         );
-        let error = download(&url, &dest, &digest(b"abcdef"), &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap_err();
+        let error = download(
+            &url,
+            &dest,
+            &digest(b"abcdef"),
+            &std::sync::atomic::AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("resume offset mismatch"));
         assert_eq!(fs::read(&partial).unwrap(), b"abc");
         fs::remove_dir_all(dir).unwrap();
@@ -952,7 +985,14 @@ mod tests {
             "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nConnection: close\r\n\r\ndef"
                 .to_string(),
         );
-        let error = download(&url, &dest, &digest(b"abcdef"), &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap_err();
+        let error = download(
+            &url,
+            &dest,
+            &digest(b"abcdef"),
+            &std::sync::atomic::AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("missing Content-Range"));
         assert_eq!(fs::read(&partial).unwrap(), b"abc");
         fs::remove_dir_all(dir).unwrap();
@@ -980,7 +1020,14 @@ mod tests {
         let bytes = b"completed before rename";
         fs::write(&partial, bytes).unwrap();
 
-        download("not a URL", &dest, &digest(bytes), &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
+        download(
+            "not a URL",
+            &dest,
+            &digest(bytes),
+            &std::sync::atomic::AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
 
         assert!(!partial.exists());
         assert_eq!(fs::read(&dest).unwrap(), bytes);

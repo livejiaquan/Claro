@@ -2,8 +2,9 @@
 
 **macOS 全本地語音輸入。按住快捷鍵說話，放開，文字直接出現在游標位置。**
 
-語音、螢幕內容、輸出的文字——全部在你的機器上處理。沒有帳號、沒有訂閱、
-預設不發出任何網路請求。針對「繁體中文為主、夾雜英文技術術語」的說話方式最佳化。
+預設情況下，語音、螢幕內容與輸出文字都在你的機器上處理。沒有帳號、沒有訂閱。
+只有你主動設定並允許自帶的雲端整理端點時，轉錄文字才可能離開機器；音訊不會上傳。
+針對「繁體中文為主、夾雜英文技術術語」的說話方式最佳化。
 
 > 開發進行中（pre-release）。可從原始碼建置使用；簽章安裝檔在 roadmap 上（M6）。
 
@@ -19,22 +20,22 @@
 
 ### 四個支柱
 
-1. **本地優先隱私**——STT 與潤飾都在本機跑（Metal 加速）。潤飾預設關閉；
-   就算開，預設選項（Apple Intelligence／內建模型）也完全離線。
+1. **本地優先隱私**——STT 固定在本機跑（Metal 加速）；首次設定只推薦
+   Apple Intelligence／Claro 內建模型／原樣轉錄，本機限制預設開啟。
    密碼欄永不讀取；上下文永不落盤；設定檔 0600；API key 進 Keychain。
 2. **真上下文感知**——聽寫時讀取目前視窗的內容（app、標題、游標周邊文字），
    把畫面上出現過的術語在**辨識階段**就餵給模型。你在看 PyTorch 文件時說
    「派托奇」，出來的就是 PyTorch。
 3. **模型可插拔**——辨識模型 6 種 whisper 變體 UI 內下載切換；潤飾引擎五選一：
    Apple Intelligence（macOS 26+，免安裝）、內建模型（llama.cpp，免安裝）、
-   Ollama、LM Studio、自訂 OpenAI-compatible API（OpenAI/Anthropic/Groq/
-   DeepSeek/Gemini/OpenRouter preset）。
+   Ollama、LM Studio、自訂 OpenAI-compatible API（OpenAI/Groq/DeepSeek/
+   Gemini/OpenRouter preset）。
 4. **CJK 極致**——繁體中文（台灣用語）終盤 OpenCC 正規化、全形標點修正、
    中英混排處理、個人字典（常錯的詞教一次就好）。
 
 ## 安裝（從原始碼）
 
-需求：macOS 14+、Apple Silicon、Rust stable、Node 18+、`brew install cmake`。
+需求：macOS 11+、Intel 或 Apple Silicon、Rust stable、Node 22+、`brew install cmake`。
 
 ```bash
 git clone https://github.com/livejiaquan/Claro && cd Claro/desktop
@@ -46,9 +47,11 @@ npm run tauri build
 
 首次啟動：
 
-1. 授予**輔助使用**權限（系統會提示；授權後 app 自動啟用，不用重啟）。
-2. 到 設定 → 語音模型 下載一個模型（推薦 Large v3 Turbo，1.5GB）。
-3. 第一次聽寫時允許**麥克風**。
+1. 在「首次設定」授予**輔助使用**權限（授權後會自動重新檢查，不用重啟）。
+2. 執行一次不辨識內容的**麥克風音量測試**。
+3. 明確按下下載這台 Mac 的推薦語音模型；Claro 不會自動下載。
+4. 選擇 Apple 端上整理、Claro 內建整理，或原樣轉錄。
+5. 到任一文字輸入框完成一次真正的聽寫與貼上。
 
 就這兩個權限，不多要。
 
@@ -70,8 +73,9 @@ npm run tauri build
 
 - **T0（預設）**：語音、文字、螢幕上下文全部不出機器。潤飾用 Apple 端上模型
   或內建模型時也是 T0。
-- **T1（自選）**：你自己設定雲端潤飾端點時，「轉錄文字＋螢幕上下文」會送到
-  **你指定的**端點。UI 會明確標示。
+- **T1（自選）**：你自己設定並允許雲端潤飾端點時，轉錄文字會送到
+  **你指定的**端點；只有 ORGANIZE 且畫面上下文已開啟時，bounded Context
+  才會一併送出。UI 會明確標示實際目的地。
 - 音訊永不落盤；上下文只在記憶體（設定頁可查看上次擷取了什麼、一鍵清除）；
   歷史紀錄存本地 `~/.claro/history.jsonl`（0600，可清）。
 - 剪貼簿以完整 NSPasteboard 項目／格式備份還原（圖片、富文本都保留），

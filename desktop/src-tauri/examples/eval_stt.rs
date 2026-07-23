@@ -446,7 +446,7 @@ fn read_production_audio(path: &Path) -> Result<WavAudio> {
             .collect::<std::result::Result<_, _>>()?,
     };
 
-    if interleaved.len() % spec.channels as usize != 0 {
+    if !interleaved.len().is_multiple_of(spec.channels as usize) {
         bail!(
             "WAV sample 數 {} 無法整除 channels {}",
             interleaved.len(),

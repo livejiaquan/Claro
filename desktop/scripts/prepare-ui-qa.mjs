@@ -14,6 +14,7 @@ const bridge = String.raw`
 (() => {
   const scenario = new URLSearchParams(location.search).get("scenario") || "new-8gb";
   const failDownloads = scenario === "download-error";
+  const downloadTerminalDelay = failDownloads ? 1200 : 30000;
   const micTimesOut = scenario === "mic-timeout";
   let nextCallback = 1;
   let nextEvent = 1;
@@ -130,8 +131,8 @@ const bridge = String.raw`
       text: "App: Slack\nWindow: Claro product\nEditing(around cursor): 明天不上線，原因是測試尚未完成\nVisible: PyTorch | release candidate",
     };
     state.history = [
-      { ts: "2026-07-12T09:42:00+08:00", duration_s: 8.4, raw: "先說結論明天不上線原因是測試尚未完成", text: "原因是測試尚未完成。先說結論，明天不上線。", status: "pasted", timings: { stt_ms: 680, polish_ms: 2200 }, polish: { mode: "organize", provider: "builtin", changed: true, outcome: "changed" } },
-      { ts: "2026-07-12T09:35:00+08:00", duration_s: 3.1, raw: "用 PyTorch 跑 training", text: "用 PyTorch 跑 training。", status: "pasted", timings: { stt_ms: 710, polish_ms: 900 }, polish: { mode: "clean", provider: "builtin", changed: true, outcome: "changed" } },
+      { ts: "2026-07-12T09:42:00+08:00", duration_s: 8.4, raw: "先說結論明天不上線原因是測試尚未完成", text: "原因是測試尚未完成。先說結論，明天不上線。", status: "pasted", timings: { release_to_paste_ms: 3260, stt_ms: 680, polish_ms: 2200, focus_guard_ms: 18, inject_ms: 360 }, polish: { mode: "organize", provider: "builtin", changed: true, outcome: "changed" } },
+      { ts: "2026-07-12T09:35:00+08:00", duration_s: 3.1, raw: "用 PyTorch 跑 training", text: "用 PyTorch 跑 training。", status: "pasted", timings: { release_to_paste_ms: 2080, stt_ms: 710, polish_ms: 900, focus_guard_ms: 16, inject_ms: 358 }, polish: { mode: "clean", provider: "builtin", changed: true, outcome: "changed" } },
     ];
   }
 
@@ -245,12 +246,25 @@ const bridge = String.raw`
         }
         return null;
       case "download_model": {
-        if (activeDownload) throw new Error("已有 " + activeDownload + " 模型正在下載");
+        if (activeDownload) throw new Error("已有模型正在下載");
         const model = state.models.find((item) => item.id === args.id);
         if (!model?.available) throw new Error("此模型仍在驗證中，尚未開放下載");
-        activeDownload = "STT";
-        setTimeout(() => emit("model-download", { model_id: args.id, downloaded_mb: 128, total_mb: model.size_mb, done: false, downloaded: false, activation_status: "none", error: null }), 20);
+        const session = {
+          kind: "stt",
+          id: args.id,
+          downloadedMb: 0,
+          totalMb: model.size_mb,
+        };
+        activeDownload = session;
+        model.downloading = true;
         setTimeout(() => {
+          if (activeDownload !== session) return;
+          session.downloadedMb = 128;
+          emit("model-download", { model_id: args.id, downloaded_mb: session.downloadedMb, total_mb: model.size_mb, done: false, downloaded: false, activation_status: "none", error: null });
+        }, 80);
+        setTimeout(() => {
+          if (activeDownload !== session) return;
+          model.downloading = false;
           if (failDownloads) {
             activeDownload = null;
             emit("model-download", { model_id: args.id, downloaded_mb: 128, total_mb: model.size_mb, done: false, downloaded: false, activation_status: "none", error: "網路連線中斷" });
@@ -266,7 +280,7 @@ const bridge = String.raw`
           activeDownload = null;
           state.status.model_present = model.active;
           emit("model-download", { model_id: args.id, downloaded_mb: model.size_mb, total_mb: model.size_mb, done: true, downloaded: true, activation_status: "none", error: null });
-        }, 120);
+        }, downloadTerminalDelay);
         return null;
       }
       case "delete_model": {
@@ -305,24 +319,60 @@ const bridge = String.raw`
         syncLlm();
         return structuredClone(state.llm);
       case "download_builtin_llm":
-        if (activeDownload) throw new Error("已有 " + activeDownload + " 模型正在下載");
-        activeDownload = "LLM";
-        setTimeout(() => emit("llm-model-download", { model_id: args.id, downloaded_mb: 256, total_mb: 2382, done: false, downloaded: false, activation_status: "none", error: null }), 20);
+        if (activeDownload) throw new Error("已有模型正在下載");
+        {
+        const model = state.builtin.find((item) => item.id === args.id);
+        if (!model) throw new Error("找不到內建整理模型");
+        const session = {
+          kind: "llm",
+          id: args.id,
+          downloadedMb: 0,
+          totalMb: model.size_mb,
+        };
+        activeDownload = session;
+        model.downloading = true;
         setTimeout(() => {
+          if (activeDownload !== session) return;
+          session.downloadedMb = 256;
+          emit("llm-model-download", { model_id: args.id, downloaded_mb: session.downloadedMb, total_mb: session.totalMb, done: false, downloaded: false, activation_status: "none", error: null });
+        }, 80);
+        setTimeout(() => {
+          if (activeDownload !== session) return;
+          model.downloading = false;
           if (failDownloads) {
             activeDownload = null;
-            emit("llm-model-download", { model_id: args.id, downloaded_mb: 256, total_mb: 2382, done: false, downloaded: false, activation_status: "none", error: "網路連線中斷" });
+            emit("llm-model-download", { model_id: args.id, downloaded_mb: session.downloadedMb, total_mb: session.totalMb, done: false, downloaded: false, activation_status: "none", error: "網路連線中斷" });
             return;
           }
-          state.builtin[0].downloaded = true;
+          model.downloaded = true;
           activeDownload = null;
-          state.builtin[0].active = true;
+          model.active = true;
           state.llm.blocked_reason = null;
           state.llm.effective_mode = state.llm.polish_mode;
           syncLlm();
-          emit("llm-model-download", { model_id: args.id, downloaded_mb: 2382, total_mb: 2382, done: true, downloaded: true, activation_status: "none", error: null });
-        }, 120);
+          emit("llm-model-download", { model_id: args.id, downloaded_mb: session.totalMb, total_mb: session.totalMb, done: true, downloaded: true, activation_status: "none", error: null });
+        }, downloadTerminalDelay);
         return null;
+        }
+      case "cancel_download": {
+        const session = activeDownload;
+        if (!session) return null;
+        activeDownload = null;
+        const model = session.kind === "stt"
+          ? state.models.find((item) => item.id === session.id)
+          : state.builtin.find((item) => item.id === session.id);
+        if (model) model.downloading = false;
+        emit(session.kind === "stt" ? "model-download" : "llm-model-download", {
+          model_id: session.id,
+          downloaded_mb: session.downloadedMb,
+          total_mb: session.totalMb,
+          done: false,
+          downloaded: false,
+          activation_status: "none",
+          error: "下載已取消",
+        });
+        return null;
+      }
       case "set_local_only":
         if (!args.enabled && !args.confirmed) throw new Error("關閉僅限本機需要明確同意");
         state.llm.local_only = args.enabled;

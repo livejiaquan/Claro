@@ -131,7 +131,7 @@ mod tests {
             NewEntry {
                 raw: "原始",
                 text: "整理後",
-                duration_s: 3.14,
+                duration_s: 3.12,
                 status: "pasted",
                 timings: None,
                 polish: None,

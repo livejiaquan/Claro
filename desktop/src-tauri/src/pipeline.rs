@@ -153,6 +153,7 @@ impl std::fmt::Display for ModelSwapError {
 impl std::error::Error for ModelSwapError {}
 
 impl Core {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine: Box<dyn SttEngine>,
         active_model: &'static ModelSpec,
@@ -466,7 +467,9 @@ fn start_recording(core: &Arc<Core>) {
                     if !current {
                         break;
                     }
-                    overlay_core.overlay.send(&format!("level {:.4}", level.get()));
+                    overlay_core
+                        .overlay
+                        .send(&format!("level {:.4}", level.get()));
                     if !force_sent && started.elapsed().as_secs_f64() > audio::MAX_RECORDING_S {
                         let _ = msg_tx.send(Msg::ForceStop(session));
                         force_sent = true;
@@ -626,6 +629,9 @@ fn collect_audio(
 }
 
 fn start_processing(core: &Arc<Core>) {
+    // hotkey release 進入 processing 的線性化點。此時計時可涵蓋 post-roll、
+    // Context 收尾、STT、整理、焦點重驗與實際貼上，而不是只量模型函式。
+    let release_started = Instant::now();
     // 每個 session 配發自己的取消旗標（prototype：不洗掉上一段還沒檢查到的取消）
     let cancel = Arc::new(AtomicBool::new(false));
     *core.cancel.lock().unwrap() = cancel.clone();
@@ -634,7 +640,7 @@ fn start_processing(core: &Arc<Core>) {
     let core = core.clone();
 
     std::thread::spawn(move || {
-        process_session(&core, session, &cancel, capture);
+        process_session(&core, session, &cancel, capture, release_started);
         core.sm.lock().unwrap().processing_finished(session);
         core.sync_esc();
     });
@@ -688,6 +694,7 @@ fn process_session(
     session: u64,
     cancel: &AtomicBool,
     capture: Option<CaptureHandle>,
+    release_started: Instant,
 ) {
     let Some(captured_audio) = collect_audio(core, capture, false, session, Some(cancel)) else {
         return;
@@ -846,7 +853,7 @@ fn process_session(
 
     // 只記錄除錯所需的模型／解碼 profile 與聚合音量，不保存 Context 詞彙內容。
     // 讓未來的準確率回報能分辨「哪個模型」與「是否有詞彙偏置」，不再盲猜。
-    let timings = Some(json!({
+    let mut timings = json!({
         "stt_ms": stt_ms,
         "polish_ms": polish_ms,
         "stt_model": stt_model,
@@ -856,7 +863,7 @@ fn process_session(
         "context_term_count": terms.len(),
         "audio_input_rms": (input_rms * 10_000.0).round() / 10_000.0,
         "audio_clipped_ratio": (clipped_ratio * 10_000.0).round() / 10_000.0,
-    }));
+    });
 
     if !async_feedback_allowed(core, session, cancel) {
         let _ = history::append_entry(
@@ -865,7 +872,7 @@ fn process_session(
                 text: &text,
                 duration_s: dur,
                 status: "cancelled",
-                timings,
+                timings: Some(timings),
                 polish: Some(polish_metadata),
             },
             &history::history_path(),
@@ -873,6 +880,7 @@ fn process_session(
         return;
     }
 
+    let focus_guard_started = Instant::now();
     let current_target = crate::context::capture_paste_target();
     // Esc 或新 session 可能在 bounded AX 驗證期間發生；貼上前必須再檢查一次。
     if !async_feedback_allowed(core, session, cancel) {
@@ -882,7 +890,7 @@ fn process_session(
                 text: &text,
                 duration_s: dur,
                 status: "cancelled",
-                timings,
+                timings: Some(timings),
                 polish: Some(polish_metadata),
             },
             &history::history_path(),
@@ -899,7 +907,7 @@ fn process_session(
                 text: &text,
                 duration_s: dur,
                 status: "focus_changed",
-                timings,
+                timings: Some(timings),
                 polish: Some(polish_metadata),
             },
             &history::history_path(),
@@ -917,6 +925,7 @@ fn process_session(
         return;
     }
 
+    let focus_guard_ms = focus_guard_started.elapsed().as_millis();
     let pre_paste_commit = |paste: &dyn Fn() -> anyhow::Result<()>| -> anyhow::Result<()> {
         let current = crate::context::capture_paste_target();
         if !paste_target_matches(target_app_id.as_ref(), current.as_ref()) {
@@ -926,7 +935,11 @@ fn process_session(
         // 之前先讓本次失敗，或在本次貼上完成後才生效，不能插入兩者之間。
         commit_paste_for_session(&core.sm, cancel, session, paste)
     };
-    if let Err(e) = core.injector.inject(&text, &pre_paste_commit) {
+    let inject_started = Instant::now();
+    let inject_result = core.injector.inject(&text, &pre_paste_commit);
+    timings["focus_guard_ms"] = json!(focus_guard_ms.min(u64::MAX as u128) as u64);
+    timings["inject_ms"] = json!(inject_started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+    if let Err(e) = inject_result {
         tracing::error!("paste failed: {e}");
         if !async_feedback_allowed(core, session, cancel) {
             let _ = history::append_entry(
@@ -935,7 +948,7 @@ fn process_session(
                     text: &text,
                     duration_s: dur,
                     status: "cancelled",
-                    timings,
+                    timings: Some(timings),
                     polish: Some(polish_metadata),
                 },
                 &history::history_path(),
@@ -949,7 +962,7 @@ fn process_session(
                 text: &text,
                 duration_s: dur,
                 status: "paste_failed",
-                timings,
+                timings: Some(timings),
                 polish: Some(polish_metadata),
             },
             &history::history_path(),
@@ -966,13 +979,15 @@ fn process_session(
     }
     send_overlay_for_session(core, session, cancel, "success");
     record_success(&core.successful_pastes);
+    timings["release_to_paste_ms"] =
+        json!(release_started.elapsed().as_millis().min(u64::MAX as u128) as u64);
     let _ = history::append_entry(
         NewEntry {
             raw: &raw,
             text: &text,
             duration_s: dur,
             status: "pasted",
-            timings,
+            timings: Some(timings),
             polish: Some(polish_metadata),
         },
         &history::history_path(),

@@ -34,6 +34,35 @@ body {
   overflow: hidden;
 }
 
+h1,
+h2 {
+  text-wrap: balance;
+}
+
+.skip-link {
+  position: fixed;
+  top: 8px;
+  left: 12px;
+  z-index: 100;
+  padding: 7px 12px;
+  border-radius: 8px;
+  background: var(--text);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  transform: translateY(-160%);
+}
+.skip-link:focus-visible {
+  transform: translateY(0);
+}
+.app-main {
+  overscroll-behavior: contain;
+}
+.app-main:focus-visible {
+  outline: 3px solid rgba(52, 120, 246, 0.28);
+  outline-offset: -3px;
+}
+
 .titlebar-drag {
   -webkit-app-region: drag;
 }
@@ -220,7 +249,7 @@ input {
 .select:hover {
   border-color: rgba(0, 0, 0, 0.18);
 }
-.select:focus {
+.select:focus-visible {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
@@ -1060,6 +1089,7 @@ input {
   border-radius: 999px;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
   animation: toast-in 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+  pointer-events: none;
   z-index: 50;
 }
 @keyframes toast-in {

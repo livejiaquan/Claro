@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -30,17 +30,22 @@ export default function App() {
   const micGeneration = useRef(0);
   const [toast, setToast] = useState<string | null>(null);
   const micRef = useRef(false);
-  micRef.current = mic.active;
   const toastTimer = useRef<number | undefined>(undefined);
   const initialRouteApplied = useRef(false);
 
-  const refresh = () =>
+  const refresh = useCallback(() =>
     invoke<Status>("get_status")
       .then((next) => {
         setStatus(next);
         setStatusError(null);
       })
-      .catch((reason) => setStatusError(String(reason)));
+      .catch((reason) => setStatusError(String(reason))), []);
+
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 1800);
+  }, []);
 
   useEffect(() => {
     if (
@@ -73,7 +78,11 @@ export default function App() {
       } else if (e.payload.activation_status === "retry_required") {
         showToast("模型已下載，但切換失敗；請到設定重試使用");
       } else if (e.payload.error) {
-        showToast(`下載失敗：${e.payload.error}`);
+        showToast(
+          e.payload.error.includes("下載已取消")
+            ? "已取消下載；已完成的部分保留，下次會續傳"
+            : `下載失敗：${e.payload.error}`,
+        );
       } else if (e.payload.done) {
         showToast("模型下載完成");
       }
@@ -82,6 +91,7 @@ export default function App() {
     const un2 = listen<MicLevel>("mic-level", (e) => {
       if (e.payload.generation < micGeneration.current) return;
       micGeneration.current = e.payload.generation;
+      micRef.current = e.payload.active;
       setMic(e.payload);
     });
     const un3 = listen<DownloadProgress>("llm-model-download", (e) => {
@@ -103,8 +113,7 @@ export default function App() {
       un3.then((f) => f());
       if (micRef.current) invoke("mic_test_stop").catch(() => {});
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [refresh, showToast]);
 
   // 第一次開啟尚未完成設定時，直接帶使用者進入引導；之後仍可自由切換頁面。
   useEffect(() => {
@@ -135,12 +144,6 @@ export default function App() {
     return () => document.removeEventListener("mousedown", onMouseDown);
   }, []);
 
-  const showToast = (msg: string) => {
-    setToast(msg);
-    window.clearTimeout(toastTimer.current);
-    toastTimer.current = window.setTimeout(() => setToast(null), 1800);
-  };
-
   const ready = Boolean(
     status &&
     status.model_present &&
@@ -152,6 +155,9 @@ export default function App() {
 
   return (
     <div className="app-shell flex h-screen">
+      <a className="skip-link no-drag" href="#main-content">
+        跳至主要內容
+      </a>
       {/* 側欄 */}
       {/* data-tauri-drag-region：Tauri 的拖曳靠這個屬性（-webkit-app-region 是 Electron 的，無效） */}
       <aside
@@ -217,7 +223,7 @@ export default function App() {
       </aside>
 
       {/* 內容 */}
-      <main className="app-main flex-1 overflow-y-auto" id="main-content">
+      <main className="app-main flex-1 overflow-y-auto" id="main-content" tabIndex={-1}>
         <div data-tauri-drag-region className="titlebar-drag h-9 sticky top-0 z-10" />
         <div className="px-9 pb-10 max-w-[880px]">
           {!status && statusError ? (
@@ -255,6 +261,9 @@ export default function App() {
               mic={mic}
               progress={progress}
               llmProgress={llmProgress}
+              onDownloadStart={(kind) =>
+                kind === "stt" ? setProgress(null) : setLlmProgress(null)
+              }
               refresh={refresh}
               onToast={showToast}
               onDone={() => {
@@ -276,6 +285,9 @@ export default function App() {
               mic={mic}
               progress={progress}
               llmProgress={llmProgress}
+              onDownloadStart={(kind) =>
+                kind === "stt" ? setProgress(null) : setLlmProgress(null)
+              }
               refresh={refresh}
               onToast={showToast}
               onOpenSetup={() => setPage("setup")}

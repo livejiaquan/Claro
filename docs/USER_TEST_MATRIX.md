@@ -1,6 +1,6 @@
 # Claro 使用者旅程與極端情境測試矩陣
 
-日期：2026-07-15。下表的 `Automated` 與 `Native` 是**驗證方法／目標，不是已通過狀態**；實際完成狀態以 `ROADMAP.md` 進度與驗收紀錄為準。`Automated` 表示 repo 內可重跑，`Native` 表示必須在 Developer ID 簽章 `.app` 與真實 Mac/App/IME 上驗證。模擬回饋是以流程與程式碼推演，不冒充真人訪談。Accuracy Pass 已用本機 ad-hoc 簽章的 release bundle 實際檢查 Home／Onboarding／Settings／History 與 sidecar，沒有白屏、截字或阻斷 log；沒有出聲、沒有觸發熱鍵，因此不能替代真實麥克風、貼上與正式發行簽章驗收。
+日期：2026-07-23。下表的 `Automated` 與 `Native` 是**驗證方法／目標，不是已通過狀態**；實際完成狀態以 `ROADMAP.md` 進度與驗收紀錄為準。`Automated` 表示 repo 內可重跑，`Native` 表示必須在 Developer ID 簽章 `.app` 與真實 Mac/App/IME 上驗證。模擬回饋是以流程與程式碼推演，不冒充真人訪談。UI QA 已實際檢查 920×640 與最小 780×560 的 Home／Onboarding／Settings／History、下載取消／錯誤／續傳、鍵盤 skip link 與 console；沒有出聲、下載模型或觸發全域熱鍵，因此不能替代真實麥克風、貼上與正式發行簽章驗收。
 
 ## 使用者角色
 
@@ -30,10 +30,10 @@
 | 7b | 同 App 視窗／欄位切換 | full-fingerprint Context regression＋同批 AX refs static | 同 App 兩視窗／兩欄位 | metadata hash 不同時不自動貼上；ContextSnapshot fingerprint 與 keyDown 目標一致；真實 App 的 AX metadata 可辨識率仍待矩陣 |
 | 8 | 密碼管理器與 secure field | denylist tests | Passwords/1Password | 零 Context 內容；仍可純聽寫 |
 | 9 | 空白、太短、STT/paste 失敗 | History UI QA | fault injection | History 顯示錯誤與恢復資訊，不再把空文字紀錄隱藏 |
-| 10 | 下載中斷與磁碟不足 | downloader tests/UI QA | throttled network/full disk | request 前預檢；重試續傳；hash 不符不載入 |
+| 10 | 下載準備、取消、中斷與磁碟不足 | downloader/session ordering tests＋Vitest＋UI QA | throttled network/full disk | 等推論鎖時可取消；終態先清 gate/downloading 再送事件；準備／下載／取消中／已取消／失敗／完成可辨；重試續傳；hash 不符不載入 |
 | 11 | 富文字/圖片/檔案剪貼簿 | NSPasteboard tests | Office/Finder | 完整還原；使用者中途 Copy 不被覆蓋 |
 | 12 | Esc 取消 | state/llama cancel＋pre-Cmd+V guard tests | Apple/Builtin/HTTP | overlay 立即取消；builtin 檢查 cancel、6 秒 generation／8 秒 total 邏輯預算；HTTP/Apple 最遲 5 秒返回；50ms clipboard settle 後仍重驗 session／focus |
-| 13 | 隱藏視窗待機 | build/static | Instruments 10 min | hidden 時停止 2 秒 polling；模型卸載後 RSS <300 MB |
+| 13 | 隱藏視窗待機與端到端延遲 | history timing＋privacy-safe summary test | Instruments 10 min | hidden 時停止 2 秒 polling；`release_to_paste` p50/p95 可重跑且摘要不輸出內容；模型卸載後 RSS <300 MB |
 | 14 | 注音/拼音/日文 IME | 尚缺 | 三種 IME | 貼上成功、輸入源正確還原、無重複字 |
 | 15 | 快速連續兩段／上一段晚到 | state stale-session＋session-slot＋stale-watchdog regressions | TextEdit／Slack | 舊 session 不得取走、覆蓋或貼出新 session 的 target/context/result |
 | 16 | 5 分鐘 force-stop | state-machine＋stale-watchdog generation test；300 秒 wall test 尚缺 | 長錄音 | 到上限後只送一次 force-stop、只處理一次、狀態回 IDLE、overlay 不殘留 |

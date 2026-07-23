@@ -31,8 +31,18 @@ jobs:
       - name: Require a version-matching tag
         run: |
           test "$GITHUB_REF_TYPE" = "tag"
-          VERSION="$(node -p "require('./desktop/src-tauri/tauri.conf.json').version")"
-          test "$GITHUB_REF_NAME" = "v$VERSION"
+          TAURI_VERSION="$(node -p "require('./desktop/src-tauri/tauri.conf.json').version")"
+          PACKAGE_VERSION="$(node -p "require('./desktop/package.json').version")"
+          CARGO_VERSION="$(awk -F '\"' '/^version = \"/ { print $2; exit }' desktop/src-tauri/Cargo.toml)"
+          test "$TAURI_VERSION" = "$PACKAGE_VERSION" || {
+            echo "tauri.conf.json ($TAURI_VERSION) != package.json ($PACKAGE_VERSION)" >&2
+            exit 1
+          }
+          test "$TAURI_VERSION" = "$CARGO_VERSION" || {
+            echo "tauri.conf.json ($TAURI_VERSION) != Cargo.toml ($CARGO_VERSION)" >&2
+            exit 1
+          }
+          test "$GITHUB_REF_NAME" = "v$TAURI_VERSION"
 
       - name: Require external signing and notarization secrets
         env:
@@ -174,6 +184,36 @@ jobs:
 
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign --verify --strict --verbose=2 "$SIDECAR"
+          require_hardened_runtime() {
+            local binary="$1"
+            codesign -dvv "$binary" 2>&1 | grep -Eq 'flags=.*runtime' || {
+              echo "Hardened runtime is missing from $binary" >&2
+              exit 1
+            }
+          }
+          inspect_entitlements() {
+            local binary="$1"
+            local output="$2"
+            codesign -d --entitlements :- "$binary" > "$output" 2>/dev/null || true
+            if test -s "$output"; then
+              plutil -lint "$output"
+              for key in \
+                com.apple.security.get-task-allow \
+                com.apple.security.cs.disable-library-validation \
+                com.apple.security.cs.allow-jit \
+                com.apple.security.cs.allow-unsigned-executable-memory
+              do
+                if test "$(plutil -extract "$key" raw "$output" 2>/dev/null || true)" = "true"; then
+                  echo "Release binary has forbidden entitlement $key: $binary" >&2
+                  exit 1
+                fi
+              done
+            fi
+          }
+          require_hardened_runtime "$MAIN"
+          require_hardened_runtime "$SIDECAR"
+          inspect_entitlements "$MAIN" "$RUNNER_TEMP/main-entitlements.plist"
+          inspect_entitlements "$SIDECAR" "$RUNNER_TEMP/sidecar-entitlements.plist"
           spctl --assess --type execute --verbose=4 "$APP"
           spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG"
           xcrun stapler validate "$APP"

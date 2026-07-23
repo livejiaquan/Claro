@@ -11,15 +11,13 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+type PrePasteCommit<'a> = dyn Fn(&dyn Fn() -> Result<()>) -> Result<()> + 'a;
+
 pub trait TextInjector: Send + Sync {
     /// `pre_paste_commit` 會在 50ms clipboard settle 後取得真正的 Cmd+V closure。
     /// 呼叫端必須在同一個 session/state lock 內完成最後驗證並執行 closure，
     /// 讓 Esc／新 session 不可能插在「guard=true」與實際貼上之間。
-    fn inject(
-        &self,
-        text: &str,
-        pre_paste_commit: &dyn Fn(&dyn Fn() -> Result<()>) -> Result<()>,
-    ) -> Result<()>;
+    fn inject(&self, text: &str, pre_paste_commit: &PrePasteCommit<'_>) -> Result<()>;
 }
 
 pub struct MacPasteInjector;
@@ -28,11 +26,7 @@ pub struct MacPasteInjector;
 const VK_V: u32 = 9;
 
 impl TextInjector for MacPasteInjector {
-    fn inject(
-        &self,
-        text: &str,
-        pre_paste_commit: &dyn Fn(&dyn Fn() -> Result<()>) -> Result<()>,
-    ) -> Result<()> {
+    fn inject(&self, text: &str, pre_paste_commit: &PrePasteCommit<'_>) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
             objc2::rc::autoreleasepool(|_| inject_macos(text, pre_paste_commit))
@@ -46,10 +40,7 @@ impl TextInjector for MacPasteInjector {
 }
 
 #[cfg(target_os = "macos")]
-fn inject_macos(
-    text: &str,
-    pre_paste_commit: &dyn Fn(&dyn Fn() -> Result<()>) -> Result<()>,
-) -> Result<()> {
+fn inject_macos(text: &str, pre_paste_commit: &PrePasteCommit<'_>) -> Result<()> {
     use objc2_app_kit::NSPasteboard;
 
     // 整個 snapshot→temporary write→Cmd+V→restore 是一筆不可交錯的交易。

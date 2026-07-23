@@ -239,7 +239,10 @@ macOS 使用 `NSPasteboard` 在清空前逐 item、逐 type 完整 materialize �
 | 待機 RSS（模型已卸載） | < 300MB |
 | 冷啟動（不含模型載入） | < 3s |
 
-每段聽寫的分段耗時已寫入 history；Advanced 頁視覺化與可重跑量測腳本仍是 M5 驗收項目。
+每段成功貼上的 history 會記錄 `release_to_paste_ms`、STT、文字整理、焦點驗證與
+貼上交易耗時；`cd desktop && npm run perf:summary` 只輸出樣本數與 p50/p95/max，
+不輸出 transcript 或 Context。正式 `.app` 的 cold/warm corpus、RSS 與
+Advanced 視覺化仍是 M5 驗收項目。
 
 ## 13. 測試策略
 

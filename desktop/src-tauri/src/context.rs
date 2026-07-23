@@ -173,7 +173,7 @@ pub fn context_terms(dict_terms: &[String], context: &str, limit: usize) -> Vec<
     // 畫面詞按「值得偏置的程度」排序再取，否則供給一大就被雜訊詞先佔位。
     // sort_by 是穩定排序，同分者維持原本的畫面出現順序。
     let mut ascii = ascii_tokens(context);
-    ascii.sort_by(|a, b| ascii_term_priority(b).cmp(&ascii_term_priority(a)));
+    ascii.sort_by_key(|term| std::cmp::Reverse(ascii_term_priority(term)));
     let cjk = cjk_tokens(context);
 
     // 畫面詞代表「此刻正在講什麼」，是比靜態字典更即時的訊號；字典一旦超過
@@ -1113,8 +1113,14 @@ mod tests {
         // 尾端是 attention 最高、最後才被截斷的位置。
         let all = context_terms(&[], ctx, 8);
         let pos = |t: &str| all.iter().position(|x| x == t).expect("詞應存在");
-        assert!(pos("the") < pos("Claude"), "常見字必須排在專有名詞之前：{all:?}");
-        assert!(pos("Claude") < pos("exFAT"), "首字大寫應排在內部大小寫之前：{all:?}");
+        assert!(
+            pos("the") < pos("Claude"),
+            "常見字必須排在專有名詞之前：{all:?}"
+        );
+        assert!(
+            pos("Claude") < pos("exFAT"),
+            "首字大寫應排在內部大小寫之前：{all:?}"
+        );
     }
 
     /// 迴歸：字典塞滿額度時，畫面詞曾經一個都進不去。畫面詞是比靜態字典更
@@ -1133,7 +1139,9 @@ mod tests {
             .iter()
             .position(|t| t.starts_with("DictTerm"))
             .expect("字典詞應該入選");
-        assert!(terms[first_dict..].iter().all(|t| t.starts_with("DictTerm")));
+        assert!(terms[first_dict..]
+            .iter()
+            .all(|t| t.starts_with("DictTerm")));
     }
 
     #[test]

@@ -131,7 +131,10 @@ pub fn start(main: Hotkey) -> Result<HotkeyService> {
     });
 
     match ready_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(())) => Ok(HotkeyService { events: event_rx, esc_ctl: ctl_tx }),
+        Ok(Ok(())) => Ok(HotkeyService {
+            events: event_rx,
+            esc_ctl: ctl_tx,
+        }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(anyhow::anyhow!("hotkey thread did not start")),
     }

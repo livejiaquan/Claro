@@ -1,5 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import DownloadStatus from "../components/DownloadStatus";
+import {
+  resolveDownloadState,
+  type DownloadKind,
+} from "../downloadState";
 import {
   resolveLlmConfig,
   type DownloadProgress,
@@ -26,6 +31,7 @@ export default function Onboarding({
   mic,
   progress,
   llmProgress,
+  onDownloadStart,
   refresh,
   onToast,
   onDone,
@@ -34,6 +40,7 @@ export default function Onboarding({
   mic: MicLevel;
   progress: DownloadProgress | null;
   llmProgress: DownloadProgress | null;
+  onDownloadStart: (kind: DownloadKind) => void;
   refresh: () => void;
   onToast: (message: string) => void;
   onDone: () => void;
@@ -49,9 +56,16 @@ export default function Onboarding({
   const [polishLoading, setPolishLoading] = useState(true);
   const [polishError, setPolishError] = useState<string | null>(null);
   const [polishWarning, setPolishWarning] = useState<string | null>(null);
+  const [downloadIntent, setDownloadIntent] = useState<{
+    key: string;
+    phase: "starting" | "cancelling";
+  } | null>(null);
+  const [polishSelectionPending, setPolishSelectionPending] = useState(false);
+  const modelsSyncStarted = useRef(false);
+  const polishSyncStarted = useRef(false);
 
-  const loadModels = useCallback(() => {
-    setModelsLoading(true);
+  const loadModels = useCallback((showLoading = false) => {
+    if (showLoading) setModelsLoading(true);
     setModelsError(null);
     invoke<ModelInfo[]>("list_models")
       .then(setModels)
@@ -60,7 +74,11 @@ export default function Onboarding({
   }, []);
 
   useEffect(
-    () => loadModels(),
+    () => {
+      const showLoading = !modelsSyncStarted.current;
+      modelsSyncStarted.current = true;
+      loadModels(showLoading);
+    },
     [
       loadModels,
       progress?.model_id,
@@ -72,11 +90,11 @@ export default function Onboarding({
     ],
   );
 
-  const loadPolish = useCallback(() => {
-    setPolishLoading(true);
+  const loadPolish = useCallback((showLoading = false) => {
+    if (showLoading) setPolishLoading(true);
     setPolishError(null);
     setPolishWarning(null);
-    Promise.allSettled([
+    return Promise.allSettled([
       invoke<LlmConfig>("get_llm_config"),
       invoke<ModelInfo[]>("list_builtin_llms"),
       invoke<HardwareProfile>("get_hardware_profile"),
@@ -109,7 +127,20 @@ export default function Onboarding({
       .finally(() => setPolishLoading(false));
   }, []);
 
-  useEffect(() => loadPolish(), [loadPolish, llmProgress?.model_id, llmProgress?.done]);
+  useEffect(
+    () => {
+      const showLoading = !polishSyncStarted.current;
+      polishSyncStarted.current = true;
+      void loadPolish(showLoading);
+    },
+    [
+      loadPolish,
+      llmProgress?.model_id,
+      llmProgress?.done,
+      llmProgress?.downloaded,
+      llmProgress?.error,
+    ],
+  );
 
   useEffect(() => {
     if (mic.passed || (mic.active && mic.level > 0.01)) setMicChecked(true);
@@ -131,6 +162,33 @@ export default function Onboarding({
     models.find((model) => model.recommended && model.available) ??
     models.find((model) => model.active && model.available) ??
     models.find((model) => model.available);
+  const intentMatches = (
+    kind: DownloadKind,
+    modelId: string,
+    phase: "starting" | "cancelling",
+  ) => downloadIntent?.key === `${kind}:${modelId}` && downloadIntent.phase === phase;
+  const onboardingSttDownload = onboardingModel
+    ? resolveDownloadState({
+        modelId: onboardingModel.id,
+        downloaded: onboardingModel.downloaded,
+        backendDownloading: onboardingModel.downloading,
+        progress,
+        startRequested: intentMatches("stt", onboardingModel.id, "starting"),
+        cancelRequested: intentMatches("stt", onboardingModel.id, "cancelling"),
+      })
+    : null;
+  const onboardingLlmDownload = recommendedBuiltin
+    ? resolveDownloadState({
+        modelId: recommendedBuiltin.id,
+        downloaded: recommendedBuiltin.downloaded,
+        backendDownloading: recommendedBuiltin.downloading,
+        progress: llmProgress,
+        startRequested: intentMatches("llm", recommendedBuiltin.id, "starting"),
+        cancelRequested: intentMatches("llm", recommendedBuiltin.id, "cancelling"),
+      })
+    : null;
+  const anyDownloadActive =
+    Boolean(onboardingSttDownload?.active) || Boolean(onboardingLlmDownload?.active);
 
   const run = (command: string, args?: Record<string, unknown>, success?: string) => {
     setError(null);
@@ -143,12 +201,46 @@ export default function Onboarding({
       .catch((reason) => setError(String(reason)));
   };
 
+  const requestDownload = async (
+    kind: DownloadKind,
+    modelId: string,
+    command: string,
+    args: Record<string, unknown>,
+  ) => {
+    const key = `${kind}:${modelId}`;
+    setError(null);
+    setDownloadIntent({ key, phase: "starting" });
+    onDownloadStart(kind);
+    try {
+      await invoke(command, args);
+      if (kind === "stt") {
+        refresh();
+        loadModels();
+      } else {
+        await loadPolish();
+      }
+    } catch (reason) {
+      setDownloadIntent((current) => (current?.key === key ? null : current));
+      setError(String(reason));
+    }
+  };
+
+  const cancelDownload = (kind: DownloadKind, modelId: string) => {
+    const key = `${kind}:${modelId}`;
+    setError(null);
+    setDownloadIntent({ key, phase: "cancelling" });
+    invoke("cancel_download").catch((reason) => {
+      setDownloadIntent((current) => (current?.key === key ? null : current));
+      setError(`無法取消下載：${String(reason)}`);
+    });
+  };
+
   const chooseLocalPolish = async (provider: "apple" | "builtin", model = "") => {
     setError(null);
     try {
       await invoke("set_llm_config", { provider, model, baseUrl: "", confirmed: true });
       await invoke("set_polish_mode", { mode: "clean", confirmed: true });
-      loadPolish();
+      await loadPolish();
       refresh();
       onToast(provider === "apple" ? "已使用 Apple 端上文字整理" : "已選擇 Claro 內建文字整理");
       return true;
@@ -159,10 +251,28 @@ export default function Onboarding({
   };
 
   const downloadAndUseBuiltin = async (model: ModelInfo) => {
-    const configured = await chooseLocalPolish("builtin", model.id);
-    if (!configured) return;
+    if (polishSelectionPending) return;
+    const key = `llm:${model.id}`;
+    setPolishSelectionPending(true);
     if (!model.downloaded) {
-      invoke("download_builtin_llm", { id: model.id }).catch((reason) => setError(String(reason)));
+      setDownloadIntent({ key, phase: "starting" });
+      onDownloadStart("llm");
+    }
+    try {
+      const configured = await chooseLocalPolish("builtin", model.id);
+      if (!configured) {
+        setDownloadIntent((current) => (current?.key === key ? null : current));
+        return;
+      }
+      if (!model.downloaded) {
+        await invoke("download_builtin_llm", { id: model.id });
+        await loadPolish();
+      }
+    } catch (reason) {
+      setDownloadIntent((current) => (current?.key === key ? null : current));
+      setError(String(reason));
+    } finally {
+      setPolishSelectionPending(false);
     }
   };
 
@@ -170,7 +280,7 @@ export default function Onboarding({
     setError(null);
     try {
       await invoke("set_polish_mode", { mode: "raw", confirmed: true });
-      loadPolish();
+      await loadPolish();
       refresh();
       onToast("已選擇原樣轉錄；之後可在設定開啟文字整理");
     } catch (reason) {
@@ -242,6 +352,7 @@ export default function Onboarding({
             <select
               className="select no-drag"
               aria-label="麥克風輸入裝置"
+              name="onboarding-input-device"
               value={status.input_device ?? ""}
               onChange={(event) => {
                 if (mic.active) invoke("mic_test_stop").catch(() => {});
@@ -273,7 +384,11 @@ export default function Onboarding({
         </div>
       </section>
 
-      <section className={`setup-step ${status.model_present ? "complete" : ""}`} aria-labelledby="setup-model-title">
+      <section
+        className={`setup-step ${status.model_present ? "complete" : ""}`}
+        aria-labelledby="setup-model-title"
+        aria-busy={onboardingSttDownload?.active ?? false}
+      >
         <div className="setup-step-number" aria-hidden="true">3</div>
         <div className="setup-step-body">
           <div className="setup-step-heading">
@@ -288,7 +403,7 @@ export default function Onboarding({
           {modelsError && (
             <div className="config-error" role="alert">
               <span>無法取得模型清單：{modelsError}</span>
-              <button className="btn no-drag" onClick={loadModels}>重試</button>
+              <button className="btn no-drag" onClick={() => loadModels(true)}>重試</button>
             </div>
           )}
           {!modelsLoading && !modelsError && (
@@ -297,36 +412,34 @@ export default function Onboarding({
               {(onboardingModel ? [onboardingModel] : []).map((model) => {
                 const activationStatus = progress?.model_id === model.id ? progress.activation_status : "none";
                 const activationPending = activationStatus !== "none";
-                const downloadError = progress?.model_id === model.id && !activationPending ? progress.error : null;
-                const downloading = progress?.model_id === model.id && !progress.done && !progress.error;
-                // 後端清單的 downloading 為真值：事件還沒到也不能把「下載」按鈕放出來
-                const downloadActive = downloading || model.downloading;
-                const percent = downloading && progress.total_mb
-                  ? Math.min(100, (progress.downloaded_mb / progress.total_mb) * 100)
-                  : null;
+                const downloadState =
+                  onboardingSttDownload ??
+                  resolveDownloadState({
+                    modelId: model.id,
+                    downloaded: model.downloaded,
+                    backendDownloading: model.downloading,
+                    progress,
+                  });
                 return (
-                  <div className="setup-model-row" key={model.id}>
+                  <div
+                    className="setup-model-row"
+                    key={model.id}
+                    aria-busy={downloadState.active}
+                  >
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
                         <strong>Claro 語音辨識</strong>
                         <span className="pill blue">這台 Mac 推薦</span>
                         {model.active && model.downloaded && <span className="pill green">使用中</span>}
+                        {!model.active && model.downloaded && <span className="pill green">已下載</span>}
                         {model.active && !model.downloaded && <span className="pill amber">已選擇・待下載</span>}
                       </div>
                       <span>{model.desc}・{model.size_mb >= 1024 ? `${(model.size_mb / 1024).toFixed(1)} GB` : `${model.size_mb} MB`}</span>
-                      {downloading && (
-                        <div className="mt-2">
-                          <div className="progress-track" role="progressbar" aria-label="下載 Claro 語音辨識" aria-valuenow={percent ?? undefined}>
-                            <div className="progress-fill" style={{ width: percent === null ? "30%" : `${percent}%` }} />
-                          </div>
-                          <small>{progress.downloaded_mb}/{progress.total_mb ?? "?"} MB</small>
-                        </div>
-                      )}
-                      {downloadError && (
-                        <div className="config-error mt-2" role="alert">
-                          下載中斷：{downloadError}。再次按下會從已完成的位置續傳。
-                        </div>
-                      )}
+                      <DownloadStatus
+                        state={downloadState}
+                        label="Claro 語音辨識模型"
+                        onCancel={() => cancelDownload("stt", model.id)}
+                      />
                       {activationPending && (
                         <div className="setup-inline-state" role="status">
                           {activationStatus === "waiting_for_idle"
@@ -334,13 +447,24 @@ export default function Onboarding({
                             : `已下載完成，但切換失敗：${progress?.error ?? "未知錯誤"}。請按「使用」重試。`}
                         </div>
                       )}
-                      {!downloading && downloadActive && (
-                        <div className="setup-inline-state" role="status">下載進行中…</div>
-                      )}
                     </div>
-                    {!model.downloaded && !downloadActive && (
-                      <button className="btn no-drag" onClick={() => run("download_model", { id: model.id, activate: true })}>
-                        {downloadError ? "重試並續傳" : "下載並使用"}
+                    {!model.downloaded && downloadState.canStart && (
+                      <button
+                        className="btn no-drag"
+                        disabled={anyDownloadActive}
+                        title={anyDownloadActive ? "請先完成目前的模型下載" : undefined}
+                        onClick={() =>
+                          void requestDownload(
+                            "stt",
+                            model.id,
+                            "download_model",
+                            { id: model.id, activate: true },
+                          )
+                        }
+                      >
+                        {downloadState.phase === "failed" || downloadState.phase === "cancelled"
+                          ? "重試並續傳"
+                          : "下載並使用"}
                       </button>
                     )}
                     {model.downloaded && !model.active && (
@@ -356,7 +480,11 @@ export default function Onboarding({
         </div>
       </section>
 
-      <section className={`setup-step ${polishReady ? "complete" : ""}`} aria-labelledby="setup-polish-title">
+      <section
+        className={`setup-step ${polishReady ? "complete" : ""}`}
+        aria-labelledby="setup-polish-title"
+        aria-busy={Boolean(onboardingLlmDownload?.active || polishSelectionPending)}
+      >
         <div className="setup-step-number" aria-hidden="true">4</div>
         <div className="setup-step-body">
           <div className="setup-step-heading">
@@ -380,13 +508,13 @@ export default function Onboarding({
           {!polishLoading && polishError && (
             <div className="config-error" role="alert">
               <span>{polishError}</span>
-              <button className="btn no-drag" onClick={loadPolish}>重新檢查</button>
+              <button className="btn no-drag" onClick={() => void loadPolish(true)}>重新檢查</button>
             </div>
           )}
           {!polishLoading && polishWarning && (
             <div className="setup-inline-state" role="status">
               <span>{polishWarning}</span>
-              <button className="btn no-drag" onClick={loadPolish}>重新檢查</button>
+              <button className="btn no-drag" onClick={() => void loadPolish(true)}>重新檢查</button>
             </div>
           )}
           {!polishLoading && (
@@ -408,12 +536,19 @@ export default function Onboarding({
               )}
 
               {recommendedBuiltin && (
-                <div className="setup-model-row">
+                <div
+                  className="setup-model-row"
+                  aria-busy={Boolean(onboardingLlmDownload?.active || polishSelectionPending)}
+                >
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
                       <strong>Claro 內建整理</strong>
                       {hardware?.recommended_llm_provider === "builtin" && <span className="pill blue">這台 Mac 推薦</span>}
                       {llm?.provider === "builtin" && polishReady && <span className="pill green">使用中</span>}
+                      {recommendedBuiltin.downloaded &&
+                        !(llm?.provider === "builtin" && polishReady) && (
+                          <span className="pill green">已下載</span>
+                        )}
                     </div>
                     <span>
                       下載約 {recommendedBuiltin.size_mb >= 1024
@@ -421,30 +556,30 @@ export default function Onboarding({
                         : `${recommendedBuiltin.size_mb} MB`}
                       ・自動調整記憶體用量，閒置後會釋放資源
                     </span>
-                    {llmProgress?.model_id === recommendedBuiltin.id && !llmProgress.done && !llmProgress.error && (
-                      <div className="mt-2">
-                        <div className="progress-track" role="progressbar" aria-label="下載 Claro 內建整理模型">
-                          <div
-                            className="progress-fill"
-                            style={{
-                              width: llmProgress.total_mb
-                                ? `${Math.min(100, (llmProgress.downloaded_mb / llmProgress.total_mb) * 100)}%`
-                                : "30%",
-                            }}
-                          />
-                        </div>
-                        <small>{llmProgress.downloaded_mb}/{llmProgress.total_mb ?? "?"} MB</small>
-                      </div>
-                    )}
-                    {llmProgress?.model_id === recommendedBuiltin.id && llmProgress.error && (
-                      <div className="config-error mt-2" role="alert">
-                        下載中斷：{llmProgress.error}。再次按下會續傳，不會從頭開始。
-                      </div>
+                    {onboardingLlmDownload && (
+                      <DownloadStatus
+                        state={onboardingLlmDownload}
+                        label="Claro 內建整理模型"
+                        onCancel={() => cancelDownload("llm", recommendedBuiltin.id)}
+                      />
                     )}
                   </div>
-                  {(!llmProgress || llmProgress.error || llmProgress.model_id !== recommendedBuiltin.id) && !(llm?.provider === "builtin" && polishReady) && (
-                    <button className="btn no-drag" onClick={() => downloadAndUseBuiltin(recommendedBuiltin)}>
-                      {recommendedBuiltin.downloaded ? "使用" : llmProgress?.error ? "重試並續傳" : "下載並使用"}
+                  {!onboardingLlmDownload?.active &&
+                    !(llm?.provider === "builtin" && polishReady) && (
+                    <button
+                      className="btn no-drag"
+                      disabled={polishSelectionPending || anyDownloadActive}
+                      title={anyDownloadActive ? "請先完成目前的模型下載" : undefined}
+                      onClick={() => void downloadAndUseBuiltin(recommendedBuiltin)}
+                    >
+                      {polishSelectionPending
+                        ? "正在套用…"
+                        : recommendedBuiltin.downloaded
+                          ? "使用"
+                          : onboardingLlmDownload?.phase === "failed" ||
+                              onboardingLlmDownload?.phase === "cancelled"
+                            ? "重試並續傳"
+                            : "下載並使用"}
                     </button>
                   )}
                 </div>

@@ -100,8 +100,9 @@ mod engine {
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
-    use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel, Special};
+    use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
     use llama_cpp_2::sampling::LlamaSampler;
+    use llama_cpp_2::TokenToStringError;
 
     const IDLE_UNLOAD: Duration = Duration::from_secs(300); // Handy 預設 5 分鐘
     const MAX_OUTPUT_TOKENS: usize = 512;
@@ -188,6 +189,21 @@ mod engine {
     pub fn unload_blocking() {
         let mut guard = STATE.lock().unwrap();
         *guard = None;
+    }
+
+    /// 模型下載準備階段用：不阻塞等待正在生成的 STATE 鎖，讓呼叫端可以在
+    /// retry 間隔檢查下載取消旗標。true 表示已拿到鎖並完成卸載。
+    pub fn try_unload_for_download() -> Result<bool> {
+        match STATE.try_lock() {
+            Ok(mut guard) => {
+                *guard = None;
+                Ok(true)
+            }
+            Err(std::sync::TryLockError::WouldBlock) => Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                bail!("內建模型狀態異常，請重新啟動 Claro")
+            }
+        }
     }
 
     /// 用內建模型跑一次 chat completion（greedy，最保守）。
@@ -287,9 +303,8 @@ mod engine {
         // 必須整串收完再一次轉字串——逐 token 轉會把拆開的字靜默丟掉（實測踩過）。
         let mut sampler = LlamaSampler::greedy();
         let mut generated: Vec<llama_cpp_2::token::LlamaToken> = Vec::new();
-        let mut n_cur = tokens.len() as i32;
         let mut reached_eog = false;
-        for _ in 0..MAX_OUTPUT_TOKENS {
+        for n_cur in (tokens.len() as i32..).take(MAX_OUTPUT_TOKENS) {
             if cancel.load(std::sync::atomic::Ordering::SeqCst) {
                 bail!("內建整理已取消");
             }
@@ -305,7 +320,6 @@ mod engine {
             generated.push(token);
             batch.clear();
             batch.add(token, n_cur, &[0], true)?;
-            n_cur += 1;
             ctx.decode(&mut batch).context("decode step")?;
         }
         require_complete_generation(reached_eog)?;
@@ -317,11 +331,18 @@ mod engine {
         // 仍是整串收完才 decode，不會把拆成多 token 的 CJK 字丟掉。
         let mut bytes: Vec<u8> = Vec::with_capacity(generated.len() * 4);
         for token in &generated {
-            bytes.extend_from_slice(
-                &model
-                    .token_to_bytes(*token, Special::Plaintext)
-                    .context("detokenize output")?,
-            );
+            let piece = match model.token_to_piece_bytes(*token, 8, false, None) {
+                Err(TokenToStringError::InsufficientBufferSpace(required)) => model
+                    .token_to_piece_bytes(
+                        *token,
+                        usize::try_from(-required).context("invalid detokenize buffer size")?,
+                        false,
+                        None,
+                    ),
+                result => result,
+            }
+            .context("detokenize output")?;
+            bytes.extend_from_slice(&piece);
         }
         let out = String::from_utf8(bytes).context("detokenize output")?;
         Ok(out.trim().to_string())
@@ -379,7 +400,9 @@ mod engine {
 }
 
 #[cfg(target_os = "macos")]
-pub use engine::{generate, generate_with_cancel, unload_blocking, unload_now};
+pub use engine::{
+    generate, generate_with_cancel, try_unload_for_download, unload_blocking, unload_now,
+};
 
 #[cfg(not(target_os = "macos"))]
 pub fn generate(_model_id: &str, _system: &str, _user: &str) -> Result<String> {
@@ -403,6 +426,11 @@ pub fn unload_now() -> bool {
 
 #[cfg(not(target_os = "macos"))]
 pub fn unload_blocking() {}
+
+#[cfg(not(target_os = "macos"))]
+pub fn try_unload_for_download() -> Result<bool> {
+    Ok(true)
+}
 
 #[cfg(test)]
 mod generation_stop_tests {

@@ -29,6 +29,8 @@ Workflow 內所有 GitHub Actions 都固定到完整 commit SHA；Apple ID、公
    - `Claro.app/Contents/MacOS/mic_indicator` 存在且可執行
    - sidecar 架構與 workflow 選項一致
    - app 與 sidecar 的最低 macOS 版本為 11.0
+   - main app 與 sidecar 都有 hardened runtime，且沒有 get-task-allow、
+     disable-library-validation、allow-jit 或 unsigned executable memory entitlement
    - app 深層簽章、sidecar 簽章與 Gatekeeper assessment 通過
    - app 與 DMG 的 notarization ticket 可被 `stapler` 驗證
 5. 下載 Actions artifact，在乾淨 Mac 完成 `docs/ROADMAP.md` 的 smoke checklist 後，才手動升格為公開 release。

@@ -1,5 +1,8 @@
 name: ci
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -21,6 +24,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable, 2026-06-30
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
@@ -32,21 +37,39 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
+      - name: Frontend install
+        working-directory: desktop
+        run: npm ci
+
+      - name: Frontend lint
+        working-directory: desktop
+        run: npm run lint
+
+      - name: Frontend tests
+        working-directory: desktop
+        run: npm test
+
       - name: Frontend build
         working-directory: desktop
-        run: |
-          npm ci
-          npm run build
+        run: npm run build
+
+      - name: Rust format
+        working-directory: desktop/src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: Rust clippy
+        working-directory: desktop/src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Rust tests
         working-directory: desktop/src-tauri
-        run: cargo test --lib
+        run: cargo test --lib --locked
 
       # examples 是文件指定的驗證入口（transcribe_file/builtin_polish…），
       # cargo test --lib 與 bundle 都不編它們——不查會在使用者手上才編譯失敗
       - name: Rust check (all targets incl. examples)
         working-directory: desktop/src-tauri
-        run: cargo check --all-targets
+        run: cargo check --all-targets --locked
 
       # debug bundle：驗證打包鏈（Info.plist 合併、icon、capabilities）不會等到發版才炸；
       # debug profile 與上面測試共用編譯快取，成本可控

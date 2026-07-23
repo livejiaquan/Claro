@@ -21,10 +21,11 @@ fn default_stt_model() -> &'static str {
 
 /// 聽寫後處理模式。模式與 LLM provider 分離：即使預設意圖是 Clean，
 /// provider=off 時 pipeline 仍會安全退回 deterministic base text。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PolishMode {
     Raw,
+    #[default]
     Clean,
     Organize,
 }
@@ -36,12 +37,6 @@ impl PolishMode {
             Self::Clean => "clean",
             Self::Organize => "organize",
         }
-    }
-}
-
-impl Default for PolishMode {
-    fn default() -> Self {
-        Self::Clean
     }
 }
 

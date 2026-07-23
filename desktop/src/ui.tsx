@@ -140,7 +140,15 @@ export function StatCard({
 }
 
 /* icons：1.6px stroke 手繪風 */
-const S = { fill: "none", stroke: "currentColor", strokeWidth: 1.6, strokeLinecap: "round", strokeLinejoin: "round" } as const;
+const S = {
+  fill: "none",
+  stroke: "currentColor",
+  strokeWidth: 1.6,
+  strokeLinecap: "round",
+  strokeLinejoin: "round",
+  "aria-hidden": true,
+  focusable: false,
+} as const;
 
 export const IconHome = () => (
   <svg viewBox="0 0 20 20" {...S}>

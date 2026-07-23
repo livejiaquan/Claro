@@ -7,3 +7,5 @@ __pycache__/
 .DS_Store
 *.sock
 *.jsonl
+/desktop/.playwright-cli/
+/desktop/output/

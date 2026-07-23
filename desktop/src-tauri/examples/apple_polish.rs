@@ -22,8 +22,9 @@ fn main() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config.json");
     std::fs::write(&path, r#"{"llm_provider":"apple"}"#).unwrap();
-    let polisher = claro_lib::polish::from_settings(&claro_lib::settings::Settings::from_path(&path))
-        .expect("apple polisher");
+    let polisher =
+        claro_lib::polish::from_settings(&claro_lib::settings::Settings::from_path(&path))
+            .expect("apple polisher");
 
     let cases: &[(&str, &str)] = &[
         ("嗯我們用 hyTorch 那個跑訓練然後把模型存到 S3", "PyTorch"),
@@ -35,12 +36,7 @@ fn main() {
     for (text, ctx) in cases {
         let t0 = std::time::Instant::now();
         match polisher.polish(text, ctx) {
-            Ok(out) => println!(
-                "[{}ms] {}\n   -> {}",
-                t0.elapsed().as_millis(),
-                text,
-                out
-            ),
+            Ok(out) => println!("[{}ms] {}\n   -> {}", t0.elapsed().as_millis(), text, out),
             Err(e) => println!("ERROR on '{text}': {e}"),
         }
     }

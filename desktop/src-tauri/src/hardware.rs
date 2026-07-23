@@ -23,7 +23,7 @@ pub struct HardwareProfile {
 pub fn profile(apple_status: i32) -> HardwareProfile {
     let architecture = std::env::consts::ARCH.to_string();
     let memory_bytes = physical_memory_bytes();
-    let memory_gb = ((memory_bytes + GIB - 1) / GIB).max(1);
+    let memory_gb = memory_bytes.div_ceil(GIB).max(1);
     policy(memory_gb, &architecture, apple_status)
 }
 
@@ -31,7 +31,7 @@ pub fn profile(apple_status: i32) -> HardwareProfile {
 pub fn recommended_stt() -> &'static str {
     let architecture = std::env::consts::ARCH;
     let memory_bytes = physical_memory_bytes();
-    let memory_gb = ((memory_bytes + GIB - 1) / GIB).max(1);
+    let memory_gb = memory_bytes.div_ceil(GIB).max(1);
     stt_policy(memory_gb, architecture).1
 }
 

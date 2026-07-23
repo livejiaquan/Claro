@@ -2,7 +2,8 @@
 //! 用法：CLARO_LLM_URL=http://127.0.0.1:8123/v1 CLARO_LLM_MODEL=mock cargo run --example test_polish
 
 fn main() -> anyhow::Result<()> {
-    let base = std::env::var("CLARO_LLM_URL").unwrap_or_else(|_| "http://localhost:11434/v1".into());
+    let base =
+        std::env::var("CLARO_LLM_URL").unwrap_or_else(|_| "http://localhost:11434/v1".into());
     let model = std::env::var("CLARO_LLM_MODEL").unwrap_or_else(|_| "qwen3:4b".into());
 
     // 直接組 Polisher（繞過 config/keychain），驗證 HTTP 與防呆路徑
