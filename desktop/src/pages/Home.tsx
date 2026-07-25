@@ -10,6 +10,7 @@ import {
   type ResolvedLlmConfig,
   type Status,
 } from "../types";
+import { privacyMessage } from "../privacyMessage";
 import { Hotkey, IconChars, IconCopy, IconMic, IconSpeed, IconStack, StatCard } from "../ui";
 
 function isToday(ts: string) {
@@ -21,42 +22,6 @@ function isToday(ts: string) {
     d.getDate() === now.getDate()
   );
 }
-
-const MODE_LABEL = {
-  raw: "原樣轉錄",
-  clean: "保守校訂",
-  correct: "專業校字",
-  organize: "條理整理",
-} as const;
-
-const PROVIDER_LABEL: Record<string, string> = {
-  apple: "Apple Intelligence",
-  builtin: "Claro 內建模型",
-  ollama: "Ollama",
-  lmstudio: "LM Studio",
-  custom: "自訂端點",
-  codex: "OpenAI Codex",
-};
-
-const BLOCKED_COPY: Record<string, string> = {
-  provider_missing: "尚未選擇整理引擎",
-  provider_off: "尚未選擇整理引擎",
-  provider_incomplete: "整理引擎設定尚未完成",
-  provider_unavailable: "整理引擎目前不可用",
-  model_missing: "整理模型尚未下載",
-  correct_consent_required: "尚未確認專業校字會調整授權詞彙的拼法格式",
-  organize_consent_required: "尚未確認條理整理的行為差異",
-  cloud_consent_required: "尚未確認雲端資料傳送",
-  codex_not_installed: "尚未找到 Codex CLI",
-  codex_auth_required: "Codex CLI 尚未登入",
-  codex_unsupported: "Codex CLI 版本不支援安全校字",
-  codex_consent_required: "尚未確認 Codex 雲端校字",
-  codex_context_consent_required: "尚未確認有限畫面詞彙傳送",
-  codex_unavailable: "Codex CLI 目前不可用",
-  local_only: "「僅限本機」正在阻擋雲端引擎",
-  invalid_endpoint: "自訂端點格式不正確",
-  invalid_custom_url: "自訂端點格式不正確",
-};
 
 function formatModelSize(sizeMb: number) {
   return sizeMb >= 1024 ? `${(sizeMb / 1024).toFixed(1)} GB` : `${sizeMb} MB`;
@@ -97,80 +62,6 @@ function currentModelPosition(model: ModelInfo) {
   if (isPreviewSttModel(model)) return "預覽模型";
   if (model.id.includes("turbo") || model.id === "small" || model.id === "medium") return "速度優先";
   return "既有方案";
-}
-
-function privacyMessage(llm: ResolvedLlmConfig | null, failed: boolean, contextEnabled: boolean) {
-  if (failed) {
-    return {
-      tone: "warning",
-      title: "無法確認資料處理位置",
-      detail: "請到設定重新載入；Claro 不會在這裡假設目前是全本地模式。",
-    };
-  }
-  if (!llm) {
-    return { tone: "neutral", title: "正在確認資料處理位置…", detail: "" };
-  }
-
-  if (llm.effective_mode === "raw") {
-    if (llm.polish_mode !== "raw" && llm.blocked_reason) {
-      return {
-        tone: "warning",
-        title: `目前退回 ${MODE_LABEL.raw}`,
-        detail: `${BLOCKED_COPY[llm.blocked_reason] ?? "整理設定尚未就緒"}；目前沒有資料送往雲端。`,
-      };
-    }
-    return {
-      tone: "local",
-      title: `全本地・${MODE_LABEL.raw}`,
-      detail: "不使用 AI 整理；音訊與文字不離開這台 Mac。",
-    };
-  }
-
-  const mode = MODE_LABEL[llm.effective_mode];
-  const boundedContextIsSent = llm.effective_mode === "organize" && contextEnabled;
-  const codexTermsAreSent =
-    llm.provider === "codex" &&
-    llm.effective_mode === "correct" &&
-    contextEnabled &&
-    llm.codex_share_context_terms &&
-    llm.codex_context_consent_valid;
-  if (llm.execution_location === "on_device") {
-    return {
-      tone: "local",
-      title: `全本地・${mode}`,
-      detail: "辨識與整理都在這台 Mac 完成。",
-    };
-  }
-  if (llm.execution_location === "local_service") {
-    const data = boundedContextIsSent ? "轉錄文字與畫面上下文" : "轉錄文字";
-    return {
-      tone: "local",
-      title: `本機服務・${mode}`,
-      detail: `${data}只送到這台 Mac 上的 ${PROVIDER_LABEL[llm.provider] ?? llm.provider}；音訊不傳送。`,
-    };
-  }
-  if (llm.execution_location === "cloud") {
-    const data = boundedContextIsSent
-      ? "轉錄文字與畫面上下文"
-      : codexTermsAreSent
-        ? "轉錄文字、校字偏好與有限畫面詞彙"
-        : llm.provider === "codex"
-          ? "轉錄文字與校字偏好"
-          : "轉錄文字";
-    const destination =
-      llm.destination_label ?? llm.endpoint_origin ?? "你設定的端點";
-    return {
-      tone: "cloud",
-      title: `雲端整理・${mode}`,
-      detail: `${data}會送到 ${destination}；音訊不傳送。`,
-    };
-  }
-
-  return {
-    tone: "warning",
-    title: `目前退回 ${MODE_LABEL.raw}`,
-    detail: "整理引擎尚未就緒；目前沒有資料送往雲端。",
-  };
 }
 
 export default function Home({
@@ -280,6 +171,32 @@ export default function Home({
         <kbd className="keycap" style={{ height: 22, fontSize: 11.5 }}>esc</kbd> 取消。
       </p>
 
+      <div
+        className={`privacy-notice home-privacy-notice ${privacy.tone}`}
+        role="status"
+        aria-live="polite"
+      >
+        <svg aria-hidden="true" viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.6">
+          <rect x="4.5" y="8.5" width="11" height="8" rx="2" />
+          <path d="M7 8.5V6.8a3 3 0 0 1 6 0v1.7" />
+        </svg>
+        <span className="min-w-0">
+          <b>{privacy.title}</b>
+          {privacy.detail && <span className="privacy-detail">{privacy.detail}</span>}
+        </span>
+        {llmFailed && (
+          <button className="btn no-drag ml-auto shrink-0" onClick={gotoSettings}>
+            前往設定
+          </button>
+        )}
+        {status.dictation_state === "recording" && (
+          <span className="pill red ml-auto shrink-0">
+            <span className="dot pulse" />
+            錄音中
+          </span>
+        )}
+      </div>
+
       {/* 即時狀態 CTA，不保存假的 onboarding 完成旗標。 */}
       {needsSetup && (
         <div className="setup-banner mb-7" role="status">
@@ -360,7 +277,7 @@ export default function Home({
         </div>
         <button
           className="text-[12.5px] font-medium no-drag"
-          style={{ color: "var(--accent)" }}
+          style={{ color: "var(--accent-text)" }}
           onClick={gotoHistory}
         >
           查看全部 →
@@ -387,22 +304,6 @@ export default function Home({
         ))}
       </div>
 
-      <div className={`privacy-notice ${privacy.tone}`} role="status" aria-live="polite">
-        <svg aria-hidden="true" viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.6">
-          <rect x="4.5" y="8.5" width="11" height="8" rx="2" />
-          <path d="M7 8.5V6.8a3 3 0 0 1 6 0v1.7" />
-        </svg>
-        <span>
-          <b>{privacy.title}</b>
-          {privacy.detail && <span className="privacy-detail">{privacy.detail}</span>}
-        </span>
-        {status.dictation_state === "recording" && (
-          <span className="pill red ml-2">
-            <span className="dot pulse" />
-            錄音中
-          </span>
-        )}
-      </div>
     </div>
   );
 }

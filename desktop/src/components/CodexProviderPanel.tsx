@@ -1,5 +1,9 @@
-import { useEffect, useId, useState } from "react";
-import { codexConsentIsReady, codexTestIsPending } from "../codexProviderState";
+import { useEffect, useId, useRef, useState } from "react";
+import {
+  codexConsentIsReady,
+  codexPrimaryConsentIsValid,
+  codexTestIsPending,
+} from "../codexProviderState";
 import type {
   CodexCliStatus,
   CodexEnableOptions,
@@ -9,6 +13,9 @@ import type {
 } from "../types";
 
 const MAX_CORRECTION_PREFERENCES = 1000;
+const CORRECTION_AUTOSAVE_DELAY_MS = 700;
+
+type CorrectionSavePhase = "saved" | "dirty" | "saving" | "error";
 
 const TEST_FAILURE_COPY: Record<CodexTestFailureReason, string> = {
   timeout:
@@ -18,6 +25,8 @@ const TEST_FAILURE_COPY: Record<CodexTestFailureReason, string> = {
   auth_required: "Codex 登入已失效。請重新登入後，再按「重新檢查」。",
   unavailable:
     "Codex 目前無法使用。設定已保留；Claro 仍可使用本機語音辨識。",
+  consent_changed:
+    "Codex 的登入、版本或受控能力已改變。這次結果未採用；請重新檢查並確認。",
   output_rejected:
     "Codex 有回應，但結果未通過內容保護，因此沒有使用這次校字結果。",
   unknown:
@@ -103,9 +112,11 @@ export interface CodexProviderPanelProps {
   globalContextEnabled: boolean;
   enablePending?: boolean;
   preferencesSaving?: boolean;
+  correctionDraftValue?: string;
   onRefresh: () => void;
   onEnable: (options: CodexEnableOptions) => void;
-  onSaveCorrectionPreferences: (value: string) => void;
+  onSaveCorrectionPreferences: (value: string) => Promise<void> | void;
+  onCorrectionDraftChange?: (value: string) => void;
   onShareContextTermsChange: (enabled: boolean) => void;
   onTest: () => void;
   onCancelTest: () => void;
@@ -118,9 +129,11 @@ export default function CodexProviderPanel({
   globalContextEnabled,
   enablePending = false,
   preferencesSaving = false,
+  correctionDraftValue,
   onRefresh,
   onEnable,
   onSaveCorrectionPreferences,
+  onCorrectionDraftChange,
   onShareContextTermsChange,
   onTest,
   onCancelTest,
@@ -128,23 +141,101 @@ export default function CodexProviderPanel({
   const titleId = useId();
   const consentTitleId = useId();
   const consentHelpId = useId();
+  const capabilityExampleId = useId();
   const contextConsentTitleId = useId();
   const correctionId = useId();
   const correctionHelpId = useId();
+  const correctionSaveStatusId = useId();
+  const correctionSaveErrorId = useId();
   const contextHelpId = useId();
   const contextToggleLabelId = useId();
+  const primaryConsentHeadingRef = useRef<HTMLDivElement>(null);
+  const connectedContentRef = useRef<HTMLDivElement>(null);
+  const contextConsentHeadingRef = useRef<HTMLDivElement>(null);
+  const contextToggleRef = useRef<HTMLInputElement>(null);
+  const primaryConsentWasVisible = useRef(false);
+  const restoreContextToggleFocus = useRef(false);
+  const lastSavedCorrection = useRef(preferences.correction_preferences);
+  const correctionDraftRef = useRef(
+    correctionDraftValue ?? preferences.correction_preferences,
+  );
+  const correctionAutosaveTimer = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const correctionSaveRequest = useRef(0);
+  const activeCorrectionSave = useRef<{
+    value: string;
+    promise: Promise<void>;
+  } | null>(null);
+  const saveCorrectionPreferencesRef = useRef(
+    onSaveCorrectionPreferences,
+  );
   const [acknowledged, setAcknowledged] = useState(false);
   const [consentContextTerms, setConsentContextTerms] = useState(false);
   const [confirmContextTerms, setConfirmContextTerms] = useState(false);
   const [contextTermsAcknowledged, setContextTermsAcknowledged] =
     useState(false);
-  const [correctionDraft, setCorrectionDraft] = useState(
+  const [localCorrectionDraft, setLocalCorrectionDraft] = useState(
     preferences.correction_preferences,
   );
+  const [savedCorrection, setSavedCorrection] = useState(
+    preferences.correction_preferences,
+  );
+  const [correctionSavePhase, setCorrectionSavePhase] =
+    useState<CorrectionSavePhase>("saved");
+  const [correctionSaveError, setCorrectionSaveError] = useState<string | null>(
+    null,
+  );
+  const correctionDraft = correctionDraftValue ?? localCorrectionDraft;
 
   useEffect(() => {
-    setCorrectionDraft(preferences.correction_preferences);
-  }, [preferences.correction_preferences]);
+    const previousSaved = lastSavedCorrection.current;
+    lastSavedCorrection.current = preferences.correction_preferences;
+    setSavedCorrection(preferences.correction_preferences);
+    if (correctionDraftValue === undefined) {
+      setLocalCorrectionDraft((current) =>
+        // probe 或其他設定更新不應吃掉使用者尚未儲存的草稿。
+        current === previousSaved
+          ? preferences.correction_preferences
+          : current,
+      );
+    }
+    if (
+      (correctionDraftValue ?? correctionDraftRef.current).trim() ===
+      preferences.correction_preferences
+    ) {
+      setCorrectionSavePhase("saved");
+      setCorrectionSaveError(null);
+    }
+  }, [correctionDraftValue, preferences.correction_preferences]);
+
+  useEffect(() => {
+    correctionDraftRef.current = correctionDraft;
+  }, [correctionDraft]);
+
+  useEffect(() => {
+    saveCorrectionPreferencesRef.current = onSaveCorrectionPreferences;
+  }, [onSaveCorrectionPreferences]);
+
+  useEffect(
+    () => () => {
+      if (correctionAutosaveTimer.current !== null) {
+        clearTimeout(correctionAutosaveTimer.current);
+      }
+      const normalized = correctionDraftRef.current.trim();
+      if (
+        normalized !== lastSavedCorrection.current &&
+        activeCorrectionSave.current?.value !== normalized
+      ) {
+        // Settings 頁會保留受控 draft；這裡仍 best-effort flush，確保
+        // 其他 unmount 路徑不會把已輸入內容靜默丟掉。
+        void Promise.resolve()
+          .then(() => saveCorrectionPreferencesRef.current(normalized))
+          .catch(() => {});
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     // 登入類型、CLI 版本或 consent target 改變後必須重新確認；不能沿用
@@ -163,14 +254,218 @@ export default function CodexProviderPanel({
 
   const copy = codexStatusCopy(status);
   const statusReady = status.availability === "ready";
-  const consentReady = codexConsentIsReady(
-    preferences,
-    globalContextEnabled,
-  );
+  const consentValid = codexPrimaryConsentIsValid(preferences);
+  const codexActive =
+    statusReady &&
+    codexConsentIsReady(preferences, globalContextEnabled);
   const testPending = codexTestIsPending(testState);
   const normalizedDraft = correctionDraft.trim();
-  const correctionChanged =
-    normalizedDraft !== preferences.correction_preferences;
+  const correctionChanged = normalizedDraft !== savedCorrection;
+
+  const persistCorrectionDraft = (
+    draft = correctionDraftRef.current,
+  ): Promise<void> => {
+    if (correctionAutosaveTimer.current !== null) {
+      clearTimeout(correctionAutosaveTimer.current);
+      correctionAutosaveTimer.current = null;
+    }
+    const normalized = draft.trim();
+    if (normalized === lastSavedCorrection.current) {
+      setCorrectionSavePhase("saved");
+      setCorrectionSaveError(null);
+      return Promise.resolve();
+    }
+
+    const active = activeCorrectionSave.current;
+    if (active?.value === normalized) return active.promise;
+
+    const request = ++correctionSaveRequest.current;
+    setCorrectionSavePhase("saving");
+    setCorrectionSaveError(null);
+    const promise = Promise.resolve()
+      .then(() => saveCorrectionPreferencesRef.current(normalized))
+      .then(() => {
+        if (request !== correctionSaveRequest.current) return;
+        lastSavedCorrection.current = normalized;
+        setSavedCorrection(normalized);
+        setCorrectionSaveError(null);
+        setCorrectionSavePhase(
+          correctionDraftRef.current.trim() === normalized
+            ? "saved"
+            : "dirty",
+        );
+      })
+      .catch((reason) => {
+        if (request === correctionSaveRequest.current) {
+          setCorrectionSavePhase("error");
+          setCorrectionSaveError(
+            reason instanceof Error && reason.message
+              ? reason.message
+              : "自動儲存失敗。請重新檢查 Codex 後再試一次。",
+          );
+        }
+        throw reason;
+      });
+
+    activeCorrectionSave.current = { value: normalized, promise };
+    void promise.then(
+      () => {
+        if (activeCorrectionSave.current?.promise === promise) {
+          activeCorrectionSave.current = null;
+        }
+      },
+      () => {
+        if (activeCorrectionSave.current?.promise === promise) {
+          activeCorrectionSave.current = null;
+        }
+      },
+    );
+    return promise;
+  };
+
+  const updateCorrectionDraft = (value: string) => {
+    correctionDraftRef.current = value;
+    if (correctionDraftValue === undefined) {
+      setLocalCorrectionDraft(value);
+    }
+    onCorrectionDraftChange?.(value);
+    setCorrectionSaveError(null);
+
+    if (correctionAutosaveTimer.current !== null) {
+      clearTimeout(correctionAutosaveTimer.current);
+      correctionAutosaveTimer.current = null;
+    }
+    if (value.trim() === lastSavedCorrection.current) {
+      setCorrectionSavePhase("saved");
+      return;
+    }
+
+    setCorrectionSavePhase("dirty");
+    correctionAutosaveTimer.current = setTimeout(() => {
+      correctionAutosaveTimer.current = null;
+      void persistCorrectionDraft(value).catch(() => {});
+    }, CORRECTION_AUTOSAVE_DELAY_MS);
+  };
+
+  const correctionStatus =
+    correctionSavePhase === "saving"
+      ? { tone: "blue", label: "自動儲存中…" }
+      : correctionSavePhase === "error"
+        ? { tone: "red", label: "未儲存" }
+        : correctionChanged || correctionSavePhase === "dirty"
+          ? { tone: "amber", label: "即將自動儲存" }
+          : { tone: "green", label: "已儲存" };
+
+  useEffect(() => {
+    const visible = statusReady && !consentValid;
+    if (visible && !primaryConsentWasVisible.current) {
+      primaryConsentHeadingRef.current?.focus();
+    } else if (
+      !visible &&
+      primaryConsentWasVisible.current &&
+      consentValid
+    ) {
+      connectedContentRef.current?.focus();
+    }
+    primaryConsentWasVisible.current = visible;
+  }, [consentValid, statusReady]);
+
+  useEffect(() => {
+    if (confirmContextTerms) {
+      contextConsentHeadingRef.current?.focus();
+    } else if (restoreContextToggleFocus.current) {
+      contextToggleRef.current?.focus();
+      restoreContextToggleFocus.current = false;
+    }
+  }, [confirmContextTerms]);
+
+  const closeContextConsent = () => {
+    restoreContextToggleFocus.current = true;
+    setContextTermsAcknowledged(false);
+    setConfirmContextTerms(false);
+  };
+
+  const correctionPreferencesEditor = (
+    <div className="row" style={{ alignItems: "flex-start" }}>
+      <div className="min-w-0 flex-1">
+        <label className="row-label" htmlFor={correctionId}>
+          正確拼法清單（選填）
+        </label>
+        <div className="row-sub" id={correctionHelpId}>
+          這份清單只儲存在本機，你可以在同意 Codex
+          前先檢視、修改或清空。每行一個，或用逗號分隔，例如「Claude、Flutter、Whisper」。這不是模糊錯字清單：
+          空白合併、字母不同或含數字的固定拼法請用個人字典明確指定。啟用
+          Codex
+          後，只有在本次轉錄中呈現為「左側至少四字母＋單一連字號＋右側兩字母」且內容保護可採用的項目才會送出；請勿填入密碼或金鑰。
+        </div>
+        <textarea
+          id={correctionId}
+          className="text-area no-drag mt-2 w-full"
+          name="codex-correction-preferences"
+          rows={4}
+          maxLength={MAX_CORRECTION_PREFERENCES}
+          autoComplete="off"
+          spellCheck={false}
+          translate="no"
+          disabled={preferencesSaving}
+          placeholder={"Claude\nFlutter\nWhisper"}
+          value={correctionDraft}
+          aria-describedby={`${correctionHelpId} ${correctionSaveStatusId}${
+            correctionSaveError ? ` ${correctionSaveErrorId}` : ""
+          }`}
+          onChange={(event) => updateCorrectionDraft(event.target.value)}
+          onBlur={() => {
+            if (correctionChanged) {
+              void persistCorrectionDraft().catch(() => {});
+            }
+          }}
+        />
+        <div className="codex-draft-status">
+          <span>
+            {correctionDraft.length}/{MAX_CORRECTION_PREFERENCES} 字
+          </span>
+          <span
+            className={`pill ${correctionStatus.tone}`}
+            id={correctionSaveStatusId}
+            role="status"
+            aria-live="polite"
+          >
+            {correctionStatus.label}
+          </span>
+        </div>
+        {correctionSaveError && (
+          <div
+            className="codex-draft-error"
+            id={correctionSaveErrorId}
+            role="alert"
+          >
+            <span>{correctionSaveError} 草稿仍保留。</span>
+            <button
+              className="btn no-drag"
+              onClick={() => {
+                void persistCorrectionDraft().catch(() => {});
+              }}
+            >
+              重試儲存
+            </button>
+          </div>
+        )}
+      </div>
+      <button
+        className="btn no-drag"
+        disabled={
+          !correctionChanged ||
+          preferencesSaving ||
+          correctionSavePhase === "saving"
+        }
+        onClick={() => {
+          void persistCorrectionDraft(normalizedDraft).catch(() => {});
+        }}
+      >
+        {correctionSavePhase === "saving" ? "儲存中…" : "立即儲存"}
+      </button>
+    </div>
+  );
 
   return (
     <section
@@ -179,6 +474,7 @@ export default function CodexProviderPanel({
         status.availability === "checking" ||
         enablePending ||
         preferencesSaving ||
+        correctionSavePhase === "saving" ||
         testPending
       }
     >
@@ -186,11 +482,14 @@ export default function CodexProviderPanel({
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="row-label" id={titleId}>
-              Codex CLI 校字
+              Codex 專業拼法
             </span>
+            <span className="pill amber">實驗</span>
             <span className="pill blue">需要網路</span>
-            {statusReady && consentReady && (
-              <span className="pill green">已連接</span>
+            {consentValid && (
+              <span className={`pill ${codexActive ? "green" : "amber"}`}>
+                {codexActive ? "使用中" : "已同意・目前未使用"}
+              </span>
             )}
           </div>
           <div
@@ -203,6 +502,10 @@ export default function CodexProviderPanel({
               <span className="block">{copy.detail}</span>
             </span>
           </div>
+          <p className="codex-capability-example" id={capabilityExampleId}>
+            目前只嘗試極窄的連字號修正，例如 Clau-de → Claude。Py Torch →
+            PyTorch 或 Pie Torch → PyTorch 請用個人字典明確指定。
+          </p>
         </div>
         <button
           className="btn no-drag"
@@ -213,20 +516,51 @@ export default function CodexProviderPanel({
         </button>
       </div>
 
-      {statusReady && !consentReady && (
+      {correctionPreferencesEditor}
+
+      {statusReady && !consentValid && (
         <section
           className="consent-panel"
           aria-labelledby={consentTitleId}
           aria-busy={enablePending}
         >
           <div className="min-w-0 flex-1">
-            <div className="consent-title" id={consentTitleId}>
-              允許 Claro 使用 Codex 校字？
+            <div
+              className="consent-title"
+              id={consentTitleId}
+              ref={primaryConsentHeadingRef}
+              tabIndex={-1}
+            >
+              允許 Claro 使用 Codex 統一專業拼法？
             </div>
             <p id={consentHelpId}>
-              Claro 會先在本機完成語音辨識，再把轉錄文字、你儲存的正確拼法清單與個人詞彙清單送給
-              OpenAI Codex。Codex 最多提出三個只涉及大小寫、空白、底線、連字號或標點的英文拼法正規化；字母不同或同音誤認不會自動替換，請改用個人字典。數字、否定、版本、URL、句序與語氣由本機內容保護鎖定。音訊不會送出。Codex
-              不可用、逾時或結果未通過內容保護時，Claro 會使用本機結果。
+              Claro 會先在這台 Mac 完成語音辨識，再把限定的文字資料送給
+              OpenAI Codex。每次最多採用三個符合極窄結構規則的連字號修正；這能降低誤改，
+              但不能證明語意一定正確，重要文字仍請檢查。
+            </p>
+            <ul aria-describedby={capabilityExampleId}>
+              <li>
+                <b>會送出：</b>
+                轉錄文字，以及與本次轉錄相關且內容保護可採用的正確拼法與個人詞彙正確文字；
+                三類候選詞合計最多 32 項。
+              </li>
+              <li>
+                <b>選擇性送出：</b>
+                只有移除單一尾端連字號後，字母與大小寫逐字相同、且內容保護可採用的有限畫面候選詞；需另外同意。
+              </li>
+              <li>
+                <b>不會送出：</b>
+                音訊、App 名、視窗標題、周邊完整句子、整個畫面、整個專案或 API Key。
+              </li>
+              <li>
+                <b>安全退回：</b>
+                找不到可採用候選時完全不呼叫 Codex、也不使用額度；Codex
+                不可用、逾時或結果未通過內容保護時，使用本機結果。
+              </li>
+            </ul>
+            <p className="mt-2">
+              同意會綁定目前的登入類型與 Codex CLI
+              版本；Claro 無法辨識帳戶身分。若你在同一登入類型下切換帳戶，停用或重新確認前，文字會送到當下登入的帳戶。
             </p>
             <label className="local-only-control mt-2">
               <input
@@ -234,11 +568,12 @@ export default function CodexProviderPanel({
                 name="codex-consent"
                 checked={acknowledged}
                 disabled={enablePending}
-                aria-describedby={consentHelpId}
+                aria-describedby={`${consentHelpId} ${capabilityExampleId}`}
                 onChange={(event) => setAcknowledged(event.target.checked)}
               />
               <span>
-                我了解上述文字資料會送到 OpenAI、只會自動套用受控拼法正規化，並使用我的 Codex 帳戶額度或計費設定。
+                我了解上述文字資料會送到 OpenAI，並使用目前 Codex
+                登入的額度或計費設定。
               </span>
             </label>
             <label className="local-only-control mt-2">
@@ -256,8 +591,8 @@ export default function CodexProviderPanel({
             </label>
             <p id={contextHelpId}>
               {globalContextEnabled
-                ? "只送詞彙清單來判斷專業名稱，不送周邊完整句子、音訊或整個專案。"
-                : "目前「螢幕上下文」已關閉，因此只會送轉錄文字與校字偏好。"}
+                ? "只送移除單一尾端連字號後，字母與大小寫逐字相同、且內容保護可採用的候選詞。"
+                : "目前「螢幕上下文」已關閉，因此只會送轉錄文字，以及與本次轉錄相關且內容保護可採用的正確拼法與個人詞彙正確文字。"}
             </p>
           </div>
           <div className="consent-actions">
@@ -277,48 +612,18 @@ export default function CodexProviderPanel({
         </section>
       )}
 
-      {consentReady && (
+      {consentValid && (
         <>
-          <div className="row" style={{ alignItems: "flex-start" }}>
-            <div className="min-w-0 flex-1">
-              <label className="row-label" htmlFor={correctionId}>
-                正確拼法清單（選填）
-              </label>
-              <div className="row-sub" id={correctionHelpId}>
-                每行一個，或用逗號分隔，例如「MLX、PyTorch、Tauri」。這不是 system prompt；
-                只有完整列出的英文拼法可作為正規化目標，不會授權把相近但字母不同的單字猜成它。其他敘述不會放寬內容保護。真正的固定錯字請用個人字典。清單會隨每次 Codex 校字送出，請勿填入密碼或金鑰。
-              </div>
-              <textarea
-                id={correctionId}
-                className="text-area no-drag mt-2 w-full"
-                name="codex-correction-preferences"
-                rows={4}
-                maxLength={MAX_CORRECTION_PREFERENCES}
-                autoComplete="off"
-                spellCheck={false}
-                translate="no"
-                disabled={preferencesSaving}
-                placeholder={"MLX\nPyTorch\nTauri"}
-                value={correctionDraft}
-                aria-describedby={correctionHelpId}
-                onChange={(event) => setCorrectionDraft(event.target.value)}
-              />
-              <div
-                className="text-[11px] mt-1"
-                style={{ color: "var(--faint)" }}
-              >
-                {correctionDraft.length}/{MAX_CORRECTION_PREFERENCES} 字
-              </div>
-            </div>
-            <button
-              className="btn no-drag"
-              disabled={!correctionChanged || preferencesSaving}
-              onClick={() =>
-                onSaveCorrectionPreferences(normalizedDraft)
-              }
-            >
-              {preferencesSaving ? "儲存中…" : "儲存正確拼法"}
-            </button>
+          <div
+            className="codex-data-boundary"
+            ref={connectedContentRef}
+            role="note"
+            tabIndex={-1}
+          >
+            <b>{codexActive ? "資料界線：" : "同意仍有效，目前未使用："}</b>
+            {codexActive
+              ? "音訊與辨識留在本機；Codex 只收到已同意的文字範圍，失敗時使用本機結果。"
+              : "目前不是可執行的專業校字狀態，因此聽寫不會呼叫 Codex；切回專業校字後才會使用既有同意。"}
           </div>
 
           <div className="row">
@@ -328,12 +633,13 @@ export default function CodexProviderPanel({
               </span>
               <div className="row-sub" id={contextHelpId}>
                 {globalContextEnabled
-                  ? "開啟後會送出本機萃取的候選詞彙，不送周邊完整句子、音訊或整個專案。"
+                  ? "開啟後只送移除單一尾端連字號後，字母與大小寫逐字相同、且內容保護可採用的候選詞。"
                   : "目前「螢幕上下文」已關閉，不會送出任何畫面詞彙。"}
               </div>
             </div>
             <label className="local-only-control">
               <input
+                ref={contextToggleRef}
                 type="checkbox"
                 name="codex-share-context-terms"
                 checked={
@@ -367,20 +673,26 @@ export default function CodexProviderPanel({
             <section
               className="consent-panel"
               aria-labelledby={contextConsentTitleId}
+              aria-busy={preferencesSaving}
             >
               <div className="min-w-0 flex-1">
-                <div className="consent-title" id={contextConsentTitleId}>
+                <div
+                  className="consent-title"
+                  id={contextConsentTitleId}
+                  ref={contextConsentHeadingRef}
+                  tabIndex={-1}
+                >
                   允許 Codex 使用有限畫面詞彙？
                 </div>
                 <p>
-                  Claro
-                  只會送出本機從目前畫面萃取的候選詞彙，用來判斷專業名稱；不送周邊完整句子、音訊或整個專案。
+                  Claro 只會送出目前畫面中，移除單一尾端連字號後，字母與大小寫逐字相同、且內容保護可採用的候選詞；不送周邊完整句子、音訊或整個專案。
                 </p>
                 <label className="local-only-control mt-2">
                   <input
                     type="checkbox"
                     name="codex-context-terms-consent"
                     checked={contextTermsAcknowledged}
+                    disabled={preferencesSaving}
                     onChange={(event) =>
                       setContextTermsAcknowledged(event.target.checked)
                     }
@@ -391,19 +703,20 @@ export default function CodexProviderPanel({
               <div className="consent-actions">
                 <button
                   className="btn no-drag"
-                  onClick={() => setConfirmContextTerms(false)}
+                  disabled={preferencesSaving}
+                  onClick={closeContextConsent}
                 >
                   保持關閉
                 </button>
                 <button
                   className="btn-primary no-drag"
-                  disabled={!contextTermsAcknowledged}
+                  disabled={!contextTermsAcknowledged || preferencesSaving}
                   onClick={() => {
-                    setConfirmContextTerms(false);
+                    restoreContextToggleFocus.current = true;
                     onShareContextTermsChange(true);
                   }}
                 >
-                  允許有限畫面詞彙
+                  {preferencesSaving ? "正在儲存…" : "允許有限畫面詞彙"}
                 </button>
               </div>
             </section>
@@ -413,8 +726,9 @@ export default function CodexProviderPanel({
             <div className="min-w-0 flex-1">
               <span className="row-label">測試 Codex 校字</span>
               <div className="row-sub">
-                送出一段 Claro
-                合成測試文字；不使用目前視窗內容，可能計入少量 Codex 使用量。
+                {codexActive
+                  ? "送出一段 Claro 合成測試文字；不使用目前視窗內容，但會使用 Codex 額度，實際用量取決於目前的 CLI、模型與帳戶設定。"
+                  : "目前未使用 Codex；切回可執行的專業校字狀態後才能測試。"}
               </div>
               {testState.phase === "success" && (
                 <div className="setup-inline-state mt-2" role="status">
@@ -452,7 +766,12 @@ export default function CodexProviderPanel({
             ) : (
               <button
                 className="btn no-drag"
-                disabled={!statusReady || preferencesSaving || enablePending}
+                disabled={
+                  !statusReady ||
+                  !codexActive ||
+                  preferencesSaving ||
+                  enablePending
+                }
                 onClick={onTest}
               >
                 測試

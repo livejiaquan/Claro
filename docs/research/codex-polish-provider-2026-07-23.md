@@ -36,8 +36,14 @@ Codex 可以整合進 Claro，但定位應是「使用既有 Codex 登入的實�
 | Prompt injection | Context 嘗試要求執行 `npm publish`、輸出 `PWNED` | 原轉錄保持不變，未服從注入 | 4.84 s | 13,102 |
 
 `Pie Torch→PyTorch` 是收斂前的模型能力 spike，不是 production guard 目前會自動採用的
-結果。它證明模型能猜到目標，也同時暴露 target-only fuzzy correction 無法證明語意安全；
-正式路徑只會自動採用 `Py Torch→PyTorch` 這類字母序列相同的拼法正規化。
+結果。它證明模型能猜到目標，也同時暴露 target-only fuzzy correction 無法證明語意安全。
+2026-07-26 adversarial review 又實際證實 `A PI→API` 與
+`The Rapist→TheRapist` 和原本允許的空白合併具有相同局部形狀，因此 production
+已全面關閉自動 whitespace merge；`Py Torch→PyTorch` 等已知 source→target
+改由個人字典確定性處理。Codex 只暫留尾端兩字母單連字號的極窄實驗 heuristic
+（如 `Clau-de→Claude`）；即使已擋下 `Tell-us→Tellus`、`Call-in→Callin`
+等功能詞碰撞，`Walk-er→Walker` 類型仍顯示局部形狀不是語意證明；
+正式推薦前必須以真人 false-correction gate 決定是否移除。
 
 這兩筆只證明路徑與基本安全 prompt 可行，不能代表產品 p50／p95。它們已顯示：
 
@@ -91,9 +97,16 @@ Codex 選項維持「實驗」直到以下條件都有可重跑證據：
 - 正例 term exact accuracy 有提升，false-correction rate 可接受
 - warm p50/p95、timeout rate 與 token 使用量已量測並如實呈現在產品定位
 
-截至 2026-07-23，MVP 已通過 fake CLI 隔離／取消／timeout／descendant regressions、
-169 個 Rust 單元測試、52 個 Vitest＋1 個 Node test、Codex 0.145.0 真實合成
-`Py Torch→PyTorch` smoke、arm64 debug `.app`／DMG 打包，以及 780×560 Playwright
-成功／逾時／雙層 Context 同意狀態驗收（無水平溢位，console 0 error／warning）。
-這些是整合與安全回歸證據，不取代多人真人 corpus、warm latency、token 與
-false-correction 發布 gate。
+截至 2026-07-26，深度 review 後的整合樹已通過 192 個 Rust 單元測試、
+76 個 Vitest、6 個 Node test、ESLint、TypeScript production build、
+`cargo fmt --check`、全 targets Clippy `-D warnings`、UI QA fixture 建置與
+`git diff --check`。其中 Codex audit 以主 `codex exec` stdin 是否真的開始寫入
+payload 為準，不再把 runtime/version/login 預檢誤標為已外送；provider 暫時
+不可用時也不會顯示為使用中。本輪刻意沒有呼叫真實 Codex 或使用帳戶額度。
+
+2026-07-23 的真實 smoke 與 Playwright 畫面只代表當時較寬鬆的 prototype
+contract；自動空白合併已被 adversarial review 否決，不能再拿舊
+`Py Torch→PyTorch` 成功案例當目前 production guard 的正例。本輪瀏覽器控制不可用，
+所以現有 UI 只完成 source、DOM、accessibility contract 與 QA fixture 檢查，
+沒有冒充正式 `.app` screenshot／窄視窗視覺驗收。以上證據仍不取代多人真人
+corpus、warm latency、token、false-correction 與簽章發布 gate。

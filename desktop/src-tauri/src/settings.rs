@@ -96,6 +96,12 @@ pub fn default_config() -> Map<String, Value> {
         "codex_context_consent_version": 0,
         "codex_context_consent_target": null,
         "codex_auth_kind": null,
+        // contract-v2 同時綁 raw version、launcher bytes 與完整 feature
+        // capability；任一項更新都必須重新驗證與同意。
+        "codex_cli_version": "",
+        "codex_cli_raw_version": "",
+        "codex_executable_sha256": "",
+        "codex_capability_fingerprint": "",
         // 進階救援欄位；UI 不要求一般使用者自行找路徑。
         "codex_cli_path": "",
     }) else {
@@ -299,6 +305,15 @@ impl Settings {
             return false;
         }
 
+        if self.llm_provider() == "codex" {
+            return self.codex_consent_target().is_some_and(|current_target| {
+                self.raw
+                    .get("cloud_consent_target")
+                    .and_then(Value::as_str)
+                    .is_some_and(|target| target == current_target)
+            });
+        }
+
         let Some(current_target) = crate::polish::cloud_consent_target(self) else {
             return true;
         };
@@ -382,14 +397,62 @@ impl Settings {
             .map(str::to_string)
     }
 
+    pub fn codex_cli_version(&self) -> Option<String> {
+        self.raw
+            .get("codex_cli_version")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
+    pub fn codex_cli_raw_version(&self) -> Option<String> {
+        self.nonempty_string("codex_cli_raw_version")
+    }
+
+    pub fn codex_executable_sha256(&self) -> Option<String> {
+        self.nonempty_string("codex_executable_sha256")
+    }
+
+    pub fn codex_capability_fingerprint(&self) -> Option<String> {
+        self.nonempty_string("codex_capability_fingerprint")
+    }
+
+    fn nonempty_string(&self, key: &str) -> Option<String> {
+        self.raw
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
+    pub fn codex_consent_target(&self) -> Option<String> {
+        Some(crate::codex::contract_consent_target_values(
+            self.codex_auth_mode()?,
+            &self.codex_cli_version()?,
+            &self.codex_cli_raw_version()?,
+            &self.codex_cli_path()?,
+            &self.codex_executable_sha256()?,
+            &self.codex_capability_fingerprint()?,
+        ))
+    }
+
+    pub fn codex_contract_matches(&self, contract: &crate::codex::CodexCapabilityContract) -> bool {
+        self.codex_cli_path().as_deref() == Some(contract.executable_path.as_str())
+            && self.codex_cli_version().as_deref() == Some(contract.version.as_str())
+            && self.codex_cli_raw_version().as_deref() == Some(contract.raw_version.as_str())
+            && self.codex_executable_sha256().as_deref()
+                == Some(contract.executable_sha256.as_str())
+            && self.codex_capability_fingerprint().as_deref()
+                == Some(contract.capability_fingerprint.as_str())
+    }
+
     pub fn codex_context_consent_valid(&self) -> bool {
-        let Some(auth_mode) = self.codex_auth_mode() else {
+        let Some(target) = self.codex_consent_target() else {
             return false;
         };
-        let target = format!(
-            "{}:context-terms-v1",
-            crate::codex::consent_target(auth_mode)
-        );
+        let target = format!("{target}:context-terms-v1");
         self.raw
             .get("codex_context_consent_version")
             .and_then(Value::as_u64)
@@ -742,13 +805,25 @@ mod tests {
     fn codex_consent_is_bound_to_auth_contract_and_separate_context_scope() {
         let dir = tempdir();
         let path = dir.join("codex-consent.json");
-        let chat_target = crate::codex::consent_target(crate::codex::CodexAuthMode::ChatGpt);
+        let chat_target = crate::codex::contract_consent_target_values(
+            crate::codex::CodexAuthMode::ChatGpt,
+            "0.145.0",
+            "codex-cli 0.145.0",
+            "/test/codex",
+            "executable-hash",
+            "capability-hash",
+        );
         fs::write(
             &path,
             json!({
                 "llm_provider": "codex",
                 "local_only": false,
                 "codex_auth_kind": "chat_gpt",
+                "codex_cli_version": "0.145.0",
+                "codex_cli_raw_version": "codex-cli 0.145.0",
+                "codex_cli_path": "/test/codex",
+                "codex_executable_sha256": "executable-hash",
+                "codex_capability_fingerprint": "capability-hash",
                 "cloud_consent_version": CLOUD_CONSENT_VERSION,
                 "cloud_consent_target": chat_target,
                 "codex_context_consent_version": CODEX_CONTEXT_CONSENT_VERSION,
@@ -761,6 +836,39 @@ mod tests {
         assert!(settings.cloud_consent_valid());
         assert!(settings.codex_context_consent_valid());
 
+        update_config_key(&path, "codex_cli_version", Value::String("0.146.0".into())).unwrap();
+        let changed_version = Settings::from_path(&path);
+        assert!(!changed_version.cloud_consent_valid());
+        assert!(!changed_version.codex_context_consent_valid());
+
+        update_config_key(&path, "codex_cli_version", Value::String("0.145.0".into())).unwrap();
+        update_config_key(
+            &path,
+            "codex_capability_fingerprint",
+            Value::String("changed-capability".into()),
+        )
+        .unwrap();
+        let changed_capability = Settings::from_path(&path);
+        assert!(!changed_capability.cloud_consent_valid());
+        assert!(!changed_capability.codex_context_consent_valid());
+
+        update_config_key(
+            &path,
+            "codex_capability_fingerprint",
+            Value::String("capability-hash".into()),
+        )
+        .unwrap();
+        update_config_key(
+            &path,
+            "codex_cli_path",
+            Value::String("/different/codex".into()),
+        )
+        .unwrap();
+        let changed_path = Settings::from_path(&path);
+        assert!(!changed_path.cloud_consent_valid());
+        assert!(!changed_path.codex_context_consent_valid());
+
+        update_config_key(&path, "codex_cli_path", Value::String("/test/codex".into())).unwrap();
         update_config_key(&path, "codex_auth_kind", Value::String("api_key".into())).unwrap();
         let changed_auth = Settings::from_path(&path);
         assert!(!changed_auth.cloud_consent_valid());

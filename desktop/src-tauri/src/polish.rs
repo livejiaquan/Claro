@@ -122,6 +122,10 @@ pub struct PolishMetadata {
     pub outcome: PolishOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<PolishFallbackReason>,
+    /// `Some(false)` 表示沒有任何轉錄 payload byte 寫入主 `codex exec`；
+    /// `Some(true)` 表示傳送已開始，但不保證處理完成或實際額度。非 Codex 路徑為 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_payload_started: Option<bool>,
     /// 僅供同一 process 的 paste linearization；不得寫進 history。
     #[serde(skip)]
     pub codex_policy_epoch: Option<u64>,
@@ -230,13 +234,13 @@ pub fn endpoint_origin(s: &Settings) -> Option<String> {
 }
 
 /// 雲端同意必須綁定到可比較的精確目標。custom 綁 origin；Codex 另綁
-/// CLI 目前登入類型與 runner contract 版本，登入方式改變後不可沿用舊同意。
+/// CLI 目前登入類型、實際版本與 runner contract，登入方式或 CLI 更新後不可沿用。
 pub fn cloud_consent_target(s: &Settings) -> Option<String> {
     match s.llm_provider().as_str() {
         "custom" if !custom_endpoint_is_loopback(&s.llm_base_url()).unwrap_or(false) => {
             custom_endpoint_origin(&s.llm_base_url()).map(|origin| format!("custom:{origin}"))
         }
-        "codex" => s.codex_auth_mode().map(crate::codex::consent_target),
+        "codex" => s.codex_consent_target(),
         _ => None,
     }
 }
@@ -335,7 +339,13 @@ pub fn blocked_reason(s: &Settings) -> Option<&'static str> {
     if mode == PolishMode::Organize && !s.organize_consent_valid() {
         return Some("organize_consent_required");
     }
-    match s.llm_provider().as_str() {
+    let provider = s.llm_provider();
+    if mode == PolishMode::Correct && provider != "codex" {
+        // 一般 provider 目前只有 free-text CLEAN/ORGANIZE contract，沒有
+        // 結構化 correction proposal；不可把 CLEAN 結果冒充「專業校字」。
+        return Some("provider_unavailable");
+    }
+    match provider.as_str() {
         "off" | "" => Some("provider_missing"),
         "codex" if mode != PolishMode::Correct => Some("provider_unavailable"),
         "codex" if crate::codex::resolve_executable(s.codex_cli_path().as_deref()).is_none() => {
@@ -464,7 +474,6 @@ fn canonical_preference_terms(preferences: &str) -> Vec<String> {
                         || matches!(c, '.' | '_' | '-' | '+')
                 })
         })
-        .take(32)
         .map(str::to_string)
         .collect()
 }
@@ -490,6 +499,71 @@ fn spellings_are_normalization_equivalent(left: &str, right: &str) -> bool {
     left.len() >= 2 && left == right
 }
 
+fn canonical_spelling_is_distinctive(value: &str) -> bool {
+    value.chars().any(char::is_uppercase)
+        || value
+            .chars()
+            .any(|character| matches!(character, '_' | '-' | '.' | '+'))
+}
+
+fn spelling_separator(character: char) -> bool {
+    character.is_ascii_whitespace() || matches!(character, '_' | '-' | '.' | '+')
+}
+
+/// Target-only allowlist 只能證明「目標被允許」，不能證明 separator edit 不改義：
+/// `G PT→GPT` 與 `A PI→API`、`Py Torch→PyTorch` 與
+/// `The Rapist→TheRapist` 都有相同的局部形狀。Phase 1 因此全面拒絕
+/// whitespace merge，只保留非常窄、明確標示為實驗 heuristic 的尾端兩字母
+/// 誤插連字號（`Clau-de→Claude`）。這仍不是語意證明；正式推薦前必須通過
+/// 真人 false-correction gate。任何已知 source→target 應優先走個人字典。
+fn spelling_edit_passes_narrow_heuristic(source: &str, target: &str) -> bool {
+    if protected_english_semantic_token(source) || protected_english_semantic_token(target) {
+        return false;
+    }
+    if !target
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+
+    let collapsed_source: String = source
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    if collapsed_source != target {
+        return false;
+    }
+
+    let separators: Vec<char> = source
+        .chars()
+        .filter(|character| spelling_separator(*character))
+        .collect();
+    if separators.is_empty() {
+        return false;
+    }
+
+    let segments: Vec<&str> = source
+        .split(spelling_separator)
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() < 2
+        || segments.iter().any(|segment| {
+            !segment
+                .chars()
+                .all(|character| character.is_ascii_alphabetic())
+        })
+    {
+        return false;
+    }
+
+    if separators.len() == 1 && separators[0] == '-' && segments.len() == 2 {
+        return segments[0].chars().count() >= 4 && segments[1].chars().count() == 2;
+    }
+
+    false
+}
+
 fn safe_ascii_spelling(value: &str) -> bool {
     value.is_ascii()
         && value.chars().any(|c| c.is_ascii_alphabetic())
@@ -509,7 +583,42 @@ fn protected_english_semantic_token(value: &str) -> bool {
         .any(|token| {
             matches!(
                 token.as_str(),
-                "no" | "not"
+                "a" | "an"
+                    | "the"
+                    | "i"
+                    | "me"
+                    | "my"
+                    | "we"
+                    | "us"
+                    | "our"
+                    | "you"
+                    | "he"
+                    | "him"
+                    | "his"
+                    | "she"
+                    | "her"
+                    | "it"
+                    | "its"
+                    | "they"
+                    | "them"
+                    | "their"
+                    | "in"
+                    | "on"
+                    | "at"
+                    | "to"
+                    | "of"
+                    | "or"
+                    | "as"
+                    | "by"
+                    | "up"
+                    | "be"
+                    | "am"
+                    | "is"
+                    | "are"
+                    | "do"
+                    | "go"
+                    | "no"
+                    | "not"
                     | "never"
                     | "none"
                     | "without"
@@ -663,6 +772,11 @@ pub(crate) fn authorize_correction_proposal(
         if !spellings_are_normalization_equivalent(&edit.from, &edit.to) {
             return Err(CorrectionGuardRejection::DissimilarEdit);
         }
+        // 全小寫普通單字的空白／標點變化很容易跨越詞義邊界（resign/re-sign、
+        // therapist/the rapist），不能只憑 target-only allowlist 自動採用。
+        if !canonical_spelling_is_distinctive(&edit.to) {
+            return Err(CorrectionGuardRejection::DissimilarEdit);
+        }
         total_source_chars += edit.from.chars().count();
         if edit.from.chars().any(char::is_numeric) || edit.to.chars().any(char::is_numeric) {
             return Err(CorrectionGuardRejection::NumericEdit);
@@ -680,6 +794,12 @@ pub(crate) fn authorize_correction_proposal(
         };
         if !has_ascii_spelling_boundaries(original, start, end) {
             return Err(CorrectionGuardRejection::InvalidEdit);
+        }
+        // source 必須提供可本機驗證的大小寫／分隔證據；target-only allowlist
+        // 不能授權 therapist→The Rapist、us→US 或 polish→Polish。
+        // 放在 source uniqueness 之後，讓重疊 occurrence 先按真正原因拒絕。
+        if !spelling_edit_passes_narrow_heuristic(&edit.from, &edit.to) {
+            return Err(CorrectionGuardRejection::DissimilarEdit);
         }
         if edit_touches_protected_token(original, start, end) {
             return Err(CorrectionGuardRejection::ProtectedEdit);
@@ -1677,6 +1797,7 @@ fn fallback_reason_for_block(reason: &str) -> PolishFallbackReason {
 
 fn fallback_result(settings: &Settings, text: &str, reason: PolishFallbackReason) -> PolishResult {
     let provider = settings.llm_provider();
+    let codex_payload_started = (provider == "codex").then_some(false);
     PolishResult {
         text: text.to_string(),
         metadata: PolishMetadata {
@@ -1685,10 +1806,23 @@ fn fallback_result(settings: &Settings, text: &str, reason: PolishFallbackReason
             changed: false,
             outcome: PolishOutcome::Fallback,
             fallback_reason: Some(reason),
+            codex_payload_started,
             codex_policy_epoch: None,
             codex_context_used: false,
         },
     }
+}
+
+fn codex_fallback_with_payload_state(
+    settings: &Settings,
+    text: &str,
+    reason: PolishFallbackReason,
+    payload_started: bool,
+) -> PolishResult {
+    let mut result = fallback_result(settings, text, reason);
+    result.metadata.provider = Some("codex".into());
+    result.metadata.codex_payload_started = Some(payload_started);
+    result
 }
 
 fn transform_with<F>(settings: &Settings, text: &str, context: &str, generate: F) -> PolishResult
@@ -1705,6 +1839,7 @@ where
                 changed: false,
                 outcome: PolishOutcome::Raw,
                 fallback_reason: None,
+                codex_payload_started: None,
                 codex_policy_epoch: None,
                 codex_context_used: false,
             },
@@ -1748,6 +1883,7 @@ where
                         PolishOutcome::Unchanged
                     },
                     fallback_reason: None,
+                    codex_payload_started: None,
                     codex_policy_epoch: None,
                     codex_context_used: false,
                 },
@@ -1767,9 +1903,8 @@ fn codex_fallback(error: crate::codex::CodexError) -> PolishFallbackReason {
         CodexError::Cancelled => PolishFallbackReason::CodexCancelled,
         CodexError::Timeout => PolishFallbackReason::CodexTimeout,
         CodexError::RateLimited => PolishFallbackReason::CodexUsageLimited,
-        CodexError::AuthRequired | CodexError::ConsentChanged => {
-            PolishFallbackReason::CodexAuthRequired
-        }
+        CodexError::AuthRequired => PolishFallbackReason::CodexAuthRequired,
+        CodexError::ConsentChanged => PolishFallbackReason::CloudConsentRequired,
         CodexError::InvalidOutput | CodexError::OutputTooLarge => {
             PolishFallbackReason::CodexInvalidOutput
         }
@@ -1803,6 +1938,131 @@ fn bounded_unique_terms(values: impl IntoIterator<Item = String>, limit: usize) 
     output
 }
 
+const CODEX_OUTBOUND_TERM_LIMIT: usize = 32;
+
+fn transcript_relevant_terms(
+    transcript: &str,
+    terms: &[String],
+    limit: usize,
+    excluded_terms: &[String],
+) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut transcript_tokens = Vec::new();
+    let mut token_start = None;
+    for (index, character) in transcript.char_indices() {
+        if character.is_ascii_alphanumeric() {
+            token_start.get_or_insert(index);
+        } else if let Some(start) = token_start.take() {
+            transcript_tokens.push((start, index));
+        }
+    }
+    if let Some(start) = token_start {
+        transcript_tokens.push((start, transcript.len()));
+    }
+    bounded_unique_terms(
+        terms.iter().filter_map(|term| {
+            if excluded_terms.iter().any(|excluded| excluded == term) {
+                return None;
+            }
+            let target = normalized_ascii_spelling(term);
+            if target.len() < 2 {
+                return None;
+            }
+            let matches_transcript = transcript_tokens.iter().enumerate().any(|(start, _)| {
+                transcript_tokens
+                    .iter()
+                    .skip(start)
+                    .take(5)
+                    .any(|(_, end)| {
+                        let source_start = transcript_tokens[start].0;
+                        let source = &transcript[transcript_tokens[start].0..*end];
+                        if normalized_ascii_spelling(source) != target {
+                            return false;
+                        }
+                        let proposal = CorrectionProposal {
+                            text: format!(
+                                "{}{}{}",
+                                &transcript[..source_start],
+                                term,
+                                &transcript[*end..]
+                            ),
+                            replacements: vec![CorrectionEdit {
+                                from: source.to_string(),
+                                to: term.clone(),
+                            }],
+                        };
+                        authorize_correction_proposal(
+                            transcript,
+                            &proposal,
+                            std::slice::from_ref(term),
+                            "",
+                        )
+                        .is_ok()
+                    })
+            });
+            matches_transcript.then(|| term.clone())
+        }),
+        limit,
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CodexOutboundTerms {
+    vocabulary: Vec<String>,
+    canonical_spellings: Vec<String>,
+    context: Vec<String>,
+}
+
+impl CodexOutboundTerms {
+    fn is_empty(&self) -> bool {
+        self.vocabulary.is_empty() && self.canonical_spellings.is_empty() && self.context.is_empty()
+    }
+}
+
+fn select_codex_outbound_terms(
+    transcript: &str,
+    local_terms: &[String],
+    canonical_terms: &[String],
+    screen_terms: &[String],
+) -> CodexOutboundTerms {
+    // 三欄共用一個總預算，並依「使用者本機詞彙 → Codex 專用正確拼法 →
+    // 臨時畫面候選」排序。每個 term 必須先在本次 transcript 找到唯一且能通過
+    // 完整 correction guard 的 source；無關詞、純 case change 與 guard 不可能
+    // 採用的 target 不會只因存在於本機設定就外送。
+    let vocabulary =
+        transcript_relevant_terms(transcript, local_terms, CODEX_OUTBOUND_TERM_LIMIT, &[]);
+    let mut selected = vocabulary.clone();
+    let canonical_spellings = transcript_relevant_terms(
+        transcript,
+        canonical_terms,
+        CODEX_OUTBOUND_TERM_LIMIT.saturating_sub(selected.len()),
+        &selected,
+    );
+    selected.extend(canonical_spellings.iter().cloned());
+    let context = transcript_relevant_terms(
+        transcript,
+        screen_terms,
+        CODEX_OUTBOUND_TERM_LIMIT.saturating_sub(selected.len()),
+        &selected,
+    );
+    CodexOutboundTerms {
+        vocabulary,
+        canonical_spellings,
+        context,
+    }
+}
+
+fn codex_dispatch_policy_is_current(initial: &Settings, current: &Settings) -> bool {
+    initial.llm_provider() == "codex"
+        && initial.polish_mode() == PolishMode::Correct
+        && current.llm_provider() == "codex"
+        && current.polish_mode() == PolishMode::Correct
+        && initial.vocabulary() == current.vocabulary()
+        && initial.dictionary() == current.dictionary()
+}
+
 fn transform_codex_with_cancel(
     settings: &Settings,
     text: &str,
@@ -1814,9 +2074,10 @@ fn transform_codex_with_cancel(
     // 這份 fresh snapshot 與 generation 一起交給 runner，任何後續撤銷都會讓
     // stdin writer fail closed。字典／詞彙若在 STT 期間變動，也不送舊候選。
     let (current, policy_epoch) = crate::codex::policy_snapshot(Settings::load);
-    if settings.vocabulary() != current.vocabulary()
-        || settings.dictionary() != current.dictionary()
-    {
+    // Pipeline 的初始 branch 來自 STT 前快照。使用者若在辨識途中切成 RAW
+    // 或其他 provider，blocked_reason(RAW) 本身不會阻擋；必須在任何 outbound
+    // payload 建立前明確要求 Codex/CORRECT 仍是最新政策。
+    if !codex_dispatch_policy_is_current(settings, &current) {
         return fallback_result(&current, text, PolishFallbackReason::CodexCancelled);
     }
     if let Some(reason) = blocked_reason(&current) {
@@ -1825,18 +2086,51 @@ fn transform_codex_with_cancel(
     let Some(expected_auth) = current.codex_auth_mode() else {
         return fallback_result(&current, text, PolishFallbackReason::CodexAuthRequired);
     };
+    let Some(expected_version) = current.codex_cli_version() else {
+        return fallback_result(&current, text, PolishFallbackReason::CloudConsentRequired);
+    };
+    let Some(expected_contract_target) = current.codex_consent_target() else {
+        return fallback_result(&current, text, PolishFallbackReason::CloudConsentRequired);
+    };
 
     // 個人詞彙是使用者明確建立的正確拼法；畫面詞彙則只有在第二層同意有效
     // 時加入。兩者分欄傳給 runner，避免模型誤把畫面候選當成較高權重指令。
-    let vocabulary_terms = bounded_unique_terms(local_terms.iter().cloned(), 32);
-    let shared_context_terms = if current.context_enabled()
+    let share_screen_terms = current.context_enabled()
         && current.codex_share_context_terms()
-        && current.codex_context_consent_valid()
-    {
-        bounded_unique_terms(screen_terms.iter().cloned(), 32)
-    } else {
-        Vec::new()
-    };
+        && current.codex_context_consent_valid();
+    let canonical_candidates = canonical_preference_terms(&current.codex_correction_preferences());
+    let outbound_terms = select_codex_outbound_terms(
+        text,
+        local_terms,
+        &canonical_candidates,
+        if share_screen_terms {
+            screen_terms
+        } else {
+            &[]
+        },
+    );
+    if outbound_terms.is_empty() {
+        // 沒有任何本機 guard 可採用的 target 時，Codex 按固定 contract
+        // 不可能產生合法 edit。直接回本機結果，避免無意義的延遲、網路與額度。
+        return PolishResult {
+            text: text.to_string(),
+            metadata: PolishMetadata {
+                mode: PolishMode::Correct,
+                provider: Some("codex".into()),
+                changed: false,
+                outcome: PolishOutcome::Unchanged,
+                fallback_reason: None,
+                codex_payload_started: Some(false),
+                codex_policy_epoch: None,
+                codex_context_used: false,
+            },
+        };
+    }
+    let CodexOutboundTerms {
+        vocabulary: vocabulary_terms,
+        canonical_spellings,
+        context: shared_context_terms,
+    } = outbound_terms;
     let mut approved_terms = vocabulary_terms.clone();
     for term in &shared_context_terms {
         if !approved_terms.contains(term) {
@@ -1847,21 +2141,34 @@ fn transform_codex_with_cancel(
         transcript: text.to_string(),
         context_terms: shared_context_terms,
         vocabulary_terms,
-        canonical_spellings: canonical_preference_terms(&current.codex_correction_preferences()),
+        // 含數字、無關、純 case change 或 guard 不可能採用的項目都已在本機
+        // 過濾；固定錯字仍交給 deterministic 個人字典。
+        canonical_spellings,
         mode: "correct".into(),
     };
-    let output = match crate::codex::run(
+    let run_audit = crate::codex::CodexRunAudit::default();
+    let output = match crate::codex::run_with_audit(
         current.codex_cli_path().as_deref(),
         &request,
         cancel,
-        expected_auth,
-        policy_epoch,
-        Duration::from_secs(8),
+        crate::codex::CodexRunPolicy {
+            auth_mode: expected_auth,
+            cli_version: &expected_version,
+            contract_target: &expected_contract_target,
+            policy_epoch,
+            timeout: Duration::from_secs(8),
+        },
+        &run_audit,
     ) {
         Ok(output) => output,
         Err(error) => {
             tracing::warn!("Codex polish failed safely: {error}");
-            return fallback_result(&current, text, codex_fallback(error));
+            return codex_fallback_with_payload_state(
+                &current,
+                text,
+                codex_fallback(error),
+                run_audit.payload_started(),
+            );
         }
     };
 
@@ -1885,7 +2192,12 @@ fn transform_codex_with_cancel(
                 || !latest.codex_share_context_terms()
                 || !latest.codex_context_consent_valid()))
     {
-        return fallback_result(&latest, text, PolishFallbackReason::CloudConsentRequired);
+        return codex_fallback_with_payload_state(
+            &latest,
+            text,
+            PolishFallbackReason::CloudConsentRequired,
+            true,
+        );
     }
 
     let proposal = CorrectionProposal {
@@ -1919,6 +2231,7 @@ fn transform_codex_with_cancel(
                         PolishOutcome::Unchanged
                     },
                     fallback_reason: None,
+                    codex_payload_started: Some(true),
                     codex_policy_epoch: Some(policy_epoch),
                     codex_context_used: context_was_shared,
                 },
@@ -1926,7 +2239,12 @@ fn transform_codex_with_cancel(
         }
         Err(reason) => {
             tracing::warn!("Codex correction rejected by local guard: {reason:?}");
-            fallback_result(&current, text, PolishFallbackReason::CodexOutputRejected)
+            codex_fallback_with_payload_state(
+                &current,
+                text,
+                PolishFallbackReason::CodexOutputRejected,
+                true,
+            )
         }
     }
 }
@@ -2285,6 +2603,48 @@ mod tests {
     }
 
     #[test]
+    fn stale_codex_dispatch_is_blocked_before_raw_or_provider_switch_can_send() {
+        let initial = settings_from(json!({
+            "llm_provider": "codex",
+            "polish_mode": "correct",
+            "vocabulary": ["PyTorch"],
+            "dictionary": {"Py Torch": "PyTorch"}
+        }));
+        let unchanged = settings_from(json!({
+            "llm_provider": "codex",
+            "polish_mode": "correct",
+            "vocabulary": ["PyTorch"],
+            "dictionary": {"Py Torch": "PyTorch"}
+        }));
+        let switched_raw = settings_from(json!({
+            "llm_provider": "codex",
+            "polish_mode": "raw",
+            "vocabulary": ["PyTorch"],
+            "dictionary": {"Py Torch": "PyTorch"}
+        }));
+        let switched_provider = settings_from(json!({
+            "llm_provider": "builtin",
+            "polish_mode": "correct",
+            "vocabulary": ["PyTorch"],
+            "dictionary": {"Py Torch": "PyTorch"}
+        }));
+        let changed_terms = settings_from(json!({
+            "llm_provider": "codex",
+            "polish_mode": "correct",
+            "vocabulary": ["Tauri"],
+            "dictionary": {"Py Torch": "PyTorch"}
+        }));
+
+        assert!(codex_dispatch_policy_is_current(&initial, &unchanged));
+        assert!(!codex_dispatch_policy_is_current(&initial, &switched_raw));
+        assert!(!codex_dispatch_policy_is_current(
+            &initial,
+            &switched_provider
+        ));
+        assert!(!codex_dispatch_policy_is_current(&initial, &changed_terms));
+    }
+
+    #[test]
     fn local_servers_map_to_fixed_base_urls() {
         let p = from_settings(&settings_from(
             json!({"llm_provider": "ollama", "llm_polish_model": "qwen3:4b"}),
@@ -2415,6 +2775,23 @@ mod tests {
             result.metadata.fallback_reason,
             Some(PolishFallbackReason::CorrectConsentRequired)
         );
+
+        let unsupported = settings_from(json!({
+            "polish_mode": "correct",
+            "correct_consent_version": crate::settings::CORRECT_CONSENT_VERSION,
+            "llm_provider": "ollama",
+            "llm_polish_model": "qwen3:4b",
+        }));
+        let result = transform_with(&unsupported, "原文", "", |_, _, _, _| {
+            panic!("ordinary provider must not masquerade CLEAN as CORRECT")
+        });
+        assert_eq!(blocked_reason(&unsupported), Some("provider_unavailable"));
+        assert_eq!(result.text, "原文");
+        assert_eq!(result.metadata.outcome, PolishOutcome::Fallback);
+        assert_eq!(
+            result.metadata.fallback_reason,
+            Some(PolishFallbackReason::ProviderUnavailable)
+        );
     }
 
     #[test]
@@ -2427,13 +2804,171 @@ mod tests {
         }));
         let input = "使用 hyTorch 訓練";
         let result = transform_with(&settings, input, "", |_, _, _, _| {
-            Ok("使用 PyTorch 訓練".to_string())
+            panic!("ordinary provider must not receive a CORRECT request")
         });
         assert_eq!(result.text, input);
         assert_eq!(result.metadata.outcome, PolishOutcome::Fallback);
         assert_eq!(
             result.metadata.fallback_reason,
-            Some(PolishFallbackReason::MeaningAnchorMismatch)
+            Some(PolishFallbackReason::ProviderUnavailable)
+        );
+    }
+
+    #[test]
+    fn screen_terms_only_share_candidates_relevant_to_this_transcript() {
+        let terms = vec![
+            "Claude".to_string(),
+            "password".to_string(),
+            "CorrectHorseBatteryStaple".to_string(),
+            "re-sign".to_string(),
+            "FooBar".to_string(),
+        ];
+        assert_eq!(
+            transcript_relevant_terms("今天用 Clau-de 跑 training", &terms, 32, &[]),
+            vec!["Claude".to_string()]
+        );
+        assert!(
+            transcript_relevant_terms("今天跑 training", &terms, 32, &[]).is_empty(),
+            "unrelated visible words must not be sent"
+        );
+        assert!(
+            transcript_relevant_terms("請 re sign，還有 Foo, Bar", &terms, 32, &[]).is_empty(),
+            "screen terms that the correction guard cannot apply must not be sent"
+        );
+    }
+
+    #[test]
+    fn narrow_separator_heuristic_rejects_ambiguous_whitespace_merges() {
+        assert!(
+            spelling_edit_passes_narrow_heuristic("Clau-de", "Claude"),
+            "the deliberately narrow experimental hyphen shape should remain supported"
+        );
+        for (source, target) in [
+            ("Py Torch", "PyTorch"),
+            ("G PT", "GPT"),
+            ("A PI", "API"),
+            ("The Rapist", "TheRapist"),
+            ("Under-score", "Underscore"),
+            ("Tell-us", "Tellus"),
+            ("Call-in", "Callin"),
+            ("therapist", "The Rapist"),
+            ("the rapist", "Therapist"),
+            ("us", "US"),
+            ("polish", "Polish"),
+            ("march", "March"),
+            ("resign", "re_sign"),
+        ] {
+            assert!(
+                !spelling_edit_passes_narrow_heuristic(source, target),
+                "{source} -> {target} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn all_codex_term_categories_are_relevance_filtered_and_deduplicated() {
+        let screen_term_input = "今天用 Whisp-er";
+        let screen_term_proposal = CorrectionProposal {
+            text: "今天用 Whisper".into(),
+            replacements: vec![CorrectionEdit {
+                from: "Whisp-er".into(),
+                to: "Whisper".into(),
+            }],
+        };
+        let screen_term_guard = authorize_correction_proposal(
+            screen_term_input,
+            &screen_term_proposal,
+            &["Whisper".into()],
+            "",
+        );
+        assert!(
+            screen_term_guard.is_ok(),
+            "narrow screen-term fixture must be guard-adoptable: {screen_term_guard:?}"
+        );
+
+        let local_terms = vec!["Flutter".into(), "PrivateProject".into(), "US".into()];
+        let canonical_terms = canonical_preference_terms(
+            "Claude\nFlutter\nGPT\nQwen3\nresign\nUS\nPolish\nThe Rapist",
+        );
+        let screen_terms = vec![
+            "Whisper".into(),
+            "Claude".into(),
+            "CorrectHorseBatteryStaple".into(),
+        ];
+        let selected = select_codex_outbound_terms(
+            "今天用 Flutt-er、Clau-de 和 Whisp-er",
+            &local_terms,
+            &canonical_terms,
+            &screen_terms,
+        );
+        assert_eq!(selected.vocabulary, vec!["Flutter"]);
+        assert_eq!(selected.canonical_spellings, vec!["Claude"]);
+        assert_eq!(selected.context, vec!["Whisper"]);
+
+        let semantic_risks = select_codex_outbound_terms(
+            "tell us to polish the therapist note",
+            &["US".into(), "Polish".into()],
+            &["The Rapist".into(), "resign".into()],
+            &["The Rapist".into()],
+        );
+        assert_eq!(
+            semantic_risks,
+            CodexOutboundTerms {
+                vocabulary: Vec::new(),
+                canonical_spellings: Vec::new(),
+                context: Vec::new(),
+            }
+        );
+        assert!(semantic_risks.is_empty());
+    }
+
+    #[test]
+    fn codex_term_categories_share_one_global_budget() {
+        let mut transcript_parts = Vec::new();
+        let mut terms = Vec::new();
+        for index in 0..45_u8 {
+            let first = char::from(b'X' + index / 26);
+            let second = char::from(b'a' + index % 26);
+            transcript_parts.push(format!("Term-{first}{second}"));
+            terms.push(format!("Term{first}{second}"));
+        }
+        let selected = select_codex_outbound_terms(
+            &transcript_parts.join(", "),
+            &terms[..15],
+            &terms[15..30],
+            &terms[30..],
+        );
+        assert_eq!(selected.vocabulary.len(), 15);
+        assert_eq!(selected.canonical_spellings.len(), 15);
+        assert_eq!(selected.context.len(), 2);
+        assert_eq!(
+            selected.vocabulary.len() + selected.canonical_spellings.len() + selected.context.len(),
+            CODEX_OUTBOUND_TERM_LIMIT
+        );
+    }
+
+    #[test]
+    fn invalid_canonical_terms_do_not_crowd_out_relevant_terms() {
+        let numeric_noise = (0..40)
+            .map(|index| format!("Qwen{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let terms = canonical_preference_terms(&format!("{numeric_noise}\nClaude"));
+        assert_eq!(
+            transcript_relevant_terms("今天用 Clau-de", &terms, 32, &[]),
+            vec!["Claude".to_string()]
+        );
+    }
+
+    #[test]
+    fn codex_consent_change_requires_fresh_cloud_consent_not_login() {
+        assert_eq!(
+            codex_fallback(crate::codex::CodexError::ConsentChanged),
+            PolishFallbackReason::CloudConsentRequired
+        );
+        assert_eq!(
+            codex_fallback(crate::codex::CodexError::AuthRequired),
+            PolishFallbackReason::CodexAuthRequired
         );
     }
 
@@ -2477,14 +3012,14 @@ mod tests {
     #[test]
     fn correction_source_uniqueness_detects_overlapping_occurrences() {
         let proposal = CorrectionProposal {
-            text: "a-aa".into(),
+            text: "AbcdAbcd-Ab".into(),
             replacements: vec![CorrectionEdit {
-                from: "aa".into(),
-                to: "a-a".into(),
+                from: "Abcd-Ab".into(),
+                to: "AbcdAb".into(),
             }],
         };
         assert_eq!(
-            authorize_correction_proposal("aaa", &proposal, &["a-a".into()], ""),
+            authorize_correction_proposal("Abcd-Abcd-Ab", &proposal, &["AbcdAb".into()], ""),
             Err(CorrectionGuardRejection::SourceNotUnique)
         );
     }

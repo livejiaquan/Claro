@@ -131,8 +131,15 @@ export type CodexTestFailureReason =
   | "rate_limited"
   | "auth_required"
   | "unavailable"
+  | "consent_changed"
   | "output_rejected"
   | "unknown";
+
+/** Rust 測試 command 的 tagged-union 回傳值；不要再從錯誤字串猜狀態。 */
+export type CodexTestResult =
+  | { phase: "success"; input: string; output: string }
+  | { phase: "failed"; reason: Exclude<CodexTestFailureReason, "unknown"> }
+  | { phase: "cancelled" };
 
 export type CodexTestState =
   | { phase: "idle" }
@@ -274,6 +281,23 @@ export function resolveLlmConfig(config: LlmConfig): ResolvedLlmConfig {
   }
   if (
     !blockedReason &&
+    polishMode === "correct" &&
+    config.provider !== "codex"
+  ) {
+    // 舊後端若仍把一般 provider 的 CLEAN 路徑回報成 CORRECT，前端也要
+    // fail closed，不能向使用者宣稱已做專業校字。
+    blockedReason = "provider_unavailable";
+  }
+  if (
+    !blockedReason &&
+    polishMode !== "raw" &&
+    polishMode !== "correct" &&
+    config.provider === "codex"
+  ) {
+    blockedReason = "provider_unavailable";
+  }
+  if (
+    !blockedReason &&
     polishMode !== "raw" &&
     config.provider === "codex" &&
     !codexConsentValid
@@ -388,4 +412,6 @@ export interface HistoryPolishMetadata {
   changed: boolean;
   outcome: "raw" | "changed" | "unchanged" | "fallback";
   fallback_reason?: string | null;
+  /** false=沒有任何轉錄 payload byte 寫入主 Codex request；true=傳送已開始。 */
+  codex_payload_started?: boolean;
 }

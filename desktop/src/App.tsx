@@ -22,6 +22,13 @@ const NAV: { id: Page; label: string; icon: () => React.ReactElement }[] = [
 
 export default function App() {
   const [page, setPage] = useState<Page>("home");
+  const [settingsFocusTarget, setSettingsFocusTarget] = useState<
+    "codex" | null
+  >(null);
+  // 留在 App scope，切頁不會讓尚未成功寫入的 Codex 清單草稿消失。
+  const [codexCorrectionDraft, setCodexCorrectionDraft] = useState<
+    string | null
+  >(null);
   const [status, setStatus] = useState<Status | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
@@ -179,7 +186,10 @@ export default function App() {
             <button
               key={id}
               className={`nav-item no-drag ${page === id ? "active" : ""}`}
-              onClick={() => setPage(id)}
+              onClick={() => {
+                if (id === "settings") setSettingsFocusTarget(null);
+                setPage(id);
+              }}
               aria-current={page === id ? "page" : undefined}
             >
               <Icon />
@@ -248,7 +258,10 @@ export default function App() {
               onCopied={() => showToast("已複製")}
               gotoHistory={() => setPage("history")}
               gotoSetup={() => setPage("setup")}
-              gotoSettings={() => setPage("settings")}
+              gotoSettings={() => {
+                setSettingsFocusTarget(null);
+                setPage("settings");
+              }}
             />
           ) : page === "history" ? (
             <History
@@ -278,6 +291,10 @@ export default function App() {
                   })
                   .catch((reason) => showToast(`無法完成設定：${String(reason)}`));
               }}
+              onOpenSettings={() => {
+                setSettingsFocusTarget("codex");
+                setPage("settings");
+              }}
             />
           ) : (
             <Settings
@@ -291,6 +308,10 @@ export default function App() {
               refresh={refresh}
               onToast={showToast}
               onOpenSetup={() => setPage("setup")}
+              focusTarget={settingsFocusTarget}
+              onFocusTargetHandled={() => setSettingsFocusTarget(null)}
+              codexCorrectionDraft={codexCorrectionDraft}
+              onCodexCorrectionDraftChange={setCodexCorrectionDraft}
             />
           )}
         </div>

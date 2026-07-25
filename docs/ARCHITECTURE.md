@@ -135,16 +135,24 @@ StaticText/TextField/TextArea/Heading 內容性角色）。
 |---|---|---|
 | `raw` | 無——完全逐字（也是所有失敗的安全退回） | — |
 | `clean`（新安裝預設意圖） | 刪停頓邊界純填充詞、明確改口只留最終版、補不改語氣的標點；**LLM 不得修改任何文字／英數 token**——專有詞修正交給 STT Context 偏置＋個人字典 | 錨點 multiset（數字/否定/日期/術語）＋語意字元序列比對（窄容忍：前一字元是空白且非句首的「那個/就是說」可缺席——STT 不替停頓補標點，中英間距後的填充詞實測會卡）＋相似度/新增內容比例 |
-| `correct`（首次啟用需明確同意） | 最多三個有詞彙證據的英文專業詞拼法正規化；只允許大小寫、空白、底線、連字號或標點差異，不允許猜測字母替換，也不改數字、日期、否定、URL、email、path、版本或帶數字 token | Codex structured edits 逐項驗證；replacement 必須命中使用者詞彙／正確拼法清單，或另行同意的 canonical Context terms；`from`／`to` 去除 ASCII 非英數並轉小寫後必須完全相同，proposal text 必須逐位元等於本機 deterministic 套用結果。字母不同或同音誤認只走使用者明確建立的個人字典 |
+| `correct`（首次啟用需明確同意） | 最多三個英文專業詞拼法正規化。target-only whitespace merge 已因 `A PI→API`、`The Rapist→TheRapist` 反例全面關閉；空白合併與已知 source→target 一律走個人字典。目前 Codex 只保留尾端兩字母單連字號的極窄實驗 heuristic（如 `Clau-de→Claude`），並明示它只是降低風險、不是語意證明。不允許純改大小寫、猜測字母替換、新增分詞，也不改數字、日期、否定、URL、email、path、版本或帶數字 token | Codex structured edits 逐項驗證；replacement 必須命中使用者詞彙／正確拼法清單，或另行同意且 guard 可採用的 canonical Context term。source 必須是恰一個連字號、左側至少四字母、右側恰兩字母，移除後逐字等於 target；proposal text 必須逐位元等於本機 deterministic 套用結果。`A PI→API`、`The Rapist→TheRapist`、`Under-score→Underscore`、`re-sign→resign`、字母不同、同音誤認、普通詞分合與含數字固定格式只走使用者明確建立的個人字典 |
 | `organize`（首次啟用需明確同意） | 完整句讀重排、分段、明確列舉格式化、完全重複合併 | 事實錨點＋內容覆蓋比對 |
+
+設定 schema 讓 mode／provider 保持正交，runtime 則使用 fail-closed capability
+matrix：`correct` 目前只配 `codex`；`codex` 除 `raw` 外只配 `correct`。離開 Codex
+時若仍在 CORRECT，`set_llm_config` 同一交易改回 CLEAN；所有 mode/provider
+commands 與 pipeline 入口都重驗相容性，避免 stale UI 或競態繞過。前端停用卡片
+僅是 UX，不是安全邊界。
 
 **合約（不可違背）**：`transform()` 是 pipeline 唯一入口，任何失敗（provider 掛掉、
 guard 拒絕、取消）一律回 deterministic base text（個人字典後的原文），並在 history
 留下 requested/effective mode、provider、fallback 原因——UI 可顯示 raw/final 與
-復原依據。聽寫不可因 LLM 掛掉而失敗。CLEAN 不把螢幕文字送給 LLM（lexical
-contract 封閉）；CORRECT 預設只送轉錄、正確拼法清單與使用者明確建立的個人 canonical
-terms，另行同意時才加上已抽取、清洗且有上限的畫面 canonical terms；只有 ORGANIZE
-用 bounded Context 做可解釋的版面判斷。正確拼法清單只接受逗號／換行分隔的
+復原依據。Codex 紀錄另含可選 `codex_payload_started` 布林值；只有主
+`codex exec` stdin 已寫入至少一個 payload byte 才為 true，runtime/version/login
+預檢不算。UI 因此能區分「未傳送／未用模型額度」與「傳送已開始但未必完成」，
+且不記錄 request 內容。聽寫不可因 LLM 掛掉而失敗。CLEAN 不把螢幕文字送給 LLM（lexical
+contract 封閉）；CORRECT 預設只送轉錄，以及與本次轉錄相關且 correction guard 可採用的正確拼法與使用者明確建立的個人 canonical
+terms，另行同意時也只加上 guard 可採用的畫面 canonical terms；三類候選共用 32 項上限，且雲端專用 extractor 只讀擷取時已分離的內容欄位，raw App 名與視窗標題不會進候選。三類候選皆空時直接回本機 unchanged，不啟動 Codex、不使用帳戶額度。只有 ORGANIZE 用 bounded Context 做可解釋的版面判斷。正確拼法清單只接受逗號／換行分隔的
 ASCII canonical terms，是 stdin 中的不可信資料，不是可覆寫固定安全契約的 system prompt。
 共用底層防呆沿用：空輸出、長度 > max(3×原文, 原文+200)、低重疊（離題回覆）、
 變長且新增內容過半（答指令／提示詞洩漏）→ 退回。

@@ -1,7 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useReducer, useRef, useState } from "react";
+import {
+  useEffect,
+  useReducer,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import CodexProviderPanel from "../components/CodexProviderPanel";
 import {
+  allocateCodexTestRequestId,
+  cancelCodexTestOnDispose,
   codexProviderReducer,
   consumeCancelledCodexTest,
   createCodexProviderUiState,
@@ -20,7 +29,7 @@ import {
   type CodexEnableOptions,
   type CodexPreferences,
   type CodexStatus,
-  type CodexTestFailureReason,
+  type CodexTestResult,
   type DictEntry,
   type DownloadProgress,
   type LlmConfig,
@@ -57,7 +66,7 @@ const POLISH_MODES: { id: PolishMode; title: string; tag?: string; description: 
     id: "correct",
     title: "專業校字",
     tag: "實驗・需確認",
-    description: "依你提供的正確詞彙，受控統一大小寫、空白與連字號；真正的錯字用個人字典。",
+    description: "目前只支援 Codex；只嘗試極窄的單連字號修正，仍可能誤改。",
   },
   {
     id: "organize",
@@ -66,6 +75,18 @@ const POLISH_MODES: { id: PolishMode; title: string; tag?: string; description: 
     description: "鎖定姓名、數字、時間、否定與其他事實後，只允許完整句子重排、分段與明確清單格式。",
   },
 ];
+
+function modeSupportedByProvider(mode: PolishMode, provider: string): boolean {
+  if (mode === "raw") return true;
+  if (mode === "correct") return provider === "codex";
+  return provider !== "codex";
+}
+
+function preferredScrollBehavior(): ScrollBehavior {
+  return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+    ? "auto"
+    : "smooth";
+}
 
 const OUTCOME_LABEL: Record<string, string> = {
   provider_missing: "尚未選擇處理引擎",
@@ -87,6 +108,20 @@ const OUTCOME_LABEL: Record<string, string> = {
   invalid_custom_url: "自訂端點格式不正確",
 };
 
+function codexMutationErrorCopy(reason: unknown): string {
+  const code = String(reason);
+  if (code.includes("codex_request_stale")) {
+    return "設定在處理期間已改變，Claro 沒有套用舊請求。請確認目前選項後再試一次。";
+  }
+  if (code.includes("codex_not_installed")) return "沒有找到 Codex CLI。安裝後請重新檢查。";
+  if (code.includes("codex_auth_required")) return "Codex CLI 尚未登入。登入後請重新檢查。";
+  if (code.includes("codex_unsupported")) return "目前的 Codex CLI 版本不支援安全校字。更新後請重新檢查。";
+  if (code.includes("codex_consent_required")) return "Codex 的登入或 CLI 版本已改變，請重新檢查並確認資料傳送。";
+  if (code.includes("codex_test_duplicate")) return "這次測試已經在執行中。";
+  if (code.includes("螢幕上下文已關閉")) return "螢幕上下文已關閉，因此不能分享畫面詞彙。";
+  return "Codex 設定目前無法完成。請重新檢查 Codex 後再試一次。";
+}
+
 function sttModelSortRank(model: ModelInfo) {
   if (model.active) return 0;
   if (model.available && model.recommended) return 1;
@@ -104,6 +139,10 @@ export default function Settings({
   refresh,
   onToast,
   onOpenSetup,
+  focusTarget,
+  onFocusTargetHandled,
+  codexCorrectionDraft,
+  onCodexCorrectionDraftChange,
 }: {
   status: Status;
   mic: MicLevel;
@@ -113,6 +152,10 @@ export default function Settings({
   refresh: () => void;
   onToast: (msg: string) => void;
   onOpenSetup: () => void;
+  focusTarget: "codex" | null;
+  onFocusTargetHandled: () => void;
+  codexCorrectionDraft: string | null;
+  onCodexCorrectionDraftChange: Dispatch<SetStateAction<string | null>>;
 }) {
   const [error, setError] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -128,9 +171,13 @@ export default function Settings({
   );
   const [codexEnablePending, setCodexEnablePending] = useState(false);
   const [codexPreferencesSaving, setCodexPreferencesSaving] = useState(false);
+  const [codexCorrectionSaving, setCodexCorrectionSaving] = useState(false);
+  const [codexError, setCodexError] = useState<string | null>(null);
+  const [polishError, setPolishError] = useState<string | null>(null);
+  const setCodexCorrectionDraft = onCodexCorrectionDraftChange;
   const [codexPolicySaving, setCodexPolicySaving] = useState(false);
   const codexStatusGeneration = useRef(0);
-  const codexTestGeneration = useRef(0);
+  const activeCodexTestRequestId = useRef<number | null>(null);
   const cancelledCodexTests = useRef(new Set<number>());
   const llmLoadGeneration = useRef(0);
   const llmRef = useRef<ResolvedLlmConfig | null>(null);
@@ -138,6 +185,16 @@ export default function Settings({
   const llmSaveSeq = useRef(0);
   const codexSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
   const codexMutationSeq = useRef(0);
+  const codexCorrectionSaveSeq = useRef(0);
+  const codexCorrectionPending = useRef<{
+    value: string;
+    promise: Promise<void>;
+  } | null>(null);
+  const modeConsentHeadingRef = useRef<HTMLDivElement>(null);
+  const modeReturnFocusRef = useRef<HTMLElement | null>(null);
+  const polishProviderSelectRef = useRef<HTMLSelectElement>(null);
+  const codexErrorRef = useRef<HTMLDivElement>(null);
+  const polishErrorRef = useRef<HTMLDivElement>(null);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [confirmCloud, setConfirmCloud] = useState(false);
   const [confirmDisableLocalOnly, setConfirmDisableLocalOnly] = useState(false);
@@ -160,6 +217,12 @@ export default function Settings({
     const resolved = resolveLlmConfig(config);
     llmRef.current = resolved;
     setLlm(resolved);
+    setCodexCorrectionDraft((current) =>
+      current !== null &&
+      current.trim() === resolved.codex_correction_preferences
+        ? null
+        : current,
+    );
   };
   const loadLlm = () => {
     const generation = ++llmLoadGeneration.current;
@@ -195,6 +258,7 @@ export default function Settings({
   };
 
   const probeCodex = () => {
+    setCodexError(null);
     const generation = ++codexStatusGeneration.current;
     dispatchCodex({ type: "status_requested", generation });
     invoke<CodexStatus>("get_codex_status")
@@ -230,6 +294,21 @@ export default function Settings({
     // 僅在 mount 載入；各 loader 的 closure 每次 render 會重建。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  useEffect(
+    () => () => {
+      const requestId = activeCodexTestRequestId.current;
+      activeCodexTestRequestId.current = null;
+      cancelCodexTestOnDispose(
+        requestId,
+        cancelledCodexTests.current,
+        (activeRequestId) =>
+          invoke<boolean>("cancel_codex_test", {
+            requestId: activeRequestId,
+          }),
+      );
+    },
+    [],
+  );
   // 內建 LLM 下載進度改變清單狀態
   useEffect(() => {
     loadBuiltinLlms();
@@ -251,10 +330,47 @@ export default function Settings({
   }, [llm?.provider]);
   useEffect(() => {
     if (llm?.provider === "codex") probeCodex();
-    else dispatchCodex({ type: "test_reset" });
+    else {
+      dispatchCodex({ type: "test_reset" });
+      setCodexError(null);
+    }
     // provider 切換後才探測；Codex 不在首次設定的必要路徑，也不背景消耗額度。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [llm?.provider]);
+  useEffect(() => {
+    if (!codexError) return;
+    const frame = requestAnimationFrame(() => {
+      codexErrorRef.current?.scrollIntoView({
+        block: "nearest",
+        behavior: preferredScrollBehavior(),
+      });
+      codexErrorRef.current?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [codexError]);
+  useEffect(() => {
+    if (!polishError) return;
+    const frame = requestAnimationFrame(() => {
+      polishErrorRef.current?.scrollIntoView({
+        block: "nearest",
+        behavior: preferredScrollBehavior(),
+      });
+      polishErrorRef.current?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [polishError]);
+  useEffect(() => {
+    if (focusTarget !== "codex" || !llm) return;
+    const frame = requestAnimationFrame(() => {
+      polishProviderSelectRef.current?.scrollIntoView({
+        block: "center",
+        behavior: preferredScrollBehavior(),
+      });
+      polishProviderSelectRef.current?.focus();
+      onFocusTargetHandled();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [focusTarget, llm, onFocusTargetHandled]);
   // 下載進度事件會改變模型清單狀態
   useEffect(() => {
     loadModels();
@@ -347,48 +463,90 @@ export default function Settings({
   const saveLlm = (next: Partial<ResolvedLlmConfig>, confirmed = false) => {
     const cur = llmRef.current;
     if (!cur) return;
-    const merged = { ...cur, ...next };
+    setPolishError(null);
+    const switchingAwayFromCodex =
+      next.provider !== undefined &&
+      cur.provider === "codex" &&
+      next.provider !== "codex";
+    const downgradeCodexCorrection =
+      switchingAwayFromCodex && cur.polish_mode === "correct";
+    const hasDirtyCodexDraft =
+      next.provider !== undefined &&
+      next.provider !== "codex" &&
+      codexCorrectionDraft !== null &&
+      codexCorrectionDraft.trim() !== cur.codex_correction_preferences;
+    // select change 前通常先觸發 textarea blur；這裡再補一道 Settings-scope
+    // flush。保留會 reject 的 promise，儲存失敗時就不切走 Codex，避免草稿
+    // 在 provider panel unmount 後靜默遺失。
+    const blockingDraftSave = hasDirtyCodexDraft
+      ? saveCodexCorrectionPreferences(codexCorrectionDraft)
+      : Promise.resolve();
+    const pendingCodexSaves = switchingAwayFromCodex || hasDirtyCodexDraft
+      ? Promise.all([codexSaveQueue.current, blockingDraftSave]).then(
+          () => undefined,
+        )
+      : Promise.resolve();
+    const previousLlmSaves = llmSaveQueue.current;
+    const merged = {
+      ...cur,
+      ...next,
+      ...(downgradeCodexCorrection
+        ? { polish_mode: "clean" as const, effective_mode: "clean" as const }
+        : {}),
+    };
     llmRef.current = merged;
     ++llmLoadGeneration.current;
     setLlm(merged);
     if (next.provider !== undefined) {
+      setPendingMode(null);
       setConfirmCloud(false);
       setConfirmDisableLocalOnly(false);
     }
     setTestResult(null);
     const seq = ++llmSaveSeq.current;
-    llmSaveQueue.current = llmSaveQueue.current.then(() =>
-      invoke<LlmConfig | null>("set_llm_config", {
-        provider: merged.provider,
-        model: merged.model,
-        baseUrl: merged.base_url,
-        confirmed,
-      })
-        .then((updated) => {
-          if (seq === llmSaveSeq.current) {
-            if (updated) acceptLlmConfig(updated);
-            else loadLlm();
-          }
+    llmSaveQueue.current = previousLlmSaves
+      .then(() => pendingCodexSaves)
+      .then(() =>
+        invoke<LlmConfig | null>("set_llm_config", {
+          provider: merged.provider,
+          model: merged.model,
+          baseUrl: merged.base_url,
+          confirmed,
+        }),
+      )
+      .then((updated) => {
+        if (seq === llmSaveSeq.current) {
+          if (updated) acceptLlmConfig(updated);
+          else loadLlm();
           if (confirmed) {
             setConfirmCloud(false);
             onToast("已確認此雲端端點");
+          } else if (downgradeCodexCorrection) {
+            onToast("已離開 Codex；文字整理改為保守校訂");
           }
-        })
-        .catch((e) => {
-          setError(String(e));
-          if (seq === llmSaveSeq.current) loadLlm();
-        }),
-    );
+        }
+      })
+      .catch((e) => {
+        // 吞在 queue 尾端，讓一次失敗不會永久阻塞後續設定；同時重讀後端
+        // authoritative 狀態，撤回尚未成功的 optimistic provider 切換。
+        if (seq === llmSaveSeq.current) {
+          setPolishError(`無法更新文字整理位置：${String(e)}`);
+          loadLlm();
+        }
+      });
   };
 
   const applyMode = (mode: PolishMode, confirmed: boolean) => {
-    setError(null);
+    setPolishError(null);
     const invokeMode = () =>
       invoke<LlmConfig | null>("set_polish_mode", { mode, confirmed });
     const applyUpdated = (updated: LlmConfig | null) => {
         if (updated) acceptLlmConfig(updated);
         else loadLlm();
         setPendingMode(null);
+        if (confirmed) {
+          requestAnimationFrame(() => modeReturnFocusRef.current?.focus());
+        }
         onToast(
           mode === "raw"
             ? "已切換為原樣轉錄"
@@ -409,31 +567,53 @@ export default function Settings({
           if (seq === codexMutationSeq.current) applyUpdated(updated);
         })
         .catch((e) => {
-          if (seq === codexMutationSeq.current) setError(String(e));
+          if (seq === codexMutationSeq.current) {
+            setPolishError(
+              `無法切換文字整理模式：${codexMutationErrorCopy(e)}`,
+            );
+          }
         })
         .finally(() => {
           if (seq === codexMutationSeq.current) setCodexPolicySaving(false);
         });
       return;
     }
-    invokeMode().then(applyUpdated).catch((e) => setError(String(e)));
+    invokeMode()
+      .then(applyUpdated)
+      .catch((e) =>
+        setPolishError(`無法切換文字整理模式：${String(e)}`),
+      );
   };
 
   const requestMode = (mode: PolishMode) => {
     if (!llm || mode === llm.polish_mode) return;
     if (mode === "correct" && !llm.correct_consent_valid) {
+      modeReturnFocusRef.current =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null;
       setPendingMode("correct");
       return;
     }
     if (mode === "organize" && !llm.organize_consent_valid) {
+      modeReturnFocusRef.current =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null;
       setPendingMode("organize");
       return;
     }
     applyMode(mode, false);
   };
 
+  useEffect(() => {
+    if (!pendingMode) return;
+    requestAnimationFrame(() => modeConsentHeadingRef.current?.focus());
+  }, [pendingMode]);
+
+  const cancelPendingMode = () => {
+    setPendingMode(null);
+    requestAnimationFrame(() => modeReturnFocusRef.current?.focus());
+  };
+
   const applyLocalOnly = (enabled: boolean, confirmed: boolean) => {
-    setError(null);
+    setPolishError(null);
     const invokeLocalOnly = () =>
       invoke<LlmConfig | null>("set_local_only", { enabled, confirmed });
     const applyUpdated = (updated: LlmConfig | null) => {
@@ -453,17 +633,26 @@ export default function Settings({
           if (seq === codexMutationSeq.current) applyUpdated(updated);
         })
         .catch((e) => {
-          if (seq === codexMutationSeq.current) setError(String(e));
+          if (seq === codexMutationSeq.current) {
+            setPolishError(
+              `無法更新雲端資料限制：${codexMutationErrorCopy(e)}`,
+            );
+          }
         })
         .finally(() => {
           if (seq === codexMutationSeq.current) setCodexPolicySaving(false);
         });
       return;
     }
-    invokeLocalOnly().then(applyUpdated).catch((e) => setError(String(e)));
+    invokeLocalOnly()
+      .then(applyUpdated)
+      .catch((e) =>
+        setPolishError(`無法更新雲端資料限制：${String(e)}`),
+      );
   };
 
   const applyCodexConfig = (updated: LlmConfig | null) => {
+    setCodexError(null);
     if (updated) acceptLlmConfig(updated);
     else loadLlm();
     refresh();
@@ -472,7 +661,7 @@ export default function Settings({
   const enableCodex = (options: CodexEnableOptions) => {
     const seq = ++codexMutationSeq.current;
     setCodexEnablePending(true);
-    setError(null);
+    setCodexError(null);
     codexSaveQueue.current = codexSaveQueue.current
       .then(() => llmSaveQueue.current)
       .then(() => {
@@ -493,72 +682,103 @@ export default function Settings({
           loadLlm();
           return;
         }
-        setError(String(e));
+        if (seq === codexMutationSeq.current) {
+          setCodexError(codexMutationErrorCopy(e));
+        }
       })
       .finally(() => {
         if (seq === codexMutationSeq.current) setCodexEnablePending(false);
       });
   };
 
-  const setCodexPreferences = (
+  function saveCodexCorrectionPreferences(
     correctionPreferences: string,
-    shareContextTerms: boolean,
-    confirmed: boolean,
-  ) => {
+  ): Promise<void> {
+    const normalized = correctionPreferences.trim();
+    const pending = codexCorrectionPending.current;
+    if (pending?.value === normalized) return pending.promise;
+
+    const seq = ++codexCorrectionSaveSeq.current;
+    const previousLlmSaves = llmSaveQueue.current;
+    setCodexCorrectionSaving(true);
+
+    const operation = codexSaveQueue.current
+      .then(() => previousLlmSaves)
+      .then(() =>
+        invoke<LlmConfig | null>("set_codex_correction_preferences", {
+          correctionPreferences: normalized,
+        }),
+      );
+    // 內部 queue 必須吞掉失敗，否則一次離線會讓後續重試永久卡在 rejected promise。
+    codexSaveQueue.current = operation.catch(() => undefined);
+
+    const promise = operation
+      .then((updated) => {
+        if (seq !== codexCorrectionSaveSeq.current) return;
+        setCodexCorrectionDraft((current) =>
+          current !== null && current.trim() === normalized ? null : current,
+        );
+        if (llmRef.current?.provider === "codex") {
+          applyCodexConfig(updated);
+        }
+      })
+      .catch((reason) => {
+        throw new Error(codexMutationErrorCopy(reason));
+      })
+      .finally(() => {
+        if (seq === codexCorrectionSaveSeq.current) {
+          setCodexCorrectionSaving(false);
+        }
+      });
+
+    codexCorrectionPending.current = { value: normalized, promise };
+    void promise.then(
+      () => {
+        if (codexCorrectionPending.current?.promise === promise) {
+          codexCorrectionPending.current = null;
+        }
+      },
+      () => {
+        if (codexCorrectionPending.current?.promise === promise) {
+          codexCorrectionPending.current = null;
+        }
+      },
+    );
+    return promise;
+  }
+
+  const setCodexContextTerms = (enabled: boolean, confirmed: boolean) => {
     const seq = ++codexMutationSeq.current;
     setCodexPreferencesSaving(true);
-    setError(null);
+    setCodexError(null);
     codexSaveQueue.current = codexSaveQueue.current
       .then(() => llmSaveQueue.current)
       .then(() => {
         if (llmRef.current?.provider !== "codex") return null;
-        return invoke<LlmConfig | null>("set_codex_preferences", {
-          correctionPreferences,
-          shareContextTerms,
+        return invoke<LlmConfig | null>("set_codex_context_terms_enabled", {
+          enabled,
           confirmed,
         });
       })
       .then((updated) => {
         if (seq === codexMutationSeq.current && llmRef.current?.provider === "codex") {
           applyCodexConfig(updated);
-          onToast(shareContextTerms ? "已更新 Codex 校字設定" : "已儲存正確拼法清單");
+          onToast(enabled ? "已允許有限畫面詞彙" : "已關閉有限畫面詞彙");
         }
       })
-      .catch((e) => setError(String(e)))
+      .catch((e) => {
+        if (seq === codexMutationSeq.current) {
+          setCodexError(codexMutationErrorCopy(e));
+        }
+      })
       .finally(() => {
         if (seq === codexMutationSeq.current) setCodexPreferencesSaving(false);
       });
   };
 
-  const codexTestFailure = (reason: unknown): CodexTestFailureReason => {
-    const text = String(reason).toLowerCase();
-    if (text.includes("timeout") || text.includes("逾時")) return "timeout";
-    if (text.includes("rate") || text.includes("usage") || text.includes("額度")) {
-      return "rate_limited";
-    }
-    if (text.includes("auth") || text.includes("login") || text.includes("登入")) {
-      return "auth_required";
-    }
-    if (
-      text.includes("reject") ||
-      text.includes("guard") ||
-      text.includes("invalidoutput") ||
-      text.includes("內容保護")
-    ) {
-      return "output_rejected";
-    }
-    if (
-      text.includes("unavailable") ||
-      text.includes("not_installed") ||
-      text.includes("busy")
-    ) {
-      return "unavailable";
-    }
-    return "unknown";
-  };
-
   const runCodexTest = () => {
-    const generation = ++codexTestGeneration.current;
+    const generation = allocateCodexTestRequestId();
+    activeCodexTestRequestId.current = generation;
     cancelledCodexTests.current.delete(generation);
     dispatchCodex({ type: "test_started", generation });
     codexSaveQueue.current
@@ -570,10 +790,15 @@ export default function Settings({
             generation,
           )
         ) {
+          if (activeCodexTestRequestId.current === generation) {
+            activeCodexTestRequestId.current = null;
+          }
           dispatchCodex({ type: "test_cancelled", generation });
           return null;
         }
-        return invoke<{ input: string; output: string }>("test_codex_polish");
+        return invoke<CodexTestResult>("test_codex_polish", {
+          requestId: generation,
+        });
       })
       .then((result) => {
         if (!result) return;
@@ -583,40 +808,70 @@ export default function Settings({
             generation,
           )
         ) {
+          if (activeCodexTestRequestId.current === generation) {
+            activeCodexTestRequestId.current = null;
+          }
           dispatchCodex({ type: "test_cancelled", generation });
           return;
         }
         cancelledCodexTests.current.delete(generation);
-        dispatchCodex({ type: "test_succeeded", generation, ...result });
+        if (activeCodexTestRequestId.current === generation) {
+          activeCodexTestRequestId.current = null;
+        }
+        if (result.phase === "success") {
+          dispatchCodex({
+            type: "test_succeeded",
+            generation,
+            input: result.input,
+            output: result.output,
+          });
+        } else if (result.phase === "cancelled") {
+          dispatchCodex({ type: "test_cancelled", generation });
+        } else {
+          dispatchCodex({
+            type: "test_failed",
+            generation,
+            reason: result.reason,
+          });
+        }
       })
-      .catch((reason) => {
+      .catch(() => {
         if (
           consumeCancelledCodexTest(
             cancelledCodexTests.current,
             generation,
           )
         ) {
+          if (activeCodexTestRequestId.current === generation) {
+            activeCodexTestRequestId.current = null;
+          }
           dispatchCodex({ type: "test_cancelled", generation });
           return;
         }
         cancelledCodexTests.current.delete(generation);
+        if (activeCodexTestRequestId.current === generation) {
+          activeCodexTestRequestId.current = null;
+        }
         dispatchCodex({
           type: "test_failed",
           generation,
-          reason: codexTestFailure(reason),
+          reason: "unknown",
         });
       });
   };
 
   const cancelCodexTest = () => {
-    const generation = codexTestGeneration.current;
+    const generation = activeCodexTestRequestId.current;
+    if (generation === null) return;
     cancelledCodexTests.current.add(generation);
     dispatchCodex({ type: "test_cancel_requested", generation });
-    invoke("cancel_codex_polish")
-      .then(() => dispatchCodex({ type: "test_cancelled", generation }))
+    invoke<boolean>("cancel_codex_test", { requestId: generation })
       .catch(() => {
         cancelledCodexTests.current.delete(generation);
-        dispatchCodex({ type: "test_failed", generation, reason: "unknown" });
+        // 取消命令未送達時，原測試仍可能正常完成；不要把 active id 清掉，
+        // 也不要丟棄稍後回來的真實結果。
+        dispatchCodex({ type: "test_cancel_failed", generation });
+        onToast("取消未送達；Codex 測試仍在進行");
       });
   };
 
@@ -681,9 +936,12 @@ export default function Settings({
   const codexMutationPending =
     codexEnablePending ||
     codexPreferencesSaving ||
+    codexCorrectionSaving ||
     codexPolicySaving ||
     codexUi.test.phase === "running" ||
     codexUi.test.phase === "cancelling";
+  const modeControlsDisabled =
+    !llm || (llm.provider === "codex" && codexMutationPending);
 
   return (
     <div className="page-in">
@@ -911,57 +1169,107 @@ export default function Settings({
       </Section>
 
       <Section title="AI 潤飾">
+        {polishError && (
+          <div
+            className="config-error"
+            role="alert"
+            ref={polishErrorRef}
+            tabIndex={-1}
+          >
+            <span>{polishError}</span>
+            <button
+              className="btn no-drag"
+              onClick={() => {
+                setPolishError(null);
+                loadLlm();
+              }}
+            >
+              重新載入目前設定
+            </button>
+          </div>
+        )}
         <fieldset
           className="mode-picker"
-          disabled={!llm || (llm.provider === "codex" && codexMutationPending)}
+          disabled={modeControlsDisabled}
         >
           <legend>文字整理模式</legend>
           <p className="mode-picker-help">模式決定 Claro 可以怎麼改文字；處理引擎與資料位置在下方另外選擇。</p>
           <div className="mode-grid">
-            {POLISH_MODES.map((mode) => (
-              <label
-                className={`mode-card ${llm?.polish_mode === mode.id ? "selected" : ""}`}
-                key={mode.id}
-              >
-                <input
-                  type="radio"
-                  name="polish-mode"
-                  value={mode.id}
-                  checked={llm?.polish_mode === mode.id}
-                  onChange={() => requestMode(mode.id)}
-                />
-                <span className="mode-card-title">
-                  {mode.title}
-                  {mode.tag && (
-                    <span
-                      className={`pill ${
-                        mode.id === "organize" || mode.id === "correct" ? "amber" : "blue"
-                      }`}
-                    >
-                      {mode.tag}
-                    </span>
-                  )}
-                </span>
-                <span className="mode-card-description">{mode.description}</span>
-              </label>
-            ))}
+            {POLISH_MODES.map((mode) => {
+              const unavailable =
+                modeControlsDisabled ||
+                !modeSupportedByProvider(mode.id, llm?.provider ?? "off");
+              const descriptionId = `polish-mode-${mode.id}-description`;
+              return (
+                <label
+                  className={`mode-card ${llm?.polish_mode === mode.id ? "selected" : ""} ${unavailable ? "disabled" : ""}`}
+                  aria-disabled={unavailable}
+                  key={mode.id}
+                >
+                  <input
+                    type="radio"
+                    name="polish-mode"
+                    value={mode.id}
+                    checked={llm?.polish_mode === mode.id}
+                    disabled={unavailable}
+                    aria-describedby={`${descriptionId} polish-mode-provider-help`}
+                    onChange={() => requestMode(mode.id)}
+                  />
+                  <span className="mode-card-title">
+                    {mode.title}
+                    {mode.tag && (
+                      <span
+                        className={`pill ${
+                          mode.id === "organize" || mode.id === "correct" ? "amber" : "blue"
+                        }`}
+                      >
+                        {mode.tag}
+                      </span>
+                    )}
+                  </span>
+                  <span
+                    className="mode-card-description"
+                    id={descriptionId}
+                  >
+                    {mode.description}
+                  </span>
+                </label>
+              );
+            })}
           </div>
+          {llm?.provider === "codex" ? (
+            <p className="mode-picker-help" id="polish-mode-provider-help">
+              Codex 目前只支援「專業校字」；要使用保守校訂或條理整理，請先在下方選擇其他引擎。
+            </p>
+          ) : (
+            <p className="mode-picker-help" id="polish-mode-provider-help">
+              「專業校字」目前只支援 Codex；選擇 Codex
+              並完成雲端同意後會自動切換。
+            </p>
+          )}
         </fieldset>
 
         {pendingMode === "correct" && (
           <section className="consent-panel" aria-labelledby="correct-confirm-title">
             <div>
-              <div id="correct-confirm-title" className="consent-title">啟用「專業校字」？</div>
-              <p>這個實驗模式會統一已授權專業詞的拼法格式，與不改字的「保守校訂」不同。</p>
+              <div
+                ref={modeConsentHeadingRef}
+                id="correct-confirm-title"
+                className="consent-title"
+                tabIndex={-1}
+              >
+                啟用「專業校字」？
+              </div>
+              <p>這個實驗模式會嘗試統一已授權專業詞的拼法格式，與不改字的「保守校訂」不同；結構 guard 只能降低風險，不能證明語意一定正確。</p>
               <ul>
-                <li><b>可能改變：</b>已授權英文詞的大小寫、空白、底線、連字號或標點。</li>
-                <li><b>不會猜字：</b>字母不同或同音誤認不自動替換；這類固定錯字請用個人字典。</li>
+                <li><b>可能改變：</b>只移除符合極窄規則的單一尾端連字號；仍可能誤判，重要文字請檢查。</li>
+                <li><b>不會自動處理：</b>空白合併、字母不同、同音誤認或其他分隔；已知 source→target 請用個人字典。</li>
                 <li><b>必須保留：</b>數字、日期、否定、條件、URL、版本、句序與語氣。</li>
                 <li><b>安全退回：</b>沒有足夠證據、處理逾時或內容保護未通過時，使用本機結果。</li>
               </ul>
             </div>
             <div className="consent-actions">
-              <button className="btn no-drag" onClick={() => setPendingMode(null)}>取消</button>
+              <button className="btn no-drag" onClick={cancelPendingMode}>取消</button>
               <button className="btn-primary no-drag" onClick={() => applyMode("correct", true)}>
                 我了解，啟用專業校字
               </button>
@@ -972,7 +1280,14 @@ export default function Settings({
         {pendingMode === "organize" && (
           <section className="consent-panel" aria-labelledby="organize-confirm-title">
             <div>
-              <div id="organize-confirm-title" className="consent-title">啟用「條理整理」？</div>
+              <div
+                ref={modeConsentHeadingRef}
+                id="organize-confirm-title"
+                className="consent-title"
+                tabIndex={-1}
+              >
+                啟用「條理整理」？
+              </div>
               <p>這個模式不只校訂，會改變句子順序與段落結構。重要內容仍應由你檢查。</p>
               <ul>
                 <li><b>可能改變：</b>完整句子的順序、段落、完全重複片段與明確清單格式。</li>
@@ -981,7 +1296,7 @@ export default function Settings({
               </ul>
             </div>
             <div className="consent-actions">
-              <button className="btn no-drag" onClick={() => setPendingMode(null)}>取消</button>
+              <button className="btn no-drag" onClick={cancelPendingMode}>取消</button>
               <button className="btn-primary no-drag" onClick={() => applyMode("organize", true)}>
                 我了解，啟用條理整理
               </button>
@@ -991,13 +1306,19 @@ export default function Settings({
 
         <Row
           label="文字整理位置"
-          sub={llm?.polish_mode === "raw" ? "原樣轉錄不會執行文字整理；這個選擇會保留給其他模式使用。" : "這只決定在哪裡處理，不會改變上方模式的行為界線。"}
+          sub={
+            llm?.polish_mode === "raw"
+              ? "原樣轉錄不會執行文字整理；這個選擇會保留給其他模式使用。"
+              : "引擎不會放寬模式的行為界線；若所選引擎不支援目前模式，Claro 會改用相容模式或安全退回原樣轉錄。"
+          }
         >
           <select
+            ref={polishProviderSelectRef}
             className="select no-drag"
             aria-label="文字整理位置"
             name="polish-provider"
             value={llm?.provider ?? "off"}
+            disabled={!llm || codexMutationPending}
             onChange={(e) => saveLlm({ provider: e.target.value })}
           >
             <option value="off" disabled>尚未選擇整理方式</option>
@@ -1008,7 +1329,7 @@ export default function Settings({
               <option value="builtin">Claro 內建模型（不需其他 App）</option>
             </optgroup>
             <optgroup label="進階：只在你已經使用時選擇">
-              <option value="codex">Codex CLI（使用這台 Mac 的既有登入・雲端）</option>
+              <option value="codex">Codex 專業拼法（使用既有登入・雲端）</option>
               <option value="ollama">連接既有 Ollama</option>
               <option value="lmstudio">連接既有 LM Studio</option>
               <option value="custom">自訂 API（OpenAI 相容）</option>
@@ -1017,28 +1338,42 @@ export default function Settings({
         </Row>
 
         {llm?.provider === "codex" && (
-          <CodexProviderPanel
-            status={codexUi.status}
-            preferences={codexPreferences}
-            testState={codexUi.test}
-            globalContextEnabled={status.context_enabled}
-            enablePending={codexEnablePending}
-            preferencesSaving={codexPreferencesSaving || codexPolicySaving}
-            onRefresh={probeCodex}
-            onEnable={enableCodex}
-            onSaveCorrectionPreferences={(value) =>
-              setCodexPreferences(value, codexPreferences.share_context_terms, false)
-            }
-            onShareContextTermsChange={(enabled) =>
-              setCodexPreferences(
-                codexPreferences.correction_preferences,
-                enabled,
-                enabled,
-              )
-            }
-            onTest={runCodexTest}
-            onCancelTest={cancelCodexTest}
-          />
+          <>
+            {codexError && (
+              <div
+                className="config-error"
+                role="alert"
+                ref={codexErrorRef}
+                tabIndex={-1}
+              >
+                <span>{codexError}</span>
+                <button className="btn no-drag" onClick={probeCodex}>
+                  重新檢查 Codex
+                </button>
+              </div>
+            )}
+            <CodexProviderPanel
+              status={codexUi.status}
+              preferences={codexPreferences}
+              testState={codexUi.test}
+              globalContextEnabled={status.context_enabled}
+              enablePending={codexEnablePending}
+              preferencesSaving={codexPreferencesSaving || codexPolicySaving}
+              correctionDraftValue={
+                codexCorrectionDraft ??
+                codexPreferences.correction_preferences
+              }
+              onRefresh={probeCodex}
+              onEnable={enableCodex}
+              onSaveCorrectionPreferences={saveCodexCorrectionPreferences}
+              onCorrectionDraftChange={setCodexCorrectionDraft}
+              onShareContextTermsChange={(enabled) =>
+                setCodexContextTerms(enabled, enabled)
+              }
+              onTest={runCodexTest}
+              onCancelTest={cancelCodexTest}
+            />
+          </>
         )}
 
         <Row
@@ -1053,6 +1388,7 @@ export default function Settings({
             <input
               type="checkbox"
               name="local-only"
+              aria-label="僅限本機"
               checked={llm?.local_only ?? false}
               disabled={
                 !llm ||
@@ -1388,8 +1724,8 @@ export default function Settings({
               </button>
             </Row>
             {testResult && (
-              <div className="row" style={{ background: "var(--green-soft)" }}>
-                <div className="text-[13px]" style={{ color: "var(--green)" }}>
+              <div className="row polish-test-result">
+                <div className="polish-test-success">
                   ✓ {testResult}
                 </div>
               </div>
@@ -1519,8 +1855,7 @@ export default function Settings({
               />
             </div>
             <button
-              className="btn no-drag"
-              style={{ color: "var(--red)" }}
+              className="btn danger-quiet no-drag"
               onClick={() => saveDict((dict ?? []).filter((_, j) => j !== i))}
             >
               刪除

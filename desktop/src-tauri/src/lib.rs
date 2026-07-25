@@ -21,6 +21,7 @@ pub mod state_machine;
 pub mod stt;
 pub mod textproc;
 
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -43,6 +44,22 @@ struct AppState {
     mic_test: Arc<Mutex<Option<CaptureHandle>>>,
     mic_test_passed: Arc<AtomicBool>,
     mic_test_generation: Arc<AtomicU64>,
+    /// Codex 自我測試使用 request-scoped cancel handle；不可碰正式聽寫的全域
+    /// policy generation 或 active process group。
+    codex_test_cancellations: Arc<Mutex<CodexTestCancellationRegistry>>,
+}
+
+const MAX_CODEX_TEST_CANCEL_TOMBSTONES: usize = 128;
+
+enum CodexTestCancellation {
+    Active(Arc<AtomicBool>),
+    CancelledBeforeStart,
+}
+
+#[derive(Default)]
+struct CodexTestCancellationRegistry {
+    entries: HashMap<u64, CodexTestCancellation>,
+    tombstone_order: VecDeque<u64>,
 }
 
 fn accessibility_trusted() -> bool {
@@ -862,6 +879,11 @@ fn set_llm_config(
                     serde_json::Value::Null,
                 ),
             ]);
+            if current.polish_mode() == settings::PolishMode::Correct {
+                // CORRECT 目前需要 Codex 的結構化 proposal。離開 Codex 時
+                // 原子地回到 CLEAN，避免普通 provider 被 UI 誤標成專業校字。
+                pairs.push(("polish_mode".into(), "clean".into()));
+            }
         }
         settings::update_config_keys(&settings::config_path(), pairs).map_err(|e| e.to_string())
     })?;
@@ -873,6 +895,7 @@ fn set_polish_mode(mode: String, confirmed: bool) -> Result<LlmConfig, String> {
     let mode = mode.parse::<settings::PolishMode>()?;
     codex::with_policy_change(|| {
         let current = settings::Settings::load();
+        validate_polish_mode_provider(mode, &current.llm_provider())?;
         validate_polish_mode_consent(
             mode,
             current.correct_consent_valid(),
@@ -897,6 +920,20 @@ fn set_polish_mode(mode: String, confirmed: bool) -> Result<LlmConfig, String> {
     Ok(get_llm_config())
 }
 
+fn validate_polish_mode_provider(mode: settings::PolishMode, provider: &str) -> Result<(), String> {
+    match (mode, provider) {
+        (settings::PolishMode::Raw, _) => Ok(()),
+        (settings::PolishMode::Correct, "codex") => Ok(()),
+        (settings::PolishMode::Correct, _) => {
+            Err("專業校字目前只支援 Codex；請先選擇 Codex".into())
+        }
+        (settings::PolishMode::Clean | settings::PolishMode::Organize, "codex") => {
+            Err("Codex 目前只支援專業校字；請先選擇其他整理引擎".into())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn validate_polish_mode_consent(
     mode: settings::PolishMode,
     correct_consent_valid: bool,
@@ -917,7 +954,7 @@ fn set_local_only(enabled: bool, confirmed: bool) -> Result<LlmConfig, String> {
     codex::with_policy_change(|| {
         let current = settings::Settings::load();
         if !enabled && current.llm_provider() == "codex" {
-            return Err("Codex 的雲端同意必須從「Codex CLI 校字」面板重新確認".into());
+            return Err("Codex 的雲端同意必須從「Codex 專業拼法」面板重新確認".into());
         }
         if !enabled && current.local_only() && !confirmed {
             return Err("關閉「僅限本機」前必須明確確認雲端資料傳送".into());
@@ -964,10 +1001,15 @@ fn set_local_only(enabled: bool, confirmed: bool) -> Result<LlmConfig, String> {
 async fn get_codex_status() -> codex::CodexStatus {
     tauri::async_runtime::spawn_blocking(|| {
         let (current, policy_epoch) = codex::policy_snapshot(settings::Settings::load);
-        let result = codex::probe(current.codex_cli_path().as_deref());
+        let mut result = codex::probe(current.codex_cli_path().as_deref());
         if current.llm_provider() == "codex" {
             let auth_changed = result.availability == codex::CodexAvailability::Ready
                 && result.auth_mode != current.codex_auth_mode();
+            let contract_changed = result.availability == codex::CodexAvailability::Ready
+                && result
+                    .contract
+                    .as_ref()
+                    .is_none_or(|contract| !current.codex_contract_matches(contract));
             let explicitly_unusable = matches!(
                 result.availability,
                 codex::CodexAvailability::NotInstalled
@@ -975,12 +1017,39 @@ async fn get_codex_status() -> codex::CodexStatus {
                     | codex::CodexAvailability::Unsupported
                     | codex::CodexAvailability::MissingCapability
             );
-            if auth_changed || explicitly_unusable {
+            if auth_changed || contract_changed || explicitly_unusable {
                 let auth_value = result
                     .auth_mode
                     .map(|auth_mode| serde_json::Value::String(auth_mode.as_str().into()))
                     .unwrap_or(serde_json::Value::Null);
-                let _ = codex::with_policy_change_if(policy_epoch, || {
+                let version_value = result
+                    .version
+                    .clone()
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null);
+                let executable_path_value = result
+                    .executable_path
+                    .clone()
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null);
+                let raw_version_value = result
+                    .contract
+                    .as_ref()
+                    .map(|contract| serde_json::Value::String(contract.raw_version.clone()))
+                    .unwrap_or(serde_json::Value::Null);
+                let executable_sha256_value = result
+                    .contract
+                    .as_ref()
+                    .map(|contract| serde_json::Value::String(contract.executable_sha256.clone()))
+                    .unwrap_or(serde_json::Value::Null);
+                let capability_fingerprint_value = result
+                    .contract
+                    .as_ref()
+                    .map(|contract| {
+                        serde_json::Value::String(contract.capability_fingerprint.clone())
+                    })
+                    .unwrap_or(serde_json::Value::Null);
+                if let Err(error) = codex::with_policy_change_if(policy_epoch, || {
                     if settings::Settings::load().llm_provider() != "codex" {
                         return Err("codex_request_stale".into());
                     }
@@ -989,6 +1058,14 @@ async fn get_codex_status() -> codex::CodexStatus {
                         vec![
                             ("local_only".into(), true.into()),
                             ("codex_auth_kind".into(), auth_value),
+                            ("codex_cli_path".into(), executable_path_value),
+                            ("codex_cli_version".into(), version_value),
+                            ("codex_cli_raw_version".into(), raw_version_value),
+                            ("codex_executable_sha256".into(), executable_sha256_value),
+                            (
+                                "codex_capability_fingerprint".into(),
+                                capability_fingerprint_value,
+                            ),
                             ("cloud_consent_version".into(), 0.into()),
                             ("cloud_consent_origin".into(), serde_json::Value::Null),
                             ("cloud_consent_target".into(), serde_json::Value::Null),
@@ -1001,7 +1078,11 @@ async fn get_codex_status() -> codex::CodexStatus {
                         ],
                     )
                     .map_err(|error| error.to_string())
-                });
+                }) {
+                    tracing::error!("failed to persist Codex safety revocation: {error}");
+                    result.availability = codex::CodexAvailability::ProbeFailed;
+                    result.error_code = Some("policy_update_failed".into());
+                }
             }
         }
         result
@@ -1013,6 +1094,7 @@ async fn get_codex_status() -> codex::CodexStatus {
         auth_mode: None,
         executable_path: None,
         error_code: Some("probe_join_failed".into()),
+        contract: None,
     })
 }
 
@@ -1044,8 +1126,13 @@ async fn enable_codex_provider(
             .into());
         }
         let auth_mode = probe.auth_mode.ok_or("codex_auth_required")?;
-        let target = codex::consent_target(auth_mode);
+        let contract = probe.contract.as_ref().ok_or("codex_unsupported")?;
+        let target = codex::contract_consent_target(auth_mode, contract);
         let context_target = format!("{target}:context-terms-v1");
+        let cli_version = contract.version.clone();
+        let raw_version = contract.raw_version.clone();
+        let executable_sha256 = contract.executable_sha256.clone();
+        let capability_fingerprint = contract.capability_fingerprint.clone();
         codex::with_policy_change_if(policy_epoch, || {
             let latest = settings::Settings::load();
             if latest.llm_provider() != "codex" {
@@ -1071,6 +1158,22 @@ async fn enable_codex_provider(
                             .executable_path
                             .map(serde_json::Value::String)
                             .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "codex_cli_version".into(),
+                        serde_json::Value::String(cli_version),
+                    ),
+                    (
+                        "codex_cli_raw_version".into(),
+                        serde_json::Value::String(raw_version),
+                    ),
+                    (
+                        "codex_executable_sha256".into(),
+                        serde_json::Value::String(executable_sha256),
+                    ),
+                    (
+                        "codex_capability_fingerprint".into(),
+                        serde_json::Value::String(capability_fingerprint),
                     ),
                     (
                         "cloud_consent_version".into(),
@@ -1112,11 +1215,7 @@ async fn enable_codex_provider(
 }
 
 #[tauri::command]
-fn set_codex_preferences(
-    correction_preferences: String,
-    share_context_terms: bool,
-    confirmed: bool,
-) -> Result<LlmConfig, String> {
+fn set_codex_correction_preferences(correction_preferences: String) -> Result<LlmConfig, String> {
     let (current, policy_epoch) = codex::policy_snapshot(settings::Settings::load);
     if current.llm_provider() != "codex" {
         return Err("目前未選擇 Codex".into());
@@ -1125,14 +1224,39 @@ fn set_codex_preferences(
     if correction_preferences.chars().count() > settings::CODEX_CORRECTION_PREFERENCES_MAX_CHARS {
         return Err("校字偏好最多 1000 字".into());
     }
+    codex::with_policy_change_if(policy_epoch, || {
+        if settings::Settings::load().llm_provider() != "codex" {
+            return Err("codex_request_stale".into());
+        }
+        settings::update_config_key(
+            &settings::config_path(),
+            "codex_correction_preferences",
+            correction_preferences.into(),
+        )
+        .map_err(|error| error.to_string())
+    })?;
+    Ok(get_llm_config())
+}
+
+#[tauri::command]
+fn set_codex_context_terms_enabled(enabled: bool, confirmed: bool) -> Result<LlmConfig, String> {
+    let (current, policy_epoch) = codex::policy_snapshot(settings::Settings::load);
+    if current.llm_provider() != "codex" {
+        return Err("目前未選擇 Codex".into());
+    }
+    let share_context_terms = enabled;
     if share_context_terms && !current.context_enabled() {
         return Err("螢幕上下文已關閉，無法啟用畫面詞彙分享".into());
     }
     if share_context_terms && !current.codex_context_consent_valid() && !confirmed {
         return Err("啟用畫面詞彙分享前必須明確確認資料傳送".into());
     }
-    let auth_mode = current.codex_auth_mode().ok_or("codex_auth_required")?;
-    let context_target = format!("{}:context-terms-v1", codex::consent_target(auth_mode));
+    let context_target = format!(
+        "{}:context-terms-v1",
+        current
+            .codex_consent_target()
+            .ok_or("codex_consent_required")?
+    );
     codex::with_policy_change_if(policy_epoch, || {
         if settings::Settings::load().llm_provider() != "codex" {
             return Err("codex_request_stale".into());
@@ -1140,10 +1264,6 @@ fn set_codex_preferences(
         settings::update_config_keys(
             &settings::config_path(),
             vec![
-                (
-                    "codex_correction_preferences".into(),
-                    correction_preferences.into(),
-                ),
                 (
                     "codex_share_context_terms".into(),
                     share_context_terms.into(),
@@ -1171,59 +1291,174 @@ fn set_codex_preferences(
     Ok(get_llm_config())
 }
 
-#[derive(Serialize)]
-struct CodexTestResult {
-    input: String,
-    output: String,
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CodexTestFailureReason {
+    Timeout,
+    RateLimited,
+    AuthRequired,
+    ConsentChanged,
+    Unavailable,
+    OutputRejected,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+enum CodexTestResult {
+    Success { input: String, output: String },
+    Failed { reason: CodexTestFailureReason },
+    Cancelled,
+}
+
+fn codex_test_failure(reason: Option<polish::PolishFallbackReason>) -> CodexTestResult {
+    use polish::PolishFallbackReason;
+    match reason {
+        Some(PolishFallbackReason::CodexCancelled) => CodexTestResult::Cancelled,
+        Some(PolishFallbackReason::CodexTimeout) => CodexTestResult::Failed {
+            reason: CodexTestFailureReason::Timeout,
+        },
+        Some(PolishFallbackReason::CodexUsageLimited) => CodexTestResult::Failed {
+            reason: CodexTestFailureReason::RateLimited,
+        },
+        Some(PolishFallbackReason::CodexAuthRequired) => CodexTestResult::Failed {
+            reason: CodexTestFailureReason::AuthRequired,
+        },
+        Some(PolishFallbackReason::CloudConsentRequired) => CodexTestResult::Failed {
+            reason: CodexTestFailureReason::ConsentChanged,
+        },
+        Some(PolishFallbackReason::CodexInvalidOutput)
+        | Some(PolishFallbackReason::CodexOutputRejected) => CodexTestResult::Failed {
+            reason: CodexTestFailureReason::OutputRejected,
+        },
+        _ => CodexTestResult::Failed {
+            reason: CodexTestFailureReason::Unavailable,
+        },
+    }
 }
 
 #[tauri::command]
-async fn test_codex_polish() -> Result<CodexTestResult, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+async fn test_codex_polish(
+    request_id: u64,
+    state: tauri::State<'_, AppState>,
+) -> Result<CodexTestResult, String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    register_codex_test_request(&state.codex_test_cancellations, request_id, cancel.clone())?;
+    let worker_cancel = cancel.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        if worker_cancel.load(Ordering::SeqCst) {
+            return CodexTestResult::Cancelled;
+        }
         let settings = settings::Settings::load();
         if settings.llm_provider() != "codex" {
-            return Err("codex_unavailable".into());
+            return CodexTestResult::Failed {
+                reason: CodexTestFailureReason::Unavailable,
+            };
         }
-        let input = "今天用 Py Torch 跑 training，版本是 2.7.1，不要升級到 3.0。".to_string();
-        let local_terms = vec!["PyTorch".to_string()];
-        let cancel = AtomicBool::new(false);
+        let input = "今天用 Clau-de 跑 training，版本是 2.7.1，不要升級到 3.0。".to_string();
+        let local_terms = vec!["Claude".to_string()];
         let result = polish::transform_with_cancel_and_terms(
             &settings,
             &input,
             "",
             &local_terms,
             &[],
-            &cancel,
+            &worker_cancel,
         );
         if result.metadata.outcome == polish::PolishOutcome::Fallback {
-            return Err(match result.metadata.fallback_reason {
-                Some(reason) => format!("{reason:?}"),
-                None => "codex_unavailable".into(),
-            });
+            return codex_test_failure(result.metadata.fallback_reason);
         }
-        if !result.text.contains("PyTorch")
-            || result.text.contains("Py Torch")
+        if !result.text.contains("Claude")
+            || result.text.contains("Clau-de")
             || !result.text.contains("2.7.1")
             || !result.text.contains("不要")
             || !result.text.contains("3.0")
         {
-            return Err("codex_output_rejected".into());
+            return CodexTestResult::Failed {
+                reason: CodexTestFailureReason::OutputRejected,
+            };
         }
-        Ok(CodexTestResult {
+        CodexTestResult::Success {
             input,
             output: result.text,
-        })
+        }
     })
-    .await
-    .map_err(|error| error.to_string())?
+    .await;
+    finish_codex_test_request(&state.codex_test_cancellations, request_id, &cancel);
+    result.map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn cancel_codex_polish() -> Result<(), String> {
-    if codex::cancel_active_and_wait() {
-        Ok(())
-    } else {
-        Err("codex_cancel_failed".into())
+fn cancel_codex_test(request_id: u64, state: tauri::State<'_, AppState>) -> bool {
+    cancel_codex_test_request(&state.codex_test_cancellations, request_id)
+}
+
+fn cancel_codex_test_request(
+    registry: &Mutex<CodexTestCancellationRegistry>,
+    request_id: u64,
+) -> bool {
+    let mut registry = registry.lock().unwrap();
+    match registry.entries.entry(request_id) {
+        Entry::Occupied(entry) => {
+            if let CodexTestCancellation::Active(cancel) = entry.get() {
+                codex::cancel_request(cancel);
+            }
+            true
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(CodexTestCancellation::CancelledBeforeStart);
+            registry.tombstone_order.push_back(request_id);
+            while registry.tombstone_order.len() > MAX_CODEX_TEST_CANCEL_TOMBSTONES {
+                if let Some(expired) = registry.tombstone_order.pop_front() {
+                    if matches!(
+                        registry.entries.get(&expired),
+                        Some(CodexTestCancellation::CancelledBeforeStart)
+                    ) {
+                        registry.entries.remove(&expired);
+                    }
+                }
+            }
+            true
+        }
+    }
+}
+
+fn register_codex_test_request(
+    registry: &Mutex<CodexTestCancellationRegistry>,
+    request_id: u64,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let mut registry = registry.lock().unwrap();
+    match registry.entries.entry(request_id) {
+        Entry::Occupied(mut entry) => match entry.get() {
+            CodexTestCancellation::Active(_) => Err("codex_test_duplicate".into()),
+            CodexTestCancellation::CancelledBeforeStart => {
+                cancel.store(true, Ordering::SeqCst);
+                entry.insert(CodexTestCancellation::Active(cancel));
+                registry
+                    .tombstone_order
+                    .retain(|existing| *existing != request_id);
+                Ok(())
+            }
+        },
+        Entry::Vacant(entry) => {
+            entry.insert(CodexTestCancellation::Active(cancel));
+            Ok(())
+        }
+    }
+}
+
+fn finish_codex_test_request(
+    registry: &Mutex<CodexTestCancellationRegistry>,
+    request_id: u64,
+    cancel: &Arc<AtomicBool>,
+) {
+    let mut registry = registry.lock().unwrap();
+    let owns_entry = matches!(
+        registry.entries.get(&request_id),
+        Some(CodexTestCancellation::Active(active)) if Arc::ptr_eq(active, cancel)
+    );
+    if owns_entry {
+        registry.entries.remove(&request_id);
     }
 }
 
@@ -1532,12 +1767,64 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+fn refresh_codex_contract_on_startup() {
+    let (current, policy_epoch) = codex::policy_snapshot(settings::Settings::load);
+    if current.llm_provider() != "codex" {
+        return;
+    }
+    let status = codex::probe(current.codex_cli_path().as_deref());
+    let ready_contract_changed = status.availability == codex::CodexAvailability::Ready
+        && (status.auth_mode != current.codex_auth_mode()
+            || status
+                .contract
+                .as_ref()
+                .is_none_or(|contract| !current.codex_contract_matches(contract)));
+    let explicitly_unusable = matches!(
+        status.availability,
+        codex::CodexAvailability::NotInstalled
+            | codex::CodexAvailability::NotAuthenticated
+            | codex::CodexAvailability::Unsupported
+            | codex::CodexAvailability::MissingCapability
+    );
+    if !ready_contract_changed && !explicitly_unusable {
+        return;
+    }
+    if let Err(error) = codex::with_policy_change_if(policy_epoch, || {
+        if settings::Settings::load().llm_provider() != "codex" {
+            return Err("codex_request_stale".into());
+        }
+        settings::update_config_keys(
+            &settings::config_path(),
+            vec![
+                ("local_only".into(), true.into()),
+                ("cloud_consent_version".into(), 0.into()),
+                ("cloud_consent_origin".into(), serde_json::Value::Null),
+                ("cloud_consent_target".into(), serde_json::Value::Null),
+                ("codex_share_context_terms".into(), false.into()),
+                ("codex_context_consent_version".into(), 0.into()),
+                (
+                    "codex_context_consent_target".into(),
+                    serde_json::Value::Null,
+                ),
+            ],
+        )
+        .map_err(|error| error.to_string())
+    }) {
+        tracing::error!("failed to revoke stale Codex consent during startup: {error}");
+    }
+}
+
 /// 所有重初始化（引擎、overlay、熱鍵、預載）都在這裡——
 /// 必須在 single-instance 檢查之後才跑，第二個實例才不會 spawn 任何東西。
 fn init_core(app: &tauri::AppHandle) {
     let cfg = settings::Settings::load();
     let spec = registry::resolve(&cfg.whisper_model());
     tracing::info!("Claro starting — STT model: {}", spec.id);
+
+    // 正式聽寫 hot path 只接受本次 process 已完成的 capability contract。
+    // 啟動時背景重建快取；CLI path、raw version、bytes 或 features 漂移時
+    // 先撤銷同意，絕不把第一段 transcript 當 capability probe。
+    std::thread::spawn(refresh_codex_contract_on_startup);
 
     #[cfg(target_os = "macos")]
     let engine: Box<dyn stt::SttEngine> = Box::new(stt::transcribe::TranscribeEngine::new(
@@ -1678,6 +1965,7 @@ fn init_core(app: &tauri::AppHandle) {
         mic_test,
         mic_test_passed,
         mic_test_generation,
+        codex_test_cancellations: Arc::new(Mutex::new(CodexTestCancellationRegistry::default())),
     });
 }
 
@@ -1710,6 +1998,16 @@ mod product_gate_tests {
             validate_polish_mode_consent(settings::PolishMode::Organize, false, false, false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn polish_mode_provider_contract_rejects_incompatible_combinations() {
+        assert!(validate_polish_mode_provider(settings::PolishMode::Raw, "codex").is_ok());
+        assert!(validate_polish_mode_provider(settings::PolishMode::Correct, "codex").is_ok());
+        assert!(validate_polish_mode_provider(settings::PolishMode::Correct, "apple").is_err());
+        assert!(validate_polish_mode_provider(settings::PolishMode::Clean, "codex").is_err());
+        assert!(validate_polish_mode_provider(settings::PolishMode::Organize, "codex").is_err());
+        assert!(validate_polish_mode_provider(settings::PolishMode::Clean, "off").is_ok());
     }
 
     #[test]
@@ -1780,6 +2078,91 @@ mod product_gate_tests {
         assert_eq!(result, Err(models::DOWNLOAD_CANCELLED.into()));
         drop(held);
     }
+
+    #[test]
+    fn codex_test_cancel_is_request_scoped_and_does_not_touch_dictation() {
+        let active = Mutex::new(CodexTestCancellationRegistry::default());
+        let first_test = Arc::new(AtomicBool::new(false));
+        let second_test = Arc::new(AtomicBool::new(false));
+        let formal_dictation = AtomicBool::new(false);
+        register_codex_test_request(&active, 41, first_test.clone()).unwrap();
+        register_codex_test_request(&active, 42, second_test.clone()).unwrap();
+
+        assert!(cancel_codex_test_request(&active, 41));
+        assert!(first_test.load(Ordering::SeqCst));
+        assert!(!second_test.load(Ordering::SeqCst));
+        assert!(!formal_dictation.load(Ordering::SeqCst));
+        assert!(cancel_codex_test_request(&active, 99));
+    }
+
+    #[test]
+    fn codex_test_duplicate_does_not_overwrite_the_original_cancel_handle() {
+        let registry = Mutex::new(CodexTestCancellationRegistry::default());
+        let original = Arc::new(AtomicBool::new(false));
+        let duplicate = Arc::new(AtomicBool::new(false));
+        register_codex_test_request(&registry, 7, original.clone()).unwrap();
+
+        assert_eq!(
+            register_codex_test_request(&registry, 7, duplicate.clone()),
+            Err("codex_test_duplicate".into())
+        );
+        assert!(cancel_codex_test_request(&registry, 7));
+        assert!(original.load(Ordering::SeqCst));
+        assert!(!duplicate.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn codex_test_cancel_before_start_is_consumed_and_tombstones_are_bounded() {
+        let registry = Mutex::new(CodexTestCancellationRegistry::default());
+        assert!(cancel_codex_test_request(&registry, 55));
+        let late = Arc::new(AtomicBool::new(false));
+        register_codex_test_request(&registry, 55, late.clone()).unwrap();
+        assert!(late.load(Ordering::SeqCst));
+        finish_codex_test_request(&registry, 55, &late);
+
+        for request_id in 1_000..(1_000 + MAX_CODEX_TEST_CANCEL_TOMBSTONES as u64 + 5) {
+            assert!(cancel_codex_test_request(&registry, request_id));
+        }
+        let registry = registry.lock().unwrap();
+        assert_eq!(
+            registry.tombstone_order.len(),
+            MAX_CODEX_TEST_CANCEL_TOMBSTONES
+        );
+        assert_eq!(
+            registry
+                .entries
+                .values()
+                .filter(|value| matches!(value, CodexTestCancellation::CancelledBeforeStart))
+                .count(),
+            MAX_CODEX_TEST_CANCEL_TOMBSTONES
+        );
+    }
+
+    #[test]
+    fn codex_test_failures_use_the_typed_ui_contract() {
+        assert_eq!(
+            codex_test_failure(Some(polish::PolishFallbackReason::CodexTimeout)),
+            CodexTestResult::Failed {
+                reason: CodexTestFailureReason::Timeout,
+            }
+        );
+        assert_eq!(
+            codex_test_failure(Some(polish::PolishFallbackReason::CodexOutputRejected)),
+            CodexTestResult::Failed {
+                reason: CodexTestFailureReason::OutputRejected,
+            }
+        );
+        assert_eq!(
+            codex_test_failure(Some(polish::PolishFallbackReason::CodexCancelled)),
+            CodexTestResult::Cancelled
+        );
+        assert_eq!(
+            codex_test_failure(Some(polish::PolishFallbackReason::CloudConsentRequired)),
+            CodexTestResult::Failed {
+                reason: CodexTestFailureReason::ConsentChanged,
+            }
+        );
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1811,9 +2194,10 @@ pub fn run() {
             set_local_only,
             get_codex_status,
             enable_codex_provider,
-            set_codex_preferences,
+            set_codex_correction_preferences,
+            set_codex_context_terms_enabled,
             test_codex_polish,
-            cancel_codex_polish,
+            cancel_codex_test,
             set_llm_key,
             list_provider_models,
             test_polish,

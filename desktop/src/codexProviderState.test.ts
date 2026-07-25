@@ -1,6 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  allocateCodexTestRequestId,
+  cancelCodexTestOnDispose,
   codexConsentIsReady,
+  codexPrimaryConsentIsValid,
   codexProviderReducer,
   codexTestIsPending,
   consumeCancelledCodexTest,
@@ -68,8 +71,9 @@ describe("resolveLlmConfig Codex privacy gates", () => {
     const resolved = resolveLlmConfig(
       config({
         provider: "codex",
-        polish_mode: "clean",
-        effective_mode: "clean",
+        polish_mode: "correct",
+        effective_mode: "correct",
+        correct_consent_valid: true,
         local_only: false,
       }),
     );
@@ -118,6 +122,32 @@ describe("resolveLlmConfig Codex privacy gates", () => {
     expect(blocked.blocked_reason).toBe("codex_context_consent_required");
     expect(ready.blocked_reason).toBeNull();
     expect(ready.effective_mode).toBe("correct");
+  });
+
+  it("fails closed for provider and mode combinations without a real contract", () => {
+    const ordinaryCorrect = resolveLlmConfig(
+      config({
+        provider: "ollama",
+        model: "qwen3:4b",
+        polish_mode: "correct",
+        correct_consent_valid: true,
+        local_only: true,
+      }),
+    );
+    const codexClean = resolveLlmConfig(
+      config({
+        provider: "codex",
+        polish_mode: "clean",
+        local_only: false,
+        codex_consent_valid: true,
+        cloud_consent_valid: true,
+      }),
+    );
+
+    expect(ordinaryCorrect.blocked_reason).toBe("provider_unavailable");
+    expect(ordinaryCorrect.effective_mode).toBe("raw");
+    expect(codexClean.blocked_reason).toBe("provider_unavailable");
+    expect(codexClean.effective_mode).toBe("raw");
   });
 });
 
@@ -211,6 +241,33 @@ describe("codexProviderReducer", () => {
     expect(state.test.phase).toBe("cancelled");
   });
 
+  it("returns to running when the cancellation command cannot be delivered", () => {
+    let state = createCodexProviderUiState();
+    const generation = nextCodexTestRequestGeneration(state);
+    state = codexProviderReducer(state, {
+      type: "test_started",
+      generation,
+    });
+    state = codexProviderReducer(state, {
+      type: "test_cancel_requested",
+      generation,
+    });
+    state = codexProviderReducer(state, {
+      type: "test_cancel_failed",
+      generation,
+    });
+
+    expect(state.test.phase).toBe("running");
+
+    state = codexProviderReducer(state, {
+      type: "test_succeeded",
+      generation,
+      input: "Clau-de",
+      output: "Claude",
+    });
+    expect(state.test.phase).toBe("success");
+  });
+
   it("ignores a previous test result after a retry starts", () => {
     let state = createCodexProviderUiState();
     const first = nextCodexTestRequestGeneration(state);
@@ -240,9 +297,10 @@ describe("Codex consent helpers", () => {
   });
 
   it("does not claim Codex is connected outside CORRECT mode", () => {
-    expect(
-      codexConsentIsReady(preferences({ correct_mode_active: false }), true),
-    ).toBe(false);
+    const inactive = preferences({ correct_mode_active: false });
+
+    expect(codexConsentIsReady(inactive, true)).toBe(false);
+    expect(codexPrimaryConsentIsValid(inactive)).toBe(true);
   });
 
   it("falls back to transcript-only when global context is off", () => {
@@ -263,11 +321,30 @@ describe("Codex consent helpers", () => {
 });
 
 describe("queued Codex test cancellation", () => {
+  it("allocates request ids outside component state so remounts cannot reuse one", () => {
+    const firstMountRequest = allocateCodexTestRequestId();
+    const secondMountRequest = allocateCodexTestRequestId();
+
+    expect(secondMountRequest).toBeGreaterThan(firstMountRequest);
+  });
+
   it("consumes only the matching generation once", () => {
     const cancelled = new Set([3]);
 
     expect(consumeCancelledCodexTest(cancelled, 3)).toBe(true);
     expect(consumeCancelledCodexTest(cancelled, 3)).toBe(false);
     expect(consumeCancelledCodexTest(cancelled, 4)).toBe(false);
+  });
+
+  it("marks and cancels the active request when its owner is disposed", async () => {
+    const cancelled = new Set<number>();
+    const cancelBackend = vi.fn().mockResolvedValue(true);
+
+    cancelCodexTestOnDispose(41, cancelled, cancelBackend);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(cancelled.has(41)).toBe(true);
+    expect(cancelBackend).toHaveBeenCalledWith(41);
   });
 });

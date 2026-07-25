@@ -262,6 +262,7 @@ mod tests {
                     changed: true,
                     outcome: PolishOutcome::Changed,
                     fallback_reason: None,
+                    codex_payload_started: None,
                     codex_policy_epoch: None,
                     codex_context_used: false,
                 }),
@@ -277,5 +278,38 @@ mod tests {
         assert_eq!(out[0]["polish_mode"], "organize");
         assert_eq!(out[0]["polish_provider"], "builtin");
         assert_eq!(out[0]["polish_outcome"], "changed");
+    }
+
+    #[test]
+    fn codex_payload_audit_is_written_without_runtime_policy_fields() {
+        use crate::polish::{PolishMetadata, PolishOutcome};
+        use crate::settings::PolishMode;
+
+        let path = temp_path();
+        append_entry(
+            NewEntry {
+                raw: "沒有候選",
+                text: "沒有候選",
+                duration_s: 1.0,
+                status: "pasted",
+                timings: None,
+                polish: Some(PolishMetadata {
+                    mode: PolishMode::Correct,
+                    provider: Some("codex".into()),
+                    changed: false,
+                    outcome: PolishOutcome::Unchanged,
+                    fallback_reason: None,
+                    codex_payload_started: Some(false),
+                    codex_policy_epoch: Some(99),
+                    codex_context_used: true,
+                }),
+            },
+            &path,
+        )
+        .unwrap();
+        let out = read_recent(1, &path);
+        assert_eq!(out[0]["polish"]["codex_payload_started"], false);
+        assert!(out[0]["polish"].get("codex_policy_epoch").is_none());
+        assert!(out[0]["polish"].get("codex_context_used").is_none());
     }
 }

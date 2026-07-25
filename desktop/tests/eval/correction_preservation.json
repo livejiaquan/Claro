@@ -1,6 +1,6 @@
 [
   {
-    "id": "approved_term_correction_preserves_all_other_text",
+    "id": "target_only_whitespace_merge_is_rejected",
     "input": "嗯我們用 Py Torch 跑訓練",
     "approved_terms": ["PyTorch"],
     "preferences": "",
@@ -10,22 +10,20 @@
         { "from": "Py Torch", "to": "PyTorch" }
       ]
     },
-    "accepted": true,
-    "output": "嗯我們用 PyTorch 跑訓練"
+    "accepted": false
   },
   {
-    "id": "codex_smoke_py_torch_preserves_numeric_and_negation_anchors",
-    "input": "今天用 Py Torch 跑 training，版本是 2.7.1，不要升級到 3.0。",
-    "approved_terms": ["PyTorch"],
+    "id": "article_phrase_cannot_collapse_into_api_acronym",
+    "input": "Ask A PI first，版本是 2.7.1，不要升級到 3.0。",
+    "approved_terms": ["API"],
     "preferences": "",
     "proposal": {
-      "text": "今天用 PyTorch 跑 training，版本是 2.7.1，不要升級到 3.0。",
+      "text": "Ask API first，版本是 2.7.1，不要升級到 3.0。",
       "replacements": [
-        { "from": "Py Torch", "to": "PyTorch" }
+        { "from": "A PI", "to": "API" }
       ]
     },
-    "accepted": true,
-    "output": "今天用 PyTorch 跑 training，版本是 2.7.1，不要升級到 3.0。"
+    "accepted": false
   },
   {
     "id": "preference_exact_term_authorizes_replacement",
@@ -132,8 +130,7 @@
         { "from": "Clau-de", "to": "Claude" }
       ]
     },
-    "accepted": true,
-    "output": "PyTorch 搭配 Claude 和 GPT"
+    "accepted": false
   },
   {
     "id": "zero_edits_cannot_use_clean_formatting",
@@ -148,31 +145,31 @@
   },
   {
     "id": "unrelated_number_anchor_is_preserved",
-    "input": "用 Py Torch 跑 3 次",
-    "approved_terms": ["PyTorch"],
+    "input": "用 Clau-de 跑 3 次",
+    "approved_terms": ["Claude"],
     "preferences": "",
     "proposal": {
-      "text": "用 PyTorch 跑 3 次",
+      "text": "用 Claude 跑 3 次",
       "replacements": [
-        { "from": "Py Torch", "to": "PyTorch" }
+        { "from": "Clau-de", "to": "Claude" }
       ]
     },
     "accepted": true,
-    "output": "用 PyTorch 跑 3 次"
+    "output": "用 Claude 跑 3 次"
   },
   {
     "id": "single_edit_does_not_cascade_inside_its_own_target",
-    "input": "使用 Py Torch 訓練",
-    "approved_terms": ["PyTorch"],
+    "input": "使用 Flutt-er 訓練",
+    "approved_terms": ["Flutter"],
     "preferences": "",
     "proposal": {
-      "text": "使用 PyTorch 訓練",
+      "text": "使用 Flutter 訓練",
       "replacements": [
-        { "from": "Py Torch", "to": "PyTorch" }
+        { "from": "Flutt-er", "to": "Flutter" }
       ]
     },
     "accepted": true,
-    "output": "使用 PyTorch 訓練"
+    "output": "使用 Flutter 訓練"
   },
   {
     "id": "unauthorized_term_is_rejected",
@@ -499,6 +496,162 @@
       "text": "使用 PyTorch",
       "replacements": [
         { "from": "hyTorch", "to": "PyTorch", "confidence": 0.99 }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "semantic_hyphen_re_sign_is_rejected",
+    "input": "I will re-sign the contract",
+    "approved_terms": ["resign"],
+    "preferences": "",
+    "proposal": {
+      "text": "I will resign the contract",
+      "replacements": [
+        { "from": "re-sign", "to": "resign" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "ordinary_lowercase_space_change_is_rejected",
+    "input": "Please re cover the chair",
+    "approved_terms": ["recover"],
+    "preferences": "",
+    "proposal": {
+      "text": "Please recover the chair",
+      "replacements": [
+        { "from": "re cover", "to": "recover" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "ordinary_word_cannot_split_into_sensitive_phrase",
+    "input": "Please call therapist",
+    "approved_terms": ["The Rapist"],
+    "preferences": "",
+    "proposal": {
+      "text": "Please call The Rapist",
+      "replacements": [
+        { "from": "therapist", "to": "The Rapist" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "ordinary_phrase_cannot_collapse_into_titlecase_word",
+    "input": "Do not repeat the rapist label",
+    "approved_terms": ["Therapist"],
+    "preferences": "",
+    "proposal": {
+      "text": "Do not repeat Therapist label",
+      "replacements": [
+        { "from": "the rapist", "to": "Therapist" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "titlecase_phrase_cannot_collapse_into_camelcase_target",
+    "input": "Do not repeat The Rapist label",
+    "approved_terms": ["TheRapist"],
+    "preferences": "",
+    "proposal": {
+      "text": "Do not repeat TheRapist label",
+      "replacements": [
+        { "from": "The Rapist", "to": "TheRapist" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "semantic_hyphen_phrase_is_outside_narrow_tail_rule",
+    "input": "Under-score the result",
+    "approved_terms": ["Underscore"],
+    "preferences": "",
+    "proposal": {
+      "text": "Underscore the result",
+      "replacements": [
+        { "from": "Under-score", "to": "Underscore" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "pronoun_suffix_cannot_collapse_into_proper_name",
+    "input": "Tell-us the result",
+    "approved_terms": ["Tellus"],
+    "preferences": "",
+    "proposal": {
+      "text": "Tellus the result",
+      "replacements": [
+        { "from": "Tell-us", "to": "Tellus" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "preposition_suffix_cannot_collapse_into_proper_name",
+    "input": "Call-in the result",
+    "approved_terms": ["Callin"],
+    "preferences": "",
+    "proposal": {
+      "text": "Callin the result",
+      "replacements": [
+        { "from": "Call-in", "to": "Callin" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "pronoun_cannot_become_country_acronym_by_case_only",
+    "input": "Tell us now",
+    "approved_terms": ["US"],
+    "preferences": "",
+    "proposal": {
+      "text": "Tell US now",
+      "replacements": [
+        { "from": "us", "to": "US" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "verb_cannot_become_nationality_by_case_only",
+    "input": "Please polish the copy",
+    "approved_terms": ["Polish"],
+    "preferences": "",
+    "proposal": {
+      "text": "Please Polish the copy",
+      "replacements": [
+        { "from": "polish", "to": "Polish" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "verb_cannot_become_month_by_case_only",
+    "input": "They march daily",
+    "approved_terms": ["March"],
+    "preferences": "",
+    "proposal": {
+      "text": "They March daily",
+      "replacements": [
+        { "from": "march", "to": "March" }
+      ]
+    },
+    "accepted": false
+  },
+  {
+    "id": "ordinary_word_cannot_gain_semantic_underscore_prefix",
+    "input": "I will resign tomorrow",
+    "approved_terms": ["re_sign"],
+    "preferences": "",
+    "proposal": {
+      "text": "I will re_sign tomorrow",
+      "replacements": [
+        { "from": "resign", "to": "re_sign" }
       ]
     },
     "accepted": false

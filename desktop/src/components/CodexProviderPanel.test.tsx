@@ -1,4 +1,10 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   CodexCliStatus,
@@ -9,7 +15,10 @@ import CodexProviderPanel, {
   type CodexProviderPanelProps,
 } from "./CodexProviderPanel";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 const readyStatus: CodexCliStatus = {
   availability: "ready",
@@ -62,9 +71,13 @@ describe("CodexProviderPanel status states", () => {
       },
     });
 
-    expect(screen.getByRole("status").textContent).toContain(
-      "不會送出文字或使用 Codex 額度",
-    );
+    expect(
+      screen
+        .getAllByRole("status")
+        .some((status) =>
+          status.textContent?.includes("不會送出文字或使用 Codex 額度"),
+        ),
+    ).toBe(true);
     expect(
       screen.getByRole("button", { name: "檢查中…" }).hasAttribute("disabled"),
     ).toBe(true);
@@ -84,7 +97,11 @@ describe("CodexProviderPanel status states", () => {
       },
     });
 
-    expect(screen.getByRole("status").textContent).toContain(copy);
+    expect(
+      screen
+        .getAllByRole("status")
+        .some((status) => status.textContent?.includes(copy)),
+    ).toBe(true);
     expect(
       screen.getByRole("button", { name: "重新檢查" }),
     ).toBeTruthy();
@@ -157,6 +174,109 @@ describe("CodexProviderPanel consent", () => {
     expect(props.onEnable).toHaveBeenCalledWith({
       share_context_terms: false,
     });
+  });
+
+  it("names the narrow capability and gives a counterexample before consent", () => {
+    renderPanel({ preferences: pendingPreferences });
+
+    expect(screen.getByText("Codex 專業拼法")).toBeTruthy();
+    expect(screen.getByText(/Clau-de → Claude/)).toBeTruthy();
+    expect(screen.getByText(/Py Torch → PyTorch/)).toBeTruthy();
+    expect(screen.getByText(/不能證明語意一定正確/)).toBeTruthy();
+    expect(screen.getByText(/三類候選詞合計最多 32 項/)).toBeTruthy();
+    expect(screen.getByText(/App 名、視窗標題/)).toBeTruthy();
+    expect(screen.getByText(/找不到可採用候選時完全不呼叫 Codex/)).toBeTruthy();
+    expect(
+      screen.getByText(/個人詞彙正確文字/),
+    ).toBeTruthy();
+  });
+
+  it("lets a returning user inspect and clear stored spellings before re-consenting", async () => {
+    const save = vi.fn().mockResolvedValue(undefined);
+    renderPanel({
+      preferences: {
+        ...pendingPreferences,
+        correction_preferences: "Claude\nInternalTerm",
+      },
+      onSaveCorrectionPreferences: save,
+    });
+    const textbox = screen.getByRole("textbox", {
+      name: "正確拼法清單（選填）",
+    }) as HTMLTextAreaElement;
+
+    expect(textbox.value).toBe("Claude\nInternalTerm");
+    expect(screen.getByText(/只儲存在本機/)).toBeTruthy();
+
+    fireEvent.change(textbox, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "立即儲存" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(save).toHaveBeenCalledWith("");
+  });
+
+  it("moves focus to the dynamically inserted primary consent heading", () => {
+    renderPanel({ preferences: pendingPreferences });
+
+    expect(document.activeElement).toBe(
+      screen.getByText("允許 Claro 使用 Codex 統一專業拼法？"),
+    );
+  });
+
+  it("hands focus to the connected content after primary consent succeeds", () => {
+    const initial = panelProps({ preferences: pendingPreferences });
+    const view = render(<CodexProviderPanel {...initial} />);
+
+    view.rerender(
+      <CodexProviderPanel
+        {...initial}
+        preferences={enabledPreferences}
+      />,
+    );
+
+    expect(document.activeElement).toBe(screen.getByRole("note"));
+    expect(screen.getByRole("note").textContent).toContain("資料界線");
+  });
+
+  it("keeps valid consent visible without claiming Codex is active in another mode", () => {
+    renderPanel({
+      preferences: {
+        ...enabledPreferences,
+        correct_mode_active: false,
+      },
+    });
+
+    expect(screen.getByText("已同意・目前未使用")).toBeTruthy();
+    expect(
+      screen.queryByText("允許 Claro 使用 Codex 統一專業拼法？"),
+    ).toBeNull();
+    expect(screen.getByRole("note").textContent).toContain(
+      "聽寫不會呼叫 Codex",
+    );
+    expect(
+      screen.getByRole("button", { name: "測試" }).hasAttribute("disabled"),
+    ).toBe(true);
+  });
+
+  it("does not claim Codex is active when a returning user's probe is unavailable", () => {
+    renderPanel({
+      status: {
+        availability: "unavailable",
+        version: null,
+        auth_mode: "unknown",
+        error_code: "probe_failed",
+      },
+    });
+
+    expect(screen.getByText("已同意・目前未使用")).toBeTruthy();
+    expect(screen.getByRole("note").textContent).toContain(
+      "聽寫不會呼叫 Codex",
+    );
+    expect(screen.queryByText("使用中")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "測試" }).hasAttribute("disabled"),
+    ).toBe(true);
   });
 
   it("clears a pending context opt-in when global context is revoked", () => {
@@ -255,21 +375,28 @@ describe("CodexProviderPanel consent", () => {
 });
 
 describe("CodexProviderPanel preferences", () => {
-  it("saves a trimmed canonical spelling list and states that it will be sent", () => {
+  it("saves a trimmed canonical spelling list and states that it will be sent", async () => {
     const props = renderPanel();
     const textbox = screen.getByRole("textbox", {
       name: "正確拼法清單（選填）",
     });
 
     expect(textbox.getAttribute("maxlength")).toBe("1000");
-    expect(screen.getByText(/清單會隨每次 Codex 校字送出/)).toBeTruthy();
+    expect(
+      screen.getByText(
+        /左側至少四字母＋單一連字號＋右側兩字母.*內容保護可採用的項目才會送出/,
+      ),
+    ).toBeTruthy();
 
     fireEvent.change(textbox, {
       target: { value: "  MLX、PyTorch  " },
     });
     fireEvent.click(
-      screen.getByRole("button", { name: "儲存正確拼法" }),
+      screen.getByRole("button", { name: "立即儲存" }),
     );
+    await act(async () => {
+      await Promise.resolve();
+    });
 
     expect(props.onSaveCorrectionPreferences).toHaveBeenCalledWith(
       "MLX、PyTorch",
@@ -313,6 +440,9 @@ describe("CodexProviderPanel preferences", () => {
         name: "有限畫面詞彙",
       }),
     );
+    expect(document.activeElement).toBe(
+      screen.getByText("允許 Codex 使用有限畫面詞彙？"),
+    );
     const allow = screen.getByRole("button", {
       name: "允許有限畫面詞彙",
     });
@@ -328,11 +458,184 @@ describe("CodexProviderPanel preferences", () => {
 
     expect(props.onShareContextTermsChange).toHaveBeenCalledWith(true);
   });
+
+  it("restores focus to the context toggle when confirmation is cancelled", () => {
+    renderPanel({
+      preferences: {
+        ...enabledPreferences,
+        context_consent_valid: false,
+      },
+    });
+    const toggle = screen.getByRole("checkbox", {
+      name: "有限畫面詞彙",
+    });
+
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole("button", { name: "保持關閉" }));
+
+    expect(document.activeElement).toBe(toggle);
+  });
+
+  it("disables secondary consent actions while saving", () => {
+    const initial = panelProps({
+      preferences: {
+        ...enabledPreferences,
+        context_consent_valid: false,
+      },
+    });
+    const view = render(<CodexProviderPanel {...initial} />);
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "有限畫面詞彙",
+      }),
+    );
+    view.rerender(
+      <CodexProviderPanel {...initial} preferencesSaving />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "保持關閉" }).hasAttribute("disabled"),
+    ).toBe(true);
+    expect(
+      screen
+        .getByRole("checkbox", {
+          name: "我了解這些詞彙會送到 OpenAI Codex。",
+        })
+        .hasAttribute("disabled"),
+    ).toBe(true);
+  });
+
+  it("keeps an unsaved spelling draft when unrelated props refresh", () => {
+    const initial = panelProps();
+    const view = render(<CodexProviderPanel {...initial} />);
+    const textbox = screen.getByRole("textbox", {
+      name: "正確拼法清單（選填）",
+    }) as HTMLTextAreaElement;
+
+    fireEvent.change(textbox, { target: { value: "PyTorch" } });
+    expect(screen.getByText("即將自動儲存")).toBeTruthy();
+    view.rerender(
+      <CodexProviderPanel
+        {...initial}
+        status={{ ...readyStatus, version: "1.2.4" }}
+      />,
+    );
+
+    expect(textbox.value).toBe("PyTorch");
+  });
+
+  it("autosaves after 700 ms without disabling typing during the request", async () => {
+    vi.useFakeTimers();
+    let finishSave: (() => void) | undefined;
+    const save = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishSave = resolve;
+        }),
+    );
+    renderPanel({ onSaveCorrectionPreferences: save });
+    const textbox = screen.getByRole("textbox", {
+      name: "正確拼法清單（選填）",
+    }) as HTMLTextAreaElement;
+
+    fireEvent.change(textbox, { target: { value: "PyTorch" } });
+    act(() => vi.advanceTimersByTime(699));
+    expect(save).not.toHaveBeenCalled();
+
+    await act(async () => {
+      vi.advanceTimersByTime(1);
+      await Promise.resolve();
+    });
+    expect(save).toHaveBeenCalledWith("PyTorch");
+    expect(textbox.disabled).toBe(false);
+    expect(screen.getByText("自動儲存中…")).toBeTruthy();
+
+    fireEvent.change(textbox, { target: { value: "PyTorch\nWhisper" } });
+    expect(textbox.value).toBe("PyTorch\nWhisper");
+    expect(textbox.disabled).toBe(false);
+
+    await act(async () => {
+      finishSave?.();
+      await Promise.resolve();
+    });
+    expect(textbox.value).toBe("PyTorch\nWhisper");
+    expect(screen.getByText("即將自動儲存")).toBeTruthy();
+  });
+
+  it("flushes a pending spelling draft immediately on blur", async () => {
+    vi.useFakeTimers();
+    const save = vi.fn().mockResolvedValue(undefined);
+    renderPanel({ onSaveCorrectionPreferences: save });
+    const textbox = screen.getByRole("textbox", {
+      name: "正確拼法清單（選填）",
+    });
+
+    fireEvent.change(textbox, { target: { value: "  MLX  " } });
+    fireEvent.blur(textbox);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(save).toHaveBeenCalledWith("MLX");
+  });
+
+  it("retains the draft and offers an inline retry after autosave fails", async () => {
+    const save = vi
+      .fn()
+      .mockRejectedValue(new Error("Codex 設定目前無法完成。"));
+    renderPanel({ onSaveCorrectionPreferences: save });
+    const textbox = screen.getByRole("textbox", {
+      name: "正確拼法清單（選填）",
+    }) as HTMLTextAreaElement;
+
+    fireEvent.change(textbox, { target: { value: "MLX\nPyTorch" } });
+    fireEvent.blur(textbox);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(textbox.value).toBe("MLX\nPyTorch");
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Codex 設定目前無法完成。",
+    );
+    expect(screen.getByRole("alert").textContent).toContain("草稿仍保留");
+    expect(
+      screen.getByRole("button", { name: "重試儲存" }),
+    ).toBeTruthy();
+  });
+
+  it("best-effort flushes a debounced draft when the panel unmounts", async () => {
+    vi.useFakeTimers();
+    const save = vi.fn().mockResolvedValue(undefined);
+    const view = render(
+      <CodexProviderPanel
+        {...panelProps({ onSaveCorrectionPreferences: save })}
+      />,
+    );
+
+    fireEvent.change(
+      screen.getByRole("textbox", {
+        name: "正確拼法清單（選填）",
+      }),
+      { target: { value: "Whisper" } },
+    );
+    view.unmount();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(save).toHaveBeenCalledWith("Whisper");
+  });
 });
 
 describe("CodexProviderPanel test states", () => {
   it("starts an idle test through props", () => {
     const props = renderPanel();
+    expect(screen.getByText(/實際用量取決於目前的 CLI/)).toBeTruthy();
+    expect(screen.queryByText(/少量 Codex 使用量/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "測試" }));
     expect(props.onTest).toHaveBeenCalledOnce();
   });
@@ -357,8 +660,8 @@ describe("CodexProviderPanel test states", () => {
   it("renders a successful synthetic input and output", () => {
     const testState: CodexTestState = {
       phase: "success",
-      input: "我們用 Py Torch 跑訓練。",
-      output: "我們用 PyTorch 跑訓練。",
+      input: "我們用 Clau-de 跑訓練。",
+      output: "我們用 Claude 跑訓練。",
     };
     renderPanel({ testState });
 
@@ -368,7 +671,7 @@ describe("CodexProviderPanel test states", () => {
         status.textContent?.includes("受控校字測試已通過"),
       ),
     ).toBe(true);
-    expect(screen.getByText(/校字結果：我們用 PyTorch/)).toBeTruthy();
+    expect(screen.getByText(/校字結果：我們用 Claude/)).toBeTruthy();
   });
 
   it.each([
@@ -376,6 +679,7 @@ describe("CodexProviderPanel test states", () => {
     ["rate_limited", "無法使用 Codex 額度"],
     ["auth_required", "Codex 登入已失效"],
     ["unavailable", "Codex 目前無法使用"],
+    ["consent_changed", "受控能力已改變"],
     ["output_rejected", "未通過內容保護"],
     ["unknown", "無法完成受控校字測試"],
   ] as const)("renders the %s failure as an alert", (reason, copy) => {

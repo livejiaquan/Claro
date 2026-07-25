@@ -47,10 +47,13 @@
 | 23 | 按下即說／放開最後一字 | audio post-roll tests | 內建麥克風、AirPods、USB | 開麥與 AX seed 並行；正常停止保留 200ms 尾音；取消與裝置斷線不等待；真人首尾漏字率仍待量測 |
 | 24 | 下載完成時仍在聽寫／模型載入失敗 | atomic swap＋race regressions | 大模型切換 | 不覆寫現役引擎或 config；不吞掉 Up／Esc；明示已下載但需重按「使用」，不假裝自動切換 |
 | 25 | 內建整理冷啟動超時 | budget／cancel／try-lock tests | release bundle cold/warm | 不排隊、不讓 LLM 失敗拖垮聽寫；超時安全退回原文並保留 warm model；阻塞式 hash／Metal load 仍須量 p50／p95 |
-| 26 | 既有 Codex CLI＋ChatGPT 登入啟用專業校字 | fake CLI integration＋UI QA | release bundle＋合成文字 | 不讀 credential；先明示資料與用量；`Py Torch→PyTorch`／`Git Hub→GitHub`，數字與否定不變；`Pie Torch` 等字母不同的 fuzzy 誤認不自動採用，改由個人字典明確指定 |
+| 26 | 既有 Codex CLI＋ChatGPT 登入啟用專業校字 | fake CLI integration＋UI QA | release bundle＋合成文字 | 不讀 credential；先明示 OpenAI 雲端、轉錄資料、三類候選合計 32 項、帳戶用量與 residual false-correction risk；只測 `Clau-de→Claude` 的極窄實驗 heuristic，數字與否定不變。`Py Torch→PyTorch`、`Git Hub→GitHub`、`A PI→API`、字母不同與其他 separator 一律不自動採用，已知 source→target 改由個人字典明確指定 |
 | 27 | Codex 未安裝／未登入／版本不支援 | probe parser＋frontend state tests | Finder 啟動 `.app` | 不阻塞 Onboarding；Homebrew、nvm、Volta launcher 可由短 PATH 啟動；提供重新檢查與可行說明；不自動安裝、登入或更新 |
 | 28 | Codex timeout／取消／忙碌／額度限制 | fake process group tests | throttled network | single-flight 不排隊；取消與 timeout kill＋reap；聽寫仍貼 deterministic base text，History 只記非內容原因 |
 | 29 | Codex prompt injection／未授權 edit／Context 撤回 | strict schema＋CORRECT guard＋argv/env leak tests | 合成 adversarial payload | command/MCP/file access 為零；未授權替換、anchor 變動與 Context 新增內容一律拒絕；重新開啟 local-only 立即中止 in-flight request |
+| 30 | 快速切換 Codex／其他 provider 與 RAW／CLEAN／CORRECT／ORGANIZE | backend compatibility tests＋frontend state tests | 重複快速點選 | CORRECT 只配 Codex、Codex 非 RAW 只配 CORRECT；離開 Codex 同一交易降為 CLEAN；stale command 與 pipeline 再驗證，不相容組合 fail closed |
+| 31 | 已同意後停用、撤回 local-only、返回 Codex 或切頁途中編輯拼法清單 | component autosave／generation tests | Settings 鍵盤操作 | 即使目前未使用仍可先檢視、修改或清空本機清單；草稿跨頁保留，失敗就地顯示並可重試；同意與「目前使用中」不混為一談 |
+| 32 | Codex 無合法候選、送出前預檢阻擋、payload 已開始後失敗 | Rust payload audit／history serialization＋History DOM tests | History 展開稽核 | 分別顯示「未送出文字／未用模型額度」與「已開始傳送」；provider 僅標為「選用」，不把進入 runner 誤當作已外送；history 不保存 request 內容 |
 
 ## keyDown AX 延遲：最小可驗證實作方案
 

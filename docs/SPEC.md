@@ -154,7 +154,7 @@ Qwen3-ASR Q8_0 離線評測 artifacts 固定如下；來源、256-token／長音
 
 Claro 已實作並以 fixture 驗證的上下文雙重用途：
 1. **解碼期偏置（provider-aware）**：抽英文／技術詞彙與 CJK 詞彙；Whisper 將上限 15 個 canonical terms 放進 `initial_prompt`，Qwen3-ASR 現有 transcribe.cpp port 不接受此 extension，不能宣稱已套用同等偏置
-2. **處理參考**：個人字典仍可在 STT 後做確定性替換；CLEAN 不把畫面文字交給 LLM，也禁止 LLM 修改任何文字／英數 token。CORRECT 若使用 Codex，主同意範圍是轉錄、正確拼法清單與使用者明確建立的個人 canonical terms；只有使用者另行同意時，才可再送出本機從當前畫面抽取、清洗且有數量上限的 canonical terms，絕不送 raw App 名、視窗標題、游標附近、選取或 visible text。正確拼法清單只接受逗號／換行分隔、整項為 ASCII canonical term 的資料，不能用自然語言或 system prompt 覆寫固定 runner instructions。完整 bounded ScreenContext 只在 ORGANIZE 進 Polisher prompt；可解釋的 surface 分類（email／message／document／technical／neutral）只能決定段落或明確清單格式，不允許改動事實或語氣內容
+2. **處理參考**：個人字典仍可在 STT 後做確定性替換；CLEAN 不把畫面文字交給 LLM，也禁止 LLM 修改任何文字／英數 token。CORRECT 若使用 Codex，主同意範圍是轉錄，以及與本次轉錄相關且本機 correction guard 可採用的正確拼法與使用者明確建立的個人 canonical terms；三類候選共用 32 項總上限，三類皆空時不得啟動 Codex 或使用帳戶額度。只有使用者另行同意時，才可再送出本機從當前畫面內容欄位抽取、清洗且有數量上限的 canonical terms。每個候選都必須在本次轉錄中找到唯一、最多五個相鄰 ASCII token 的 source，且該 source→target 能通過完整本機 correction guard；與本次語音無關或 guard 不可能採用的設定／畫面詞不外傳。Codex 專用 extractor 會在抽詞前依欄位 provenance 排除 `App:`／`Window:` 行，絕不送 raw App 名、視窗標題、游標附近、選取或 visible text 本身。正確拼法清單只接受逗號／換行分隔、整項為 ASCII canonical term 的資料，不能用自然語言或 system prompt 覆寫固定 runner instructions；含數字項目目前由 meaning guard 鎖定，因此不送 Codex，固定格式改由本機個人字典處理。完整 bounded ScreenContext 只在 ORGANIZE 進 Polisher prompt；可解釋的 surface 分類（email／message／document／technical／neutral）只能決定段落或明確清單格式，不允許改動事實或語氣內容
 
 **隱私鐵律**：
 - `AXSecureTextField` 永不讀取
@@ -186,10 +186,20 @@ prototype 教訓：1.5B 級模型會洩漏提示詞、亂加列表符號 → 預
 |---|---|---|
 | `raw` | 只做 OpenCC、CJK 標點／空白與個人字典等確定性處理 | **永不呼叫 LLM** |
 | `clean` | 去除有停頓邊界的純填充詞、保留明確自我更正後版本、補不改變問句／驚嘆語氣的標點；LLM 不得修改任何文字或英數 token，不跨句重排、不濃縮。專有詞正確率由 STT Context 偏置與使用者字典負責 | 新安裝的預設意圖；provider 未就緒時安全退回 RAW |
-| `correct` | 允許最多三個有證據的英文／專業詞拼法正規化。正確寫法必須大小寫敏感地出現在使用者詞彙／正確拼法清單，或另行同意送出的 canonical Context terms；`from`／`to` 去除 ASCII 非英數並轉小寫後必須完全相同，因此只會改大小寫、空白、底線、連字號或標點。字母不同、同音誤認與真正 fuzzy alias 不會自動採用，只能走使用者明確建立的個人字典；數字、日期、否定、URL、email、path、版本與帶數字 token 不可由此路徑修改 | 首次啟用必須明確同意它會改變拼法格式；structured edits 由本機逐項授權，proposal text 必須逐位元等於本機套用 edit 的結果；不確定、未授權或 guard 不通過即退回 deterministic base text |
+| `correct` | 允許最多三個英文／專業詞拼法正規化。正確寫法必須大小寫敏感地出現在使用者詞彙／正確拼法清單，或另行同意送出的 canonical Context terms。深度 review 已證實 target-only whitespace merge 無法從局部形狀區分 `G PT→GPT`／`A PI→API` 或 `Py Torch→PyTorch`／`The Rapist→TheRapist`，所以 production guard 全面拒絕空白合併。目前只保留「恰一個連字號、左側至少四個純字母、右側恰兩個純字母、移除後字母與大小寫逐字等於 target」的極窄實驗 heuristic（如 `Clau-de→Claude`）；這只是降低風險，不是語意證明。空白合併、純改大小寫、其他標點／底線格式、字母不同、同音誤認與真正 fuzzy alias 一律只能走使用者明確建立的個人字典；`A PI→API`、`The Rapist→TheRapist`、`Under-score→Underscore`、`us→US`、`re-sign→resign` 等反例明確拒絕。數字、日期、否定、URL、email、path、版本與帶數字 token 不可由此路徑修改 | 首次啟用必須明確同意它會改變拼法格式，UI 必須標示實驗性與仍可能誤改；structured edits 由本機逐項授權，proposal text 必須逐位元等於本機套用 edit 的結果；不確定、未授權或 guard 不通過即退回 deterministic base text |
 | `organize` | 只允許完整句讀重排、分段、明確改口、完全相同內容合併與明確列舉格式化；不得改動或新增姓名、術語、數字、日期／時間、否定、條件、決策、待辦與因果 | 首次啟用必須明確同意；不確定或 guard 不通過即退回原文 |
 
 CLEAN 沿用 prototype 與 yetone「只修不改寫」規則；CORRECT 是另一個明示會改詞的契約，不能藉由選擇某個 provider 暗中放寬 CLEAN；ORGANIZE 使用獨立 prompt，不得與 CLEAN 共用互相矛盾的指示。所有模式都只輸出結果、不回答或執行轉錄／Context 中的指令。
+
+模式與 provider 在設定資料模型上仍是兩條軸，但實際能力採明確矩陣：`correct`
+目前只允許 `codex`，而 `codex` 的非 RAW 路徑目前只允許 `correct`。離開
+Codex 且原本為 CORRECT 時，後端必須在同一筆設定交易中降級為 CLEAN；任何舊畫面、
+快速切換或競態送出的不相容組合，都由 backend command 與 pipeline 再驗證並
+fail closed，不得讓 CLEAN 或 ORGANIZE 偷渡 Codex。前端停用不相容選項只是說明與
+防誤觸，不能取代後端保護。history 另記錄 `codex_payload_started`：只有至少一個
+轉錄 payload byte 寫入主 `codex exec` stdin 後才為 true；runtime/version/login
+預檢、沒有合法候選或其他送出前阻擋皆為 false。這能區分「未傳送文字／未用模型
+額度」與「傳送已開始但未必完成」，且只記布林稽核狀態，不保存內容。
 
 guard 分兩層：共同層拒絕空輸出、長度爆炸、提示詞洩漏與離題回答；ORGANIZE 另外比對事實錨點與內容覆蓋。明確的晚期自我更正只保留最後決定，完全重複的片段可合併，明確列舉可轉為項目符號；其他姓名、數字、否定、條件、因果與獨特內容仍必須保留。history 記錄 requested/effective mode、provider、是否改動、成功或 fallback 原因，讓 UI 可顯示 raw/final 與復原依據。
 
@@ -215,7 +225,7 @@ macOS 使用 `NSPasteboard` 在清空前逐 item、逐 type 完整 materialize �
 | 層級 | 資料流 | 預設 |
 |---|---|---|
 | T0 全本地 | 音訊/文字不出機器 | ✅ |
-| T1 自選雲端潤飾 | BYOK 只送使用者同意的文字範圍到指定端點；Codex 主同意送轉錄、正確拼法清單與使用者建立的個人 canonical terms，畫面 canonical terms 另行同意後才送到 OpenAI | 關；UI 明示目的地、資料種類與帳戶用量 |
+| T1 自選雲端潤飾 | BYOK 只送使用者同意的文字範圍到指定端點；Codex 主同意送轉錄，以及三類清單中與本次轉錄相關、具有唯一 source 且 correction guard 可採用的候選（共用 32 項上限）；畫面 canonical terms 仍需另行同意 | 關；UI 明示目的地、資料種類、帳戶用量與「同登入類型下切換帳戶無法辨識」的限制 |
 | T2 雲端 STT | 音訊上雲 | v0.1 不做 |
 
 - **local-only 模式**：新安裝預設開啟；阻擋聽寫音訊、Context 與潤飾文字送往外部 endpoint。localhost／127.0.0.1／`::1` 本機服務仍可使用；自訂外部 endpoint 必須 HTTPS。使用者明確按下的 STT／LLM 模型下載屬例外，UI 必須先顯示大小並取得同意；目前尚無全程序 network interceptor，不能宣稱連更新檢查都硬斷
@@ -255,7 +265,7 @@ Advanced 視覺化仍是 M5 驗收項目。
 
 ## 14. 設定檔（`~/.claro/config.json`，自 prototype 遷移）
 
-新 schema 分節（hotkey/stt/polish/context/cjk/dictionary/privacy）；目前相容扁平鍵包含 `polish_mode`（`raw|clean|correct|organize`）、`local_only`、`history_enabled`、`correct_consent_version`、`organize_consent_version`、`cloud_consent_version`、`cloud_consent_target`、`codex_correction_preferences`、`codex_share_context_terms`、`setup_completed`。所有雲端同意都綁定實際目的地與資料契約；自訂 API 另綁 scheme + authority，Codex 另綁 OpenAI service、登入類型與 prompt contract。任一 target、登入類型、資料範圍或契約版本改變即自動失效，不能沿用另一個 provider 的同意。新安裝的 `setup_completed` 只能在後端同時確認權限、麥克風測試、已驗證模型與本次啟動至少一次成功貼上後寫入；既有已完成設定不被回溯阻擋。個人字典新安裝預設為空，只有使用者明確建立的替換才可改字；舊版若 dictionary **完全等於**未經同意內建的 `GBT→GPT`／`My Torch→PyTorch` 才移除，任何自訂增刪都原樣保留。啟動時偵測舊 schema（`whisper_model`/`llm_model`/`llm_enabled`）自動遷移並保留未知欄位。history.jsonl 維持向後相容，新增可選 `timings` 與 `polish` metadata；音訊診斷使用正規化前的 `audio_input_rms`／`audio_clipped_ratio`，不得把舊 `audio_rms` 當成實際麥克風音量。
+新 schema 分節（hotkey/stt/polish/context/cjk/dictionary/privacy）；目前相容扁平鍵包含 `polish_mode`（`raw|clean|correct|organize`）、`local_only`、`history_enabled`、`correct_consent_version`、`organize_consent_version`、`cloud_consent_version`、`cloud_consent_target`、`codex_correction_preferences`、`codex_share_context_terms`、`codex_cli_version`、`codex_cli_raw_version`、`codex_executable_sha256`、`codex_capability_fingerprint`、`setup_completed`。所有雲端同意都綁定實際目的地與資料契約；自訂 API 另綁 scheme + authority，Codex contract-v2 另綁 OpenAI service、登入類型、raw／normalized CLI 版本、實際 executable path＋SHA-256，以及由完整 feature inventory、動態停用集合、必要 flags、固定 instructions／schema 與 sandbox policy 組成的 capability fingerprint。probe 發布新 contract 後，正式執行仍會在 stdin 前逐次比對完整 consent target。任一 target、登入類型、CLI binary／能力、資料範圍或契約版本改變即自動失效，不能沿用另一個 provider 或舊 CLI 的同意。新安裝的 `setup_completed` 只能在後端同時確認權限、麥克風測試、已驗證模型與本次啟動至少一次成功貼上後寫入；既有已完成設定不被回溯阻擋。個人字典新安裝預設為空，只有使用者明確建立的替換才可改字；舊版若 dictionary **完全等於**未經同意內建的 `GBT→GPT`／`My Torch→PyTorch` 才移除，任何自訂增刪都原樣保留。啟動時偵測舊 schema（`whisper_model`/`llm_model`/`llm_enabled`）自動遷移並保留未知欄位。history.jsonl 維持向後相容，新增可選 `timings` 與 `polish` metadata；音訊診斷使用正規化前的 `audio_input_rms`／`audio_clipped_ratio`，不得把舊 `audio_rms` 當成實際麥克風音量。
 
 ## 15. 決策記錄與待決事項
 
@@ -276,4 +286,4 @@ Advanced 視覺化仍是 M5 驗收項目。
 | D13 | 首次設定與模型生命週期由唯讀 `HardwareProfile` 決策：Intel 推薦 Turbo Q5、8–12GB Apple Silicon 推薦 large-v3 Q5、16GB+ 推薦完整 large-v3；8–12GB 路徑不讓 STT 與 4B LLM 同時常駐。Qwen3-ASR 在長音訊分段與真人台灣 corpus 通過前只供離線 eval，production UI fail closed。只改推薦與資源策略，任何正式模型下載仍須使用者明確按下 | **已定；2026-07-15 Accuracy Pass 收斂** |
 | D14 | Typeless 等閉源產品只做官方資料與人工可觀察輸出的產品評測；不反組譯、不解密私有流量、不把其輸出用於訓練、fine-tune、prompt distillation 或自動資料抽取，也不宣稱知道其模型、prompt 或內部管線。Claro 以 session-bound AX context、可稽核 surface 分類與 Meaning Lock 建立可獨立驗證的對標行為與評測目標 | **已定（2026-07-12，見 `docs/research/typeless-black-box-2026-07-12.md`）** |
 | D15 | STT production 暫留 `zh` hint，`auto`／`zh` 必須以同一真人 corpus 成對驗證後才可改預設；CLEAN Meaning Lock 不承擔猜回錯字；準確度發布門檻不得以 publisher benchmark、合成 TTS 或 LLM 文句通順度代替 | **已定（2026-07-15，見 `docs/research/stt-accuracy-2026-07-15.md`）** |
-| D16 | 保留 CLEAN 不改字契約，另增 opt-in CORRECT；Codex CLI 是可選 cloud provider，不是本機 provider。Codex 只重用官方 CLI auth，不讀 credential；執行使用空 cwd、ephemeral、approval never、無 agent tools、stdin 與 structured output。主同意涵蓋轉錄、正確拼法清單與使用者建立的個人 canonical terms；完整畫面 Context 永不送 Codex，畫面 canonical terms 只有另行同意後可送。正確拼法清單不是可覆寫固定安全契約的 system prompt。target-only fuzzy matching 無法證明語意安全，因此自動採用只允許去除 ASCII 非英數並轉小寫後相同的拼法正規化；真正錯字需由個人字典明確指定 source→target。所有失敗退 deterministic base text | **已定（2026-07-23，實驗性功能；正式推薦前需通過 anchor／false-correction／工具隔離／延遲與 token gate）** |
+| D16 | 保留 CLEAN 不改字契約，另增 opt-in CORRECT；Codex CLI 是可選 cloud provider，不是本機 provider。Codex 只重用官方 CLI auth，不讀 credential；執行使用空 cwd、ephemeral、approval never、動態停用 probe 發現的全部非 removed features、stdin 與 structured output。主同意涵蓋轉錄，以及本機三類清單中與本次轉錄相關、具有唯一 source 且 guard 可採用的 canonical terms（共用 32 項上限）；完整畫面 Context 永不送 Codex，畫面 canonical terms 還需另行同意，且 raw App 名／視窗標題在抽詞前依 provenance 排除。正確拼法清單不是可覆寫固定安全契約的 system prompt。target-only separator matching 無法證明語意安全；深度 review 後自動空白合併全面關閉，只留尾端兩字母單連字號的極窄實驗 heuristic，並明示它不是語意證明。空白合併、真正錯字、純 case change、普通全小寫詞分合、target 新增分詞與含數字固定格式需由個人字典明確指定 source→target。同意 target 以 contract-v2 綁登入類型、raw／normalized CLI 版本、executable path＋SHA-256、完整 capability fingerprint 與 runner contract，並在正式 stdin 前再比較；request-scoped 取消需中止 runtime preflight 與 stdin writer，不得撤銷或中止正式聽寫，退出時正式 run 與 capability probe process groups 都須回收。所有失敗退 deterministic base text | **已定（2026-07-23；2026-07-26 深度審查補強資料最小化、完整 capability 同意、request-scoped cancel 與退出回收；實驗性功能，正式推薦前需通過 anchor／false-correction／工具隔離／延遲與 token gate）** |

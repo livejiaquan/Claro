@@ -15,6 +15,7 @@ import {
   type ResolvedLlmConfig,
   type Status,
 } from "../types";
+import { polishReadinessLabel } from "../privacyMessage";
 import { Hotkey, LevelBar } from "../ui";
 
 function StepStatus({ ready, label }: { ready: boolean; label: string }) {
@@ -35,6 +36,7 @@ export default function Onboarding({
   refresh,
   onToast,
   onDone,
+  onOpenSettings,
 }: {
   status: Status;
   mic: MicLevel;
@@ -44,6 +46,7 @@ export default function Onboarding({
   refresh: () => void;
   onToast: (message: string) => void;
   onDone: () => void;
+  onOpenSettings: () => void;
 }) {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [modelsLoading, setModelsLoading] = useState(true);
@@ -494,13 +497,7 @@ export default function Onboarding({
             </div>
             <StepStatus
               ready={polishReady}
-              label={
-                llm?.polish_mode === "raw"
-                  ? "原樣轉錄已就緒"
-                  : polishReady
-                    ? "本機整理已就緒"
-                    : "尚未選擇"
-              }
+              label={polishReadinessLabel(llm, polishReady)}
             />
           </div>
 
@@ -597,10 +594,16 @@ export default function Onboarding({
             </div>
           )}
           {!polishLoading && (
-            <p className="setup-note">
-              已經在這台 Mac 使用 Codex？完成首次聽寫後，可到「設定 → AI 潤飾」連接既有登入；
-              這不是完成 Claro 的必要步驟，也不會自動安裝或登入任何工具。
-            </p>
+            <div className="setup-note-row">
+              <p className="setup-note">
+                已經在這台 Mac 使用 Codex？你可以在設定中選用實驗校字；它會把轉錄文字送到
+                OpenAI，並使用既有登入的方案額度或計費設定。這不是完成 Claro
+                的必要步驟，也不會自動安裝或登入任何工具。
+              </p>
+              <button className="btn no-drag" type="button" onClick={onOpenSettings}>
+                查看 Codex 選項
+              </button>
+            </div>
           )}
         </div>
       </section>

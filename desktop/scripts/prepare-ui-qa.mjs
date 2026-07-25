@@ -17,6 +17,7 @@ const bridge = String.raw`
   const downloadTerminalDelay = failDownloads ? 1200 : 30000;
   const micTimesOut = scenario === "mic-timeout";
   const codexTestTimesOut = scenario === "codex-timeout";
+  const cancelledCodexTestIds = new Set();
   let nextCallback = 1;
   let nextEvent = 1;
   let micGeneration = 0;
@@ -129,7 +130,7 @@ const bridge = String.raw`
       codex_consent_valid: scenario === "codex-connected",
       codex_context_consent_valid: false,
       codex_share_context_terms: false,
-      codex_correction_preferences: scenario === "codex-connected" ? "MLX\nPyTorch\nTauri" : "",
+      codex_correction_preferences: scenario === "codex-connected" ? "Claude\nFlutter\nWhisper" : "",
       blocked_reason: scenario === "codex-connected" ? null : "codex_consent_required",
     });
     modelById("large-v3-turbo").downloaded = true;
@@ -387,19 +388,30 @@ const bridge = String.raw`
         });
         syncLlm();
         return structuredClone(state.llm);
-      case "set_codex_preferences":
+      case "set_codex_correction_preferences":
         state.llm.codex_correction_preferences = args.correctionPreferences.trim();
-        state.llm.codex_share_context_terms = !!args.shareContextTerms;
-        state.llm.codex_context_consent_valid = !!args.shareContextTerms;
+        syncLlm();
+        return structuredClone(state.llm);
+      case "set_codex_context_terms_enabled":
+        state.llm.codex_share_context_terms = !!args.enabled;
+        state.llm.codex_context_consent_valid = !!args.enabled;
         syncLlm();
         return structuredClone(state.llm);
       case "test_codex_polish":
-        if (codexTestTimesOut) throw new Error("CodexTimeout");
+        if (cancelledCodexTestIds.delete(args.requestId)) {
+          return { phase: "cancelled" };
+        }
+        if (codexTestTimesOut) {
+          return { phase: "failed", reason: "timeout" };
+        }
         return {
-          input: "今天用 Py Torch 跑 training，版本是 2.7.1，不要升級到 3.0。",
-          output: "今天用 PyTorch 跑 training，版本是 2.7.1，不要升級到 3.0。",
+          phase: "success",
+          input: "今天用 Clau-de 跑 training，版本是 2.7.1，不要升級到 3.0。",
+          output: "今天用 Claude 跑 training，版本是 2.7.1，不要升級到 3.0。",
         };
-      case "cancel_codex_polish": return null;
+      case "cancel_codex_test":
+        cancelledCodexTestIds.add(args.requestId);
+        return true;
       case "download_builtin_llm":
         if (activeDownload) throw new Error("已有模型正在下載");
         {

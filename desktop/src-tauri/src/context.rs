@@ -27,6 +27,10 @@ pub struct ContextSnapshot {
     pub app_id: String,
     pub app_name: String,
     pub surface: &'static str,
+    /// 只含已確定來自 AX 內容欄位的值；不含 App／Window metadata，也不靠
+    /// 重新 parse 可被換行混淆的 `text`。只供本機詞彙抽取。
+    #[serde(skip_serializing)]
+    pub(crate) content_text: String,
     /// 只供 pipeline 驗證本次 Context 是否來自同一個視窗／焦點；不送到 UI。
     #[serde(skip_serializing)]
     pub(crate) target: PasteTarget,
@@ -200,6 +204,13 @@ pub fn context_terms(dict_terms: &[String], context: &str, limit: usize) -> Vec<
     out.extend(ascii_picked);
     out.extend(dict_picked);
     out
+}
+
+/// Codex 的第二層畫面詞彙同意只涵蓋內容欄位，不涵蓋 App 名或視窗標題。
+/// STT 的本機 prompt 仍可使用完整 snapshot；雲端候選只能使用擷取當下分離、
+/// 保留 provenance 的 `content_text`，不能事後 parse 可被換行混淆的 audit text。
+pub fn codex_screen_terms(snapshot: &ContextSnapshot, limit: usize) -> Vec<String> {
+    context_terms(&[], &snapshot.content_text, limit)
 }
 
 /// 一個畫面詞值得佔用 prompt 格子的程度（大 = 優先）。
@@ -971,6 +982,7 @@ mod macos {
             return None;
         }
         let mut parts: Vec<String> = Vec::new();
+        let mut content_parts: Vec<String> = Vec::new();
         let mut window_title = String::new();
         if !elements.app_name.is_empty() {
             parts.push(format!("App: {}", elements.app_name));
@@ -998,6 +1010,7 @@ mod macos {
                             let around = around.trim();
                             if !around.is_empty() {
                                 parts.push(format!("Editing(around cursor): {around}"));
+                                content_parts.push(around.to_string());
                             }
                         }
                     }
@@ -1010,7 +1023,9 @@ mod macos {
                     {
                         let sel = sel.trim();
                         if !sel.is_empty() {
-                            parts.push(format!("Selected: {}", truncate_chars(sel, 200)));
+                            let selected = truncate_chars(sel, 200);
+                            parts.push(format!("Selected: {selected}"));
+                            content_parts.push(selected);
                         }
                     }
                 }
@@ -1021,6 +1036,7 @@ mod macos {
             let visible = collect_visible_text(&elements.window, deadline);
             if !visible.is_empty() {
                 parts.push(format!("Visible: {visible}"));
+                content_parts.push(visible);
             }
         }
 
@@ -1035,6 +1051,7 @@ mod macos {
             app_id: elements.app_id,
             app_name: elements.app_name.clone(),
             surface: classify_surface(&elements.app_name, &elements.bundle_id, &window_title),
+            content_text: content_parts.join("\n"),
             target,
         })
     }
@@ -1088,6 +1105,27 @@ mod tests {
         assert_eq!(terms.len(), 3);
         assert!(!terms.iter().any(|t| t.to_lowercase() == "app"));
         assert!(!terms.iter().any(|t| t.to_lowercase() == "editing"));
+    }
+
+    #[test]
+    fn codex_screen_terms_never_include_app_or_window_metadata() {
+        let snapshot = ContextSnapshot {
+            text: "App: SecretAI\nWindow: PrivateProject\nVisible: InjectedTitle\nVisible: Clau-de Claude".into(),
+            app_id: "com.example.editor".into(),
+            app_name: "SecretAI".into(),
+            surface: "neutral",
+            content_text: "Visible: Clau-de Claude".into(),
+            target: PasteTarget {
+                app_id: "com.example.editor".into(),
+                window_hash: [1; 32],
+                focus_hash: [2; 32],
+            },
+        };
+        let terms = codex_screen_terms(&snapshot, 10);
+        assert!(!terms.iter().any(|term| term == "SecretAI"));
+        assert!(!terms.iter().any(|term| term == "PrivateProject"));
+        assert!(!terms.iter().any(|term| term == "InjectedTitle"));
+        assert!(terms.iter().any(|term| term == "Claude"));
     }
 
     /// 專有名詞形狀的詞要贏過全小寫常見字——prompt 格子有限，全小寫的字

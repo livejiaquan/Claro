@@ -55,7 +55,7 @@ const OUTCOME_LABEL: Record<string, string> = {
   raw: "原樣輸出",
   changed: "已整理",
   unchanged: "無需變更",
-  fallback: "安全退回原文",
+  fallback: "已保留本機結果",
 };
 
 const FALLBACK_LABEL: Record<string, string> = {
@@ -94,6 +94,7 @@ function historyMetadata(entry: HistoryEntry) {
   const provider = entry.polish?.provider ?? entry.polish_provider ?? entry.provider;
   const outcome = entry.polish?.outcome ?? entry.polish_outcome ?? entry.outcome;
   const fallbackReason = entry.polish?.fallback_reason ?? entry.fallback_reason;
+  const codexPayloadStarted = entry.polish?.codex_payload_started;
   const sttMs = entry.timings?.stt_ms ?? entry.timings?.stt;
   const polishMs = entry.timings?.polish_ms ?? entry.timings?.polish;
   const releaseToPasteMs = entry.timings?.release_to_paste_ms;
@@ -109,6 +110,7 @@ function historyMetadata(entry: HistoryEntry) {
     provider,
     outcome,
     fallbackReason,
+    codexPayloadStarted,
     sttMs,
     polishMs,
     releaseToPasteMs,
@@ -285,7 +287,18 @@ export default function History({
                     <span className="history-meta-line">
                       {pill && <span className={`pill ${pill.cls}`}>{pill.label}</span>}
                       {meta.mode && <span className="pill blue">{MODE_LABEL[meta.mode]}</span>}
-                      {meta.outcome === "fallback" && <span className="pill amber">安全退回</span>}
+                      {meta.provider && (
+                        <span className="pill blue">
+                          選用：{PROVIDER_LABEL[meta.provider] ?? meta.provider}
+                        </span>
+                      )}
+                      {meta.outcome === "fallback" && <span className="pill amber">保留本機結果</span>}
+                      {meta.provider === "codex" && meta.codexPayloadStarted === false && (
+                        <span className="pill green">未送出文字・未用模型額度</span>
+                      )}
+                      {meta.provider === "codex" && meta.codexPayloadStarted === true && (
+                        <span className="pill blue">已開始傳送至 Codex</span>
+                      )}
                       <span className="hist-time">
                         {new Date(entry.ts).toLocaleString("zh-TW", {
                           month: "numeric",
@@ -351,13 +364,25 @@ export default function History({
                       <dd>{meta.mode ? MODE_LABEL[meta.mode] : "舊紀錄未記錄"}</dd>
                     </div>
                     <div>
-                      <dt>文字整理位置</dt>
+                      <dt>選用的整理引擎</dt>
                       <dd>{meta.provider ? (PROVIDER_LABEL[meta.provider] ?? meta.provider) : meta.mode === "raw" ? "未使用" : "未記錄"}</dd>
                     </div>
                     <div>
                       <dt>結果</dt>
                       <dd>{meta.outcome ? (OUTCOME_LABEL[meta.outcome] ?? meta.outcome) : hasAuditMetadata ? "未記錄" : "舊紀錄未記錄"}</dd>
                     </div>
+                    {meta.provider === "codex" && meta.codexPayloadStarted !== undefined && (
+                      <div>
+                        <dt>Codex 文字傳送</dt>
+                        <dd>
+                          {meta.codexPayloadStarted
+                            ? "已開始傳送聽寫資料；處理是否完成與實際額度依 CLI、模型與帳戶設定"
+                            : meta.outcome === "unchanged"
+                              ? "未傳送；沒有合法候選，因此未使用模型額度"
+                              : "未傳送；前置安全檢查在送出文字前停止，因此未使用模型額度"}
+                        </dd>
+                      </div>
+                    )}
                     <div>
                       <dt>語音模型</dt>
                       <dd>
@@ -386,7 +411,7 @@ export default function History({
                     </div>
                     {meta.fallbackReason && (
                       <div className="history-fallback">
-                        <dt>安全退回原因</dt>
+                        <dt>保留本機結果原因</dt>
                         <dd>{FALLBACK_LABEL[meta.fallbackReason] ?? meta.fallbackReason}</dd>
                       </div>
                     )}

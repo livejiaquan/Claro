@@ -794,8 +794,9 @@ fn process_session(
     } = captured_audio;
     let dur = samples.len() as f64 / audio::TARGET_RATE as f64;
     send_overlay_for_session(core, session, cancel, "processing");
-    // 單一 session 只讀一次設定，避免使用者在轉錄途中切模式造成 provider、
-    // consent 與 history metadata 彼此不一致。
+    // 單一 session 以這份設定決定本機管線；任何可能外送的 Codex 路徑會在
+    // stdin 前另取 policy snapshot，若 provider／mode／同意已變便直接取消，
+    // 不沿用這份 STT 前快照。
     let settings = Settings::load();
 
     // 若錄音太短、背景 preload 尚未完成，這裡會同步補載 STT；低記憶體機
@@ -849,7 +850,12 @@ fn process_session(
     // 「當前畫面臨時萃取詞」。STT 仍使用合併後清單，但雲端路徑分欄傳遞，
     // 畫面詞只有第二層同意有效時才會送出。
     let local_terms = crate::context::context_terms(&bias_terms, "", PROMPT_TERM_LIMIT);
-    let screen_terms = crate::context::context_terms(&[], &screen_ctx, PROMPT_TERM_LIMIT);
+    // Codex 的畫面詞彙同意不涵蓋 raw App 名或視窗標題；雲端候選必須走
+    // 保留 provenance 的專用 extractor。本機 Whisper prompt 仍可使用完整 context。
+    let screen_terms = snapshot
+        .as_ref()
+        .map(|captured| crate::context::codex_screen_terms(captured, PROMPT_TERM_LIMIT))
+        .unwrap_or_default();
     let terms = crate::context::context_terms(&bias_terms, &screen_ctx, PROMPT_TERM_LIMIT);
     let (stt_model, stt_family, prompt_term_count) = {
         let model = *core.active_model.lock().unwrap();
@@ -1347,6 +1353,7 @@ mod target_tests {
             app_id: expected.app_id.clone(),
             app_name: "Slack".into(),
             surface: "message",
+            content_text: "私密頻道".into(),
             target: expected.clone(),
         };
         assert!(context_matches_target(Some(&expected), &snapshot));

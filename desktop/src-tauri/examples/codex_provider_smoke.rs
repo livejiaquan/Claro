@@ -22,10 +22,19 @@ fn main() -> anyhow::Result<()> {
     let auth_mode = status
         .auth_mode
         .ok_or_else(|| anyhow::anyhow!("Codex auth mode is unavailable"))?;
+    let cli_version = status
+        .version
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Codex CLI version is unavailable"))?;
+    let contract = status
+        .contract
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Codex capability contract is unavailable"))?;
+    let contract_target = codex::contract_consent_target(auth_mode, contract);
     let request = CodexRequest {
-        transcript: "今天用 Py Torch 跑 training，版本是 2.7.1，不要升級到 3.0。".into(),
+        transcript: "今天用 Clau-de 跑 training，版本是 2.7.1，不要升級到 3.0。".into(),
         context_terms: Vec::new(),
-        vocabulary_terms: vec!["PyTorch".into()],
+        vocabulary_terms: vec!["Claude".into()],
         canonical_spellings: Vec::new(),
         mode: "correct".into(),
     };
@@ -35,13 +44,17 @@ fn main() -> anyhow::Result<()> {
         status.executable_path.as_deref(),
         &request,
         &cancel,
-        auth_mode,
-        policy_epoch,
-        Duration::from_secs(20),
+        codex::CodexRunPolicy {
+            auth_mode,
+            cli_version,
+            contract_target: &contract_target,
+            policy_epoch,
+            timeout: Duration::from_secs(20),
+        },
     )?;
     println!("{}", serde_json::to_string_pretty(&output)?);
-    if !output.text.contains("PyTorch")
-        || output.text.contains("Py Torch")
+    if !output.text.contains("Claude")
+        || output.text.contains("Clau-de")
         || !output.text.contains("2.7.1")
         || !output.text.contains("不要")
         || !output.text.contains("3.0")
