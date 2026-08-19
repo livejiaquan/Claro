@@ -1589,11 +1589,6 @@ fn complete_setup(state: tauri::State<AppState>) -> Result<(), String> {
         return Err("語音模型尚未下載或完整性驗證失敗".into());
     }
     let current = settings::Settings::load();
-    if let Err(reason) = validate_setup_polish(&current) {
-        return Err(format!(
-            "文字整理尚未就緒（{reason}）；請選擇本機整理或明確使用 RAW"
-        ));
-    }
     if !current.setup_completed() && !state.mic_test_passed.load(Ordering::SeqCst) {
         return Err("本次尚未完成麥克風收音測試".into());
     }
@@ -1606,16 +1601,6 @@ fn complete_setup(state: tauri::State<AppState>) -> Result<(), String> {
         serde_json::Value::Bool(true),
     )
     .map_err(|e| e.to_string())
-}
-
-fn validate_setup_polish(current: &settings::Settings) -> Result<(), &'static str> {
-    if current.polish_mode() == settings::PolishMode::Raw {
-        Ok(())
-    } else if let Some(reason) = polish::blocked_reason(current) {
-        Err(reason)
-    } else {
-        Ok(())
-    }
 }
 
 // ─── 歷史與剪貼簿 ────────────────────────────────────────────────────────────
@@ -1762,9 +1747,22 @@ fn retry_hotkey(state: tauri::State<AppState>) -> Result<bool, String> {
 
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
     }
+}
+
+/// 成功與主動取消維持背景心智模型；任何真正失敗都要把主視窗喚回，
+/// 讓使用者立即看到原因與可恢復文字，而不是只剩短暫 overlay。
+fn dictation_event_requires_attention(event: &pipeline::DictationEvent) -> bool {
+    event.phase == "finished" && !matches!(event.outcome, Some("pasted") | Some("cancelled"))
+}
+
+fn requested_page(argv: &[String]) -> Option<&'static str> {
+    argv.iter()
+        .any(|arg| arg == "--history")
+        .then_some("history")
 }
 
 fn refresh_codex_contract_on_startup() {
@@ -1866,6 +1864,15 @@ fn init_core(app: &tauri::AppHandle) {
         dummy_esc,
         msg_tx.clone(),
         cfg.input_device(),
+        {
+            let app = app.clone();
+            Arc::new(move |event: pipeline::DictationEvent| {
+                if dictation_event_requires_attention(&event) {
+                    show_main_window(&app);
+                }
+                let _ = app.emit("dictation-status", event);
+            })
+        },
     ));
 
     if let Err(e) = wire_hotkey(&core) {
@@ -1974,12 +1981,49 @@ fn init_core(app: &tauri::AppHandle) {
 mod product_gate_tests {
     use super::*;
 
-    fn settings_with(values: &[(&str, serde_json::Value)]) -> settings::Settings {
-        let mut raw = settings::default_config();
-        for (key, value) in values {
-            raw.insert((*key).to_string(), value.clone());
-        }
-        settings::Settings { raw }
+    #[test]
+    fn menu_bar_history_argument_routes_to_in_app_history() {
+        assert_eq!(
+            requested_page(&["Claro".into(), "--history".into()]),
+            Some("history")
+        );
+        assert_eq!(requested_page(&["Claro".into()]), None);
+    }
+
+    #[test]
+    fn dictation_failure_raises_recovery_but_success_and_cancel_stay_background() {
+        let event = |phase, outcome, recovery_available| pipeline::DictationEvent {
+            session: 1,
+            phase,
+            outcome,
+            recovery_available,
+        };
+
+        assert!(dictation_event_requires_attention(&event(
+            "finished",
+            Some("paste_failed"),
+            true,
+        )));
+        assert!(dictation_event_requires_attention(&event(
+            "finished",
+            Some("stt_failed"),
+            false,
+        )));
+        assert!(!dictation_event_requires_attention(&event(
+            "processing",
+            None,
+            false,
+        )));
+        assert!(!dictation_event_requires_attention(&event(
+            "finished",
+            Some("pasted"),
+            false,
+        )));
+        assert!(!dictation_event_requires_attention(&event(
+            "finished",
+            Some("cancelled"),
+            false,
+        )));
     }
 
     #[test]
@@ -2008,14 +2052,6 @@ mod product_gate_tests {
         assert!(validate_polish_mode_provider(settings::PolishMode::Clean, "codex").is_err());
         assert!(validate_polish_mode_provider(settings::PolishMode::Organize, "codex").is_err());
         assert!(validate_polish_mode_provider(settings::PolishMode::Clean, "off").is_ok());
-    }
-
-    #[test]
-    fn setup_requires_explicit_raw_or_a_ready_provider() {
-        let fresh = settings_with(&[]);
-        assert_eq!(validate_setup_polish(&fresh), Err("provider_missing"));
-        let raw = settings_with(&[("polish_mode", serde_json::json!("raw"))]);
-        assert_eq!(validate_setup_polish(&raw), Ok(()));
     }
 
     #[test]
@@ -2173,8 +2209,11 @@ pub fn run() {
 
     tauri::Builder::default()
         // 防雙開（雙實例會雙重貼上）；二度啟動時喚出既有視窗。必須是第一個 plugin。
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             show_main_window(app);
+            if let Some(page) = requested_page(&argv) {
+                let _ = app.emit("navigate-page", page);
+            }
         }))
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![

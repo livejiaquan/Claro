@@ -39,13 +39,27 @@ pub struct PendingResult {
     pub reason: &'static str,
 }
 
+/// 單次聽寫的即時 UI 事件。文字本身不放進 event；需要救援時由 UI
+/// 透過既有的 `get_pending_result` 取回，避免把完整 transcript 複製到多條通道。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DictationEvent {
+    pub session: u64,
+    pub phase: &'static str,
+    pub outcome: Option<&'static str>,
+    pub recovery_available: bool,
+}
+
+pub type DictationEventSink = Arc<dyn Fn(DictationEvent) + Send + Sync>;
+
 /// 成功貼上只累加成功次數，不得清掉較早尚未由使用者處理的救援文字。
 fn record_success(successful_pastes: &AtomicU64) {
     successful_pastes.fetch_add(1, Ordering::SeqCst);
 }
 
 fn enqueue_pending_result(queue: &Mutex<VecDeque<PendingResult>>, result: PendingResult) {
-    queue.lock().unwrap().push_back(result);
+    // Recovery UI must show the failure that just happened. Keep older unhandled
+    // results behind it instead of letting a stale item masquerade as this session.
+    queue.lock().unwrap().push_front(result);
 }
 
 fn codex_adoption_policy_is_current(metadata: &polish::PolishMetadata) -> Result<(), String> {
@@ -192,13 +206,15 @@ pub struct Core {
         )>,
     >,
     /// keyDown 當下先用 NSWorkspace 固定 App id、開啟麥克風，再做有界指紋擷取。
-    /// 與 context 文字分開：即使 context 關閉或位於敏感 App，
-    /// 仍不可把完成文字貼到後來切換的目標。
+    /// 與 context 文字分開：Context 仍綁定錄音當下的目標；真正貼上前會重新
+    /// 取得目前焦點，讓使用者處理期間切到另一個輸入框時，結果仍能直接貼上。
     target_capture: Mutex<Option<(u64, Option<crate::context::PasteTarget>)>>,
     /// 只存在記憶體，供設定頁稽核；永不寫入 history/config。
     pub last_context: Mutex<Option<crate::context::ContextSnapshot>>,
     /// History 關閉或落盤失敗時的救援文字；只存在本次程序記憶體。
     pub pending_results: Mutex<VecDeque<PendingResult>>,
+    /// 由 Tauri runtime 接上的即時聽寫 UI event sink；pipeline 本身不依賴 AppHandle。
+    pub dictation_event_sink: DictationEventSink,
 
     capture: Mutex<Option<CaptureHandle>>,
     recording_flag: Arc<AtomicBool>,
@@ -242,6 +258,7 @@ impl Core {
         esc_ctl: crossbeam_channel::Sender<Ctl>,
         msg_tx: crossbeam_channel::Sender<Msg>,
         input_device: Option<String>,
+        dictation_event_sink: DictationEventSink,
     ) -> Self {
         Self {
             sm: Mutex::new(DictationStateMachine::new()),
@@ -262,6 +279,7 @@ impl Core {
             target_capture: Mutex::new(None),
             last_context: Mutex::new(None),
             pending_results: Mutex::new(VecDeque::new()),
+            dictation_event_sink,
             capture: Mutex::new(None),
             recording_flag: Arc::new(AtomicBool::new(false)),
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
@@ -718,6 +736,7 @@ fn start_processing(core: &Arc<Core>) {
     let cancel = Arc::new(AtomicBool::new(false));
     *core.cancel.lock().unwrap() = cancel.clone();
     let session = core.sm.lock().unwrap().session();
+    emit_dictation_event(core, session, "processing", None, false);
     let capture = detach_capture(core);
     let core = core.clone();
 
@@ -728,11 +747,12 @@ fn start_processing(core: &Arc<Core>) {
     });
 }
 
-fn paste_target_matches(
-    expected: Option<&crate::context::PasteTarget>,
-    current: Option<&crate::context::PasteTarget>,
-) -> bool {
-    matches!((expected, current), (Some(expected), Some(current)) if expected == current)
+/// 貼上跟隨 Cmd+V 當下的前景 App。這裡刻意不要求 AX 視窗／欄位 metadata：
+/// WebView、Electron 與部分原生輸入框常不提供可區分的 identifier/title，若把
+/// 完整焦點指紋當成「可否貼上」條件，會把真正可輸入的目前欄位誤判成不存在。
+/// Context 仍使用嚴格 PasteTarget 綁定；只有交付文字改採前景 App 的寬容 gate。
+fn paste_destination_available(current_app: Option<&str>) -> bool {
+    current_app.is_some_and(|app_id| app_id != "dev.claro.desktop")
 }
 
 fn context_matches_target(
@@ -746,6 +766,70 @@ fn async_feedback_allowed(core: &Core, session: u64, cancel: &AtomicBool) -> boo
     !crate::SHUTTING_DOWN.load(Ordering::SeqCst)
         && !cancel.load(Ordering::SeqCst)
         && core.sm.lock().unwrap().session() == session
+}
+
+fn emit_dictation_event(
+    core: &Core,
+    session: u64,
+    phase: &'static str,
+    outcome: Option<&'static str>,
+    recovery_available: bool,
+) {
+    (core.dictation_event_sink)(DictationEvent {
+        session,
+        phase,
+        outcome,
+        recovery_available,
+    });
+}
+
+/// 保證即使 processing thread 遇到未預期的 early return 或 panic，UI 也會收到
+/// 一個 terminal event，不會永久停在「處理中」或完全沒有回饋。
+struct DictationFeedback<'a> {
+    core: &'a Core,
+    session: u64,
+    cancel: &'a AtomicBool,
+    finished: bool,
+}
+
+impl<'a> DictationFeedback<'a> {
+    fn new(core: &'a Core, session: u64, cancel: &'a AtomicBool) -> Self {
+        Self {
+            core,
+            session,
+            cancel,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, outcome: &'static str, recovery_available: bool) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        emit_dictation_event(
+            self.core,
+            self.session,
+            "finished",
+            Some(outcome),
+            recovery_available,
+        );
+    }
+}
+
+impl Drop for DictationFeedback<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let outcome = if self.cancel.load(Ordering::SeqCst) {
+            "cancelled"
+        } else {
+            "error"
+        };
+        self.finished = true;
+        emit_dictation_event(self.core, self.session, "finished", Some(outcome), false);
+    }
 }
 
 fn commit_paste_for_session(
@@ -784,6 +868,7 @@ fn process_session(
     capture: Option<CaptureHandle>,
     release_started: Instant,
 ) {
+    let mut feedback = DictationFeedback::new(core, session, cancel);
     let Some(captured_audio) = collect_audio(core, capture, false, session, Some(cancel)) else {
         return;
     };
@@ -895,6 +980,7 @@ fn process_session(
                     },
                     &history::history_path(),
                 );
+                feedback.finish(if cancelled { "cancelled" } else { "stt_failed" }, false);
                 return;
             }
         }
@@ -917,6 +1003,7 @@ fn process_session(
             },
             &history::history_path(),
         );
+        feedback.finish(if cancelled { "cancelled" } else { "silent" }, false);
         return;
     }
 
@@ -983,12 +1070,16 @@ fn process_session(
             &polish_metadata,
             None,
         );
+        feedback.finish("cancelled", false);
         return;
     }
 
     let focus_guard_started = Instant::now();
-    let current_target = crate::context::capture_paste_target();
-    // Esc 或新 session 可能在 bounded AX 驗證期間發生；貼上前必須再檢查一次。
+    // Context remains session-bound, but Cmd+V follows the foreground App's current
+    // focus. Switching from Mail to Slack (or to another field) is intentional;
+    // only an unavailable external App should enter recovery.
+    let current_app = crate::context::current_app_id();
+    // Esc 或新 session 可能在查詢前景 App 期間發生；貼上前必須再檢查一次。
     if !async_feedback_allowed(core, session, cancel) {
         persist_pre_paste_result(
             &core.pending_results,
@@ -1001,11 +1092,12 @@ fn process_session(
             &polish_metadata,
             None,
         );
+        feedback.finish("cancelled", false);
         return;
     }
 
-    if !paste_target_matches(target_app_id.as_ref(), current_target.as_ref()) {
-        tracing::warn!("paste target changed or is unavailable — preserving result in history");
+    if !paste_destination_available(current_app.as_deref()) {
+        tracing::warn!("paste destination unavailable — preserving result in history");
         send_overlay_for_session(core, session, cancel, "error");
         // 一律保留於 process-memory queue：處理途中切換 history 開關、磁碟滿或
         // 寫入失敗都不能形成沒有落盤、也沒有救援副本的資料遺失窗口。
@@ -1020,15 +1112,16 @@ fn process_session(
             &polish_metadata,
             Some("focus_changed"),
         );
+        feedback.finish("focus_changed", true);
         return;
     }
 
     let focus_guard_ms = focus_guard_started.elapsed().as_millis();
     let codex_policy_epoch = polish_metadata.codex_policy_epoch;
     let pre_paste_commit = |paste: &dyn Fn() -> anyhow::Result<()>| -> anyhow::Result<()> {
-        let current = crate::context::capture_paste_target();
-        if !paste_target_matches(target_app_id.as_ref(), current.as_ref()) {
-            anyhow::bail!("paste target changed before Cmd+V");
+        let current_app = crate::context::current_app_id();
+        if !paste_destination_available(current_app.as_deref()) {
+            anyhow::bail!("paste destination unavailable before Cmd+V");
         }
         // 持有 state-machine lock 到 Cmd+V 完成；Esc／新 session 只能在線性化點
         // 之前先讓本次失敗，或在本次貼上完成後才生效，不能插入兩者之間。
@@ -1089,6 +1182,7 @@ fn process_session(
                 &polish_metadata,
                 None,
             );
+            feedback.finish("cancelled", false);
             return;
         }
         send_overlay_for_session(core, session, cancel, "error");
@@ -1103,6 +1197,7 @@ fn process_session(
             &polish_metadata,
             Some("paste_failed"),
         );
+        feedback.finish("paste_failed", true);
         return;
     }
     send_overlay_for_session(core, session, cancel, "success");
@@ -1120,6 +1215,7 @@ fn process_session(
         },
         &history::history_path(),
     );
+    feedback.finish("pasted", false);
 }
 
 /// Esc 取消錄音：立即收 UI，背景仍轉錄一份進歷史（可救回，prototype 語意）
@@ -1168,8 +1264,9 @@ fn cancel_recording(core: &Arc<Core>) {
 mod target_tests {
     use super::{
         apply_hotkey_transition, begin_model_switch, commit_paste_for_session,
-        context_matches_target, enqueue_pending_result, force_stop_session, paste_target_matches,
-        record_success, replace_engine_atomically, take_session_slot, PendingResult,
+        context_matches_target, enqueue_pending_result, force_stop_session,
+        paste_destination_available, record_success, replace_engine_atomically, take_session_slot,
+        PendingResult,
     };
     use crate::context::{ContextSnapshot, PasteTarget};
     use crate::state_machine::{DictationStateMachine, SmAction, State};
@@ -1318,27 +1415,14 @@ mod target_tests {
     }
 
     #[test]
-    fn paste_requires_same_known_target() {
-        let target = PasteTarget {
-            app_id: "com.apple.TextEdit".into(),
-            window_hash: [1; 32],
-            focus_hash: [2; 32],
-        };
-        let same = target.clone();
-        let other_app = PasteTarget {
-            app_id: "com.apple.Safari".into(),
-            ..target.clone()
-        };
-        let other_focus = PasteTarget {
-            focus_hash: [3; 32],
-            ..target.clone()
-        };
-        assert!(paste_target_matches(Some(&target), Some(&same)));
-        assert!(!paste_target_matches(Some(&target), Some(&other_app)));
-        assert!(!paste_target_matches(Some(&target), Some(&other_focus)));
-        assert!(!paste_target_matches(Some(&target), None));
-        assert!(!paste_target_matches(None, Some(&target)));
-        assert!(!paste_target_matches(None, None));
+    fn paste_follows_any_current_external_app_without_ax_metadata() {
+        assert!(paste_destination_available(Some("com.apple.TextEdit")));
+        assert!(paste_destination_available(Some("com.google.Chrome")));
+        assert!(paste_destination_available(Some(
+            "com.tinyspeck.slackmacgap"
+        )));
+        assert!(!paste_destination_available(Some("dev.claro.desktop")));
+        assert!(!paste_destination_available(None));
     }
 
     #[test]
@@ -1379,7 +1463,7 @@ mod target_tests {
     }
 
     #[test]
-    fn failed_results_queue_without_overwriting_older_recovery() {
+    fn failed_results_show_newest_recovery_without_dropping_older_text() {
         let queue = Mutex::new(VecDeque::new());
         for text in ["第一段", "第二段"] {
             enqueue_pending_result(
@@ -1393,8 +1477,8 @@ mod target_tests {
         }
         let saved = queue.lock().unwrap();
         assert_eq!(saved.len(), 2);
-        assert_eq!(saved.front().unwrap().text, "第一段");
-        assert_eq!(saved.back().unwrap().text, "第二段");
+        assert_eq!(saved.front().unwrap().text, "第二段");
+        assert_eq!(saved.back().unwrap().text, "第一段");
     }
 
     #[test]

@@ -4,7 +4,14 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import "@fontsource/baloo-2/700.css";
 import "./index.css";
-import type { DownloadProgress, MicLevel, Status } from "./types";
+import type {
+  DictationEvent,
+  DownloadProgress,
+  MicLevel,
+  PendingResult,
+  Status,
+} from "./types";
+import { visiblePendingResult } from "./dictationState";
 import Home from "./pages/Home";
 import History from "./pages/History";
 import Onboarding from "./pages/Onboarding";
@@ -20,6 +27,36 @@ const NAV: { id: Page; label: string; icon: () => React.ReactElement }[] = [
   { id: "settings", label: "設定", icon: IconSettings },
 ];
 
+function dictationFailureCopy(outcome: DictationEvent["outcome"]) {
+  switch (outcome) {
+    case "focus_changed":
+      return {
+        title: "文字已辨識，但目前沒有外部貼上位置",
+        detail: "結果已保留；先按「複製結果」，再回輸入框按 Cmd+V，不用重講。",
+      };
+    case "paste_failed":
+      return {
+        title: "文字已辨識，但 Claro 無法送出貼上",
+        detail: "結果已保留；按下「複製結果」即可貼上，不用重講。",
+      };
+    case "stt_failed":
+      return {
+        title: "這段聽寫沒有完成",
+        detail: "語音模型未能完成辨識；這次沒有可恢復文字，請先檢查模型後再試。",
+      };
+    case "silent":
+      return {
+        title: "沒有辨識到足夠的聲音",
+        detail: "請確認麥克風有收到聲音，再重新說一次。",
+      };
+    default:
+      return {
+        title: "這段聽寫沒有完成",
+        detail: "Claro 遇到問題；若下方有保留文字，請直接複製，不用重講。",
+      };
+  }
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>("home");
   const [settingsFocusTarget, setSettingsFocusTarget] = useState<
@@ -33,8 +70,11 @@ export default function App() {
   const [statusError, setStatusError] = useState<string | null>(null);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [llmProgress, setLlmProgress] = useState<DownloadProgress | null>(null);
+  const [dictationEvent, setDictationEvent] = useState<DictationEvent | null>(null);
+  const [pendingResult, setPendingResult] = useState<PendingResult | null>(null);
   const [mic, setMic] = useState<MicLevel>({ level: 0, active: false, generation: 0, passed: false, timed_out: false });
   const micGeneration = useRef(0);
+  const dictationSession = useRef(0);
   const [toast, setToast] = useState<string | null>(null);
   const micRef = useRef(false);
   const toastTimer = useRef<number | undefined>(undefined);
@@ -54,6 +94,19 @@ export default function App() {
     toastTimer.current = window.setTimeout(() => setToast(null), 1800);
   }, []);
 
+  const loadPendingResult = useCallback(() => {
+    invoke<PendingResult | null>("get_pending_result")
+      .then(setPendingResult)
+      .catch(() => setPendingResult(null));
+  }, []);
+
+  const copyPendingResult = useCallback(() => {
+    if (!pendingResult) return;
+    invoke("copy_text", { text: pendingResult.text })
+      .then(() => showToast("已複製保留文字，這次不用重講"))
+      .catch(() => showToast("複製失敗，請到歷史紀錄再試"));
+  }, [pendingResult, showToast]);
+
   useEffect(() => {
     if (
       progress &&
@@ -66,6 +119,7 @@ export default function App() {
 
   useEffect(() => {
     refresh();
+    loadPendingResult();
     let timer: number | undefined;
     const syncPolling = () => {
       if (timer !== undefined) window.clearInterval(timer);
@@ -112,15 +166,38 @@ export default function App() {
         );
       if (e.payload.done) showToast("模型下載完成");
     });
+    const un4 = listen<DictationEvent>("dictation-status", (e) => {
+      const next = e.payload;
+      if (next.session < dictationSession.current) return;
+      dictationSession.current = next.session;
+      setDictationEvent(next);
+      if (next.phase === "finished" && next.recovery_available) {
+        // backend 先把 pending result 放入 queue，再送 terminal event；不把
+        // transcript 放進 event，這裡只取回已保留的本機結果。
+        loadPendingResult();
+      }
+      refresh();
+    });
+    const un5 = listen<string>("navigate-page", (e) => {
+      if (e.payload === "history") setPage("history");
+    });
     return () => {
       if (timer !== undefined) window.clearInterval(timer);
       document.removeEventListener("visibilitychange", syncPolling);
       un1.then((f) => f());
       un2.then((f) => f());
       un3.then((f) => f());
+      un4.then((f) => f());
+      un5.then((f) => f());
       if (micRef.current) invoke("mic_test_stop").catch(() => {});
     };
-  }, [refresh, showToast]);
+  }, [loadPendingResult, refresh, showToast]);
+
+  useEffect(() => {
+    // History can discard or clear the backend recovery queue. Refresh when the
+    // user leaves that page so a stale parent copy cannot reappear as a banner.
+    if (page !== "history") loadPendingResult();
+  }, [loadPendingResult, page]);
 
   // 第一次開啟尚未完成設定時，直接帶使用者進入引導；之後仍可自由切換頁面。
   useEffect(() => {
@@ -159,6 +236,14 @@ export default function App() {
     status.setup_completed,
   );
   const needsSetup = Boolean(status && !ready);
+  const dictationProcessing = dictationEvent?.phase === "processing";
+  const dictationFailed =
+    dictationEvent?.phase === "finished" &&
+    dictationEvent.outcome !== "pasted" &&
+    dictationEvent.outcome !== "cancelled";
+  const currentPendingResult = visiblePendingResult(pendingResult, dictationEvent);
+  const showRecovery = Boolean(currentPendingResult);
+  const failureCopy = dictationFailureCopy(dictationEvent?.outcome ?? "error");
 
   return (
     <div className="app-shell flex h-screen">
@@ -236,6 +321,73 @@ export default function App() {
       <main className="app-main flex-1 overflow-y-auto" id="main-content" tabIndex={-1}>
         <div data-tauri-drag-region className="titlebar-drag h-9 sticky top-0 z-10" />
         <div className="px-9 pb-10 max-w-[880px]">
+          {dictationProcessing && (
+            <div
+              className="dictation-feedback processing"
+              role="status"
+              aria-live="polite"
+              aria-busy="true"
+            >
+              <span className="dictation-feedback-icon dot pulse" aria-hidden="true" />
+              <div className="dictation-feedback-copy">
+                <strong>正在處理這段聽寫…</strong>
+                <p>請稍候，完成後會自動貼上；需要停止時可以按 Esc。</p>
+              </div>
+            </div>
+          )}
+
+          {dictationFailed && (
+            <div
+              className={`dictation-feedback ${currentPendingResult ? "recovery" : "failure"}`}
+              role="alert"
+              aria-live="assertive"
+            >
+              <span className="dictation-feedback-icon" aria-hidden="true">
+                {currentPendingResult ? "!" : "×"}
+              </span>
+              <div className="dictation-feedback-copy">
+                <strong>{failureCopy.title}</strong>
+                <p>{failureCopy.detail}</p>
+                {currentPendingResult && (
+                  <p className="dictation-recovery-text select-text">{currentPendingResult.text}</p>
+                )}
+              </div>
+              <div className="dictation-feedback-actions">
+                {currentPendingResult && (
+                  <button className="btn-primary no-drag" onClick={copyPendingResult}>
+                    複製結果
+                  </button>
+                )}
+                <button className="btn no-drag" onClick={() => setPage("history")}>
+                  查看歷史
+                </button>
+              </div>
+            </div>
+          )}
+
+          {showRecovery && !dictationFailed && page !== "history" && (
+            <div
+              className="dictation-feedback recovery"
+              role="status"
+              aria-live="polite"
+            >
+              <span className="dictation-feedback-icon" aria-hidden="true">!</span>
+              <div className="dictation-feedback-copy">
+                <strong>有一段文字尚未自動貼上</strong>
+                <p>結果已保留在 Claro；你可以直接複製，不用重講。</p>
+                <p className="dictation-recovery-text select-text">{currentPendingResult?.text}</p>
+              </div>
+              <div className="dictation-feedback-actions">
+                <button className="btn-primary no-drag" onClick={copyPendingResult}>
+                  複製結果
+                </button>
+                <button className="btn no-drag" onClick={() => setPage("history")}>
+                  查看歷史
+                </button>
+              </div>
+            </div>
+          )}
+
           {!status && statusError ? (
             <div className="page-in status-fatal" role="alert">
               <h1>無法讀取 Claro 狀態</h1>

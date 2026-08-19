@@ -49,6 +49,22 @@ export interface PendingResult {
   reason: "focus_changed" | "paste_failed";
 }
 
+export type DictationOutcome =
+  | "pasted"
+  | "paste_failed"
+  | "focus_changed"
+  | "stt_failed"
+  | "silent"
+  | "cancelled"
+  | "error";
+
+export interface DictationEvent {
+  session: number;
+  phase: "processing" | "finished";
+  outcome: DictationOutcome | null;
+  recovery_available: boolean;
+}
+
 export interface ModelInfo {
   id: string;
   label: string;

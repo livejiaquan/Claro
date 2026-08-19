@@ -2,8 +2,8 @@
 //!
 //! AX API 抓前景 app／視窗標題／焦點元件游標前後文／選取文字／可見文字 BFS。
 //! 隱私鐵律：AXSecureTextField 永不讀；內容只在記憶體、永不落盤；
-//! 設定 `context_enabled=false` 時零 AX 文字擷取；貼上安全仍會讀取並立即 hash
-//! App／視窗／焦點 metadata，但不讀欄位值、不顯示、不落盤。
+//! 設定 `context_enabled=false` 時零 AX 文字擷取；Context session 綁定仍會讀取並
+//! 立即 hash App／視窗／焦點 metadata，但不讀欄位值、不顯示、不落盤。
 //! 預算：游標前後 500 字、可見文字 3000 字、800 節點。可見文字的額度比
 //! prototype 的 1200/400 大，因為它是「自動詞源」——使用者不必手動維護字典，
 //! 螢幕上出現過的專有名詞就能進 STT 偏置。擷取在 keyDown 就於背景啟動、
@@ -36,8 +36,8 @@ pub struct ContextSnapshot {
     pub(crate) target: PasteTarget,
 }
 
-/// 貼上安全用的焦點指紋。只保留 App id 與不可逆的視窗／焦點 metadata hash，
-/// 不含欄位內容；即使 context 關閉也能防止處理期間切到同 App 的另一個目標。
+/// Context session 綁定用的焦點指紋。只保留 App id 與不可逆的視窗／焦點
+/// metadata hash，不含欄位內容；貼上交付本身跟隨 Cmd+V 當下的前景 App。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasteTarget {
     pub app_id: String,

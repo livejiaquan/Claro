@@ -1,7 +1,7 @@
 //! 文字注入：剪貼簿全格式備份 → 寫入 → 合成 Cmd+V → 還原（SPEC §9）。
-//! macOS 走 NSPasteboard item/type 層級的 eager snapshot；任一 type 無法讀取就
-//! fail-closed，絕不清空使用者原本的剪貼簿。還原前再用 changeCount 與私有
-//! marker 確認剪貼簿仍由 Claro 持有，避免覆蓋使用者新的 Copy。
+//! macOS 走 NSPasteboard item/type 層級的 eager snapshot；保留每個 item 所有
+//! 可 materialize 的格式，只有整個 item 都無法保存時才 fail-closed。還原前再用
+//! changeCount 與私有 marker 確認剪貼簿仍由 Claro 持有，避免覆蓋使用者新的 Copy。
 //! 還原延遲 300ms（SPEC D8：Handy 的 50ms 會 race 慢的目標 app）。
 //! CJK IME 輸入源防護在 M4（SPEC D9）。
 
@@ -13,8 +13,13 @@ use anyhow::{anyhow, bail, Context, Result};
 
 type PrePasteCommit<'a> = dyn Fn(&dyn Fn() -> Result<()>) -> Result<()> + 'a;
 
+/// Clipboard managers and slower WebView targets can need more than one run-loop
+/// turn after NSPasteboard changes. The extra 50ms is negligible beside STT time
+/// and materially safer than racing Cmd+V immediately after the temporary write.
+const CLIPBOARD_SETTLE_MS: u64 = 100;
+
 pub trait TextInjector: Send + Sync {
-    /// `pre_paste_commit` 會在 50ms clipboard settle 後取得真正的 Cmd+V closure。
+    /// `pre_paste_commit` 會在 clipboard settle 後取得真正的 Cmd+V closure。
     /// 呼叫端必須在同一個 session/state lock 內完成最後驗證並執行 closure，
     /// 讓 Esc／新 session 不可能插在「guard=true」與實際貼上之間。
     fn inject(&self, text: &str, pre_paste_commit: &PrePasteCommit<'_>) -> Result<()>;
@@ -51,13 +56,14 @@ fn inject_macos(text: &str, pre_paste_commit: &PrePasteCommit<'_>) -> Result<()>
         .map_err(|_| anyhow!("clipboard transaction lock poisoned"))?;
 
     let pasteboard = NSPasteboard::generalPasteboard();
-    // snapshot 必須在 clearContents 之前完整成功；任一格式無法 eager 讀取就不注入。
+    // snapshot 必須在 clearContents 之前成功保存每個 item 的至少一種格式；
+    // lazy provider 的冗餘格式讀不到時略過，整個 item 都讀不到才不注入。
     let snapshot = PasteboardSnapshot::capture(&pasteboard)?;
     let marker = make_marker();
     let injected_change_count = write_injected_text(&pasteboard, text, &marker, &snapshot)?;
-    thread::sleep(Duration::from_millis(50));
+    thread::sleep(Duration::from_millis(CLIPBOARD_SETTLE_MS));
 
-    // 50ms 是給 clipboard manager/目標 app 的反應窗口；真正送 Cmd+V 前必須
+    // settle 是給 clipboard manager/目標 app 的反應窗口；真正送 Cmd+V 前必須
     // 再驗一次 ownership。若期間內容被改寫，直接中止，不能把替代內容貼出去。
     let pre_paste_change_count = pasteboard.changeCount();
     let pre_paste_marker = current_marker(&pasteboard);
@@ -113,6 +119,38 @@ struct PasteboardSnapshot {
     items: Vec<Vec<(String, Vec<u8>)>>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct MaterializedPasteboardItem {
+    data: Vec<(String, Vec<u8>)>,
+    skipped_types: usize,
+}
+
+/// macOS pasteboards often expose several equivalent text or image flavors. A lazy
+/// provider may fail to materialize one redundant flavor even though another flavor
+/// contains the same clipboard item. Rejecting the whole paste in that case makes a
+/// successful dictation disappear before Cmd+V. Keep every readable flavor, but still
+/// fail closed when an entire item cannot be preserved at all.
+fn retain_materialized_types(
+    item_index: usize,
+    types: impl IntoIterator<Item = (String, Option<Vec<u8>>)>,
+) -> Result<MaterializedPasteboardItem> {
+    let mut data = Vec::new();
+    let mut skipped_types = 0;
+    for (type_name, bytes) in types {
+        match bytes {
+            Some(bytes) => data.push((type_name, bytes)),
+            None => skipped_types += 1,
+        }
+    }
+    if data.is_empty() {
+        bail!("clipboard item {item_index} has no materialized types");
+    }
+    Ok(MaterializedPasteboardItem {
+        data,
+        skipped_types,
+    })
+}
+
 #[cfg(target_os = "macos")]
 impl PasteboardSnapshot {
     fn capture(pasteboard: &objc2_app_kit::NSPasteboard) -> Result<Self> {
@@ -125,15 +163,22 @@ impl PasteboardSnapshot {
             if types.is_empty() {
                 bail!("clipboard item {item_index} has no readable types");
             }
-            let mut saved_item = Vec::with_capacity(types.len());
-            for data_type in types.iter() {
-                let type_name = data_type.to_string();
-                let data = item.dataForType(&data_type).with_context(|| {
-                    format!("clipboard item {item_index} type '{type_name}' is not materialized")
-                })?;
-                saved_item.push((type_name, data.to_vec()));
+            let materialized = retain_materialized_types(
+                item_index,
+                types.iter().map(|data_type| {
+                    let type_name = data_type.to_string();
+                    let data = item.dataForType(&data_type).map(|data| data.to_vec());
+                    (type_name, data)
+                }),
+            )?;
+            if materialized.skipped_types > 0 {
+                tracing::warn!(
+                    item_index,
+                    skipped_types = materialized.skipped_types,
+                    "clipboard snapshot skipped unreadable redundant formats"
+                );
             }
-            snapshot.push(saved_item);
+            snapshot.push(materialized.data);
         }
         Ok(Self { items: snapshot })
     }
@@ -304,7 +349,8 @@ fn run_cmd_v_sequence(mut send: impl FnMut(CmdVAction) -> Result<()>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        paste_if_owned, paste_transaction_lock, run_cmd_v_sequence, should_restore, CmdVAction,
+        paste_if_owned, paste_transaction_lock, retain_materialized_types, run_cmd_v_sequence,
+        should_restore, CmdVAction,
     };
     use anyhow::bail;
 
@@ -367,6 +413,45 @@ mod tests {
         assert!(paste_transaction_lock().try_lock().is_err());
         drop(guard);
         assert!(paste_transaction_lock().try_lock().is_ok());
+    }
+
+    #[test]
+    fn snapshot_keeps_readable_flavors_when_a_redundant_flavor_is_unavailable() {
+        let item = retain_materialized_types(
+            0,
+            [
+                ("public.rtf".to_string(), None),
+                (
+                    "public.utf8-plain-text".to_string(),
+                    Some(b"Claro".to_vec()),
+                ),
+                (
+                    "public.utf16-external-plain-text".to_string(),
+                    Some(vec![0xff, 0xfe, b'C', 0]),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(item.skipped_types, 1);
+        assert_eq!(item.data.len(), 2);
+        assert_eq!(item.data[0].0, "public.utf8-plain-text");
+    }
+
+    #[test]
+    fn snapshot_still_fails_closed_when_an_entire_item_is_unreadable() {
+        let error = retain_materialized_types(
+            2,
+            [
+                ("public.rtf".to_string(), None),
+                ("public.utf8-plain-text".to_string(), None),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("clipboard item 2 has no materialized types"));
     }
 
     #[test]
@@ -493,7 +578,7 @@ mod tests {
             .unwrap();
             assert!(first_called);
 
-            // 模擬 clipboard manager 在 50ms 內換掉內容；測試 closure 不會送鍵。
+            // 模擬 clipboard manager 在 settle 期間換掉內容；測試 closure 不會送鍵。
             write_injected_text(&pasteboard, "replacement", b"other-owner", &snapshot).unwrap();
             let mut replacement_pasted = false;
             let error = paste_if_owned(

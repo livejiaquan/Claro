@@ -665,6 +665,67 @@ input {
   background: var(--amber-soft);
   color: var(--amber-text);
 }
+.dictation-feedback {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0 0 20px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  min-width: 0;
+}
+.dictation-feedback.processing {
+  border-color: rgba(52, 120, 246, 0.24);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+.dictation-feedback.recovery {
+  border-color: rgba(199, 124, 26, 0.24);
+  background: var(--amber-soft);
+  color: var(--amber-text);
+}
+.dictation-feedback.failure {
+  border-color: rgba(229, 72, 77, 0.2);
+  background: var(--red-soft);
+  color: var(--red-text);
+}
+.dictation-feedback-icon {
+  flex: 0 0 auto;
+  margin-top: 4px;
+}
+.dictation-feedback-copy {
+  flex: 1;
+  min-width: 0;
+}
+.dictation-feedback-copy strong {
+  color: inherit;
+  font-weight: 650;
+}
+.dictation-feedback-copy p {
+  margin-top: 3px;
+}
+.dictation-feedback-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.dictation-recovery-text {
+  max-height: 132px;
+  margin-top: 9px !important;
+  padding: 9px 10px;
+  overflow: auto;
+  border: 1px solid rgba(199, 124, 26, 0.2);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.62);
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .status-fatal {
   max-width: 520px;
   margin: 36px auto;
@@ -1044,6 +1105,11 @@ input {
   color: var(--faint);
   font-size: 10.5px;
 }
+.setup-score .setup-score-next {
+  margin-top: 7px;
+  color: var(--green-text);
+  font-weight: 650;
+}
 .setup-step {
   display: grid;
   grid-template-columns: 34px minmax(0, 1fr);
@@ -1069,6 +1135,11 @@ input {
   color: var(--accent-text);
   font-size: 13px;
   font-weight: 700;
+}
+.setup-step-number.setup-step-next {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 17px;
 }
 .setup-step.complete .setup-step-number,
 .setup-first-dictation.ready .setup-step-number {
@@ -1131,6 +1202,22 @@ input {
   border: 1px solid var(--hairline);
   border-radius: 10px;
 }
+.setup-download-expectation {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin: 10px 10px 0;
+  padding: 9px 10px;
+  border-radius: 9px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.setup-download-expectation strong {
+  color: var(--accent-text);
+  font-weight: 650;
+}
 .setup-model-row {
   display: flex;
   align-items: center;
@@ -1159,6 +1246,16 @@ input {
 }
 .setup-first-dictation.blocked {
   background: rgba(255, 255, 255, 0.58);
+}
+.setup-first-dictation-list {
+  margin: 10px 0 0;
+  padding-left: 19px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.setup-first-dictation-list li + li {
+  margin-top: 3px;
 }
 .setup-note {
   color: var(--faint);
@@ -1215,16 +1312,16 @@ input {
 /* 頁面切換動畫 */
 @keyframes page-in {
   from {
-    opacity: 0;
     transform: translateY(6px);
   }
   to {
-    opacity: 1;
     transform: none;
   }
 }
 .page-in {
-  animation: page-in 0.28s cubic-bezier(0.22, 1, 0.36, 1) both;
+  /* WebKit can pause a newly mounted page animation while the native window is
+     inactive. Never make page visibility depend on that animation completing. */
+  animation: page-in 0.28s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 @media (max-width: 860px) {

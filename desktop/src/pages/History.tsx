@@ -21,8 +21,8 @@ const EMPTY_STATUS_TEXT: Record<string, string> = {
   silent: "沒有偵測到足夠的語音",
   mic_unavailable: "麥克風目前不可用",
   stt_failed: "語音模型未能完成辨識",
-  paste_failed: "文字已保留，但無法貼到目標 App",
-  focus_changed: "處理期間焦點已切換；文字已保留在歷史紀錄",
+  paste_failed: "文字已保留，但 Claro 無法送出貼上",
+  focus_changed: "完成時沒有可貼上的輸入位置；文字已保留在歷史紀錄",
 };
 
 const STATUS_RECOVERY: Record<string, string> = {
@@ -31,8 +31,8 @@ const STATUS_RECOVERY: Record<string, string> = {
   silent: "在「首次設定」測試麥克風音量，或改選另一個輸入裝置。",
   mic_unavailable: "打開 macOS 麥克風權限，或在設定中改選可用的輸入裝置。",
   stt_failed: "到「語音模型」重試；若持續失敗，可刪除後重新下載模型。",
-  paste_failed: "先複製上方最後輸出，再重新檢查 Claro 的輔助使用權限。",
-  focus_changed: "為避免貼到錯誤的 App，Claro 沒有自動貼上；可複製上方最後輸出。",
+  paste_failed: "先複製上方最後輸出；若持續發生，再重新檢查 Claro 的輔助使用權限。",
+  focus_changed: "目前沒有可貼上的輸入位置；點回輸入框後可複製上方最後輸出。",
 };
 
 const MODE_LABEL: Record<PolishMode, string> = {
@@ -235,8 +235,8 @@ export default function History({
               <strong className="text-[13px]">有一段文字未自動貼上</strong>
               <p className="text-[12px] mt-1" style={{ color: "var(--muted)" }}>
                 {pending.reason === "focus_changed"
-                  ? "焦點已改變，為避免貼錯位置而保留在記憶體。"
-                  : "目標 App 未接受貼上，結果已保留在記憶體。"}
+                  ? "完成時沒有可貼上的輸入位置，結果已保留在記憶體。"
+                  : "Claro 無法送出貼上，結果已保留在記憶體。"}
               </p>
               <p className="text-[13px] mt-3 whitespace-pre-wrap select-text">{pending.text}</p>
             </div>

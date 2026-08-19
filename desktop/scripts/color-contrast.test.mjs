@@ -127,3 +127,26 @@ test("privacy detail inherits each notice tone instead of overriding contrast", 
     );
   }
 });
+
+test("page transition never makes native route content invisible", () => {
+  const keyframesStart = css.indexOf("@keyframes page-in");
+  const pageRuleStart = css.indexOf(".page-in", keyframesStart);
+  const nextMediaStart = css.indexOf("@media", pageRuleStart);
+  assert.ok(keyframesStart >= 0 && pageRuleStart > keyframesStart && nextMediaStart > pageRuleStart);
+
+  const transitionCss = css.slice(keyframesStart, nextMediaStart);
+  assert.doesNotMatch(
+    transitionCss,
+    /\bopacity\s*:/,
+    "a paused WebKit route animation must not hide the entire page",
+  );
+  const pageRule = transitionCss.match(/\n\.page-in\s*\{([^}]*)\}/);
+  assert.ok(pageRule, "missing .page-in rule");
+  const animation = pageRule[1].match(/animation:\s*([^;]+);/);
+  assert.ok(animation, "missing .page-in animation declaration");
+  assert.doesNotMatch(
+    animation[1],
+    /\bboth\b/,
+    "page transition must not retain a hidden animation frame",
+  );
+});

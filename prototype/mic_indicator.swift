@@ -604,10 +604,14 @@ class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func openHistory(_ sender: NSMenuItem) {
-        NSWorkspace.shared.open(URL(fileURLWithPath: HISTORY_PATH))
+        openClaro(arguments: ["--history"])
     }
 
     @objc private func openClaro(_ sender: NSMenuItem) {
+        openClaro(arguments: [])
+    }
+
+    private func openClaro(arguments: [String]) {
         let executable = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
         let appURL = executable
             .deletingLastPathComponent() // MacOS
@@ -616,6 +620,7 @@ class MenuBarController: NSObject, NSMenuDelegate {
         guard appURL.pathExtension == "app" else { return }
         let config = NSWorkspace.OpenConfiguration()
         config.activates = true
+        config.arguments = arguments
         NSWorkspace.shared.openApplication(at: appURL, configuration: config, completionHandler: nil)
     }
 

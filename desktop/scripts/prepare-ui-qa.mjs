@@ -42,7 +42,7 @@ const bridge = String.raw`
     successful_pastes_this_launch: 0,
     history_enabled: true,
     mic_test_passed_this_launch: false,
-    polish_mode: "clean",
+    polish_mode: "raw",
     effective_mode: "raw",
     llm_provider: "off",
     local_only: true,
@@ -56,7 +56,7 @@ const bridge = String.raw`
     appleStatus: 2,
     llm: {
       provider: "off", model: "", base_url: "", has_key: false, apple_status: 2,
-      polish_mode: "clean", effective_mode: "raw", local_only: true,
+      polish_mode: "raw", effective_mode: "raw", local_only: true,
       organize_consent_valid: false, correct_consent_valid: false,
       cloud_consent_valid: false, execution_location: "none", endpoint_origin: null,
       destination_label: null, codex_consent_valid: false,
@@ -132,6 +132,22 @@ const bridge = String.raw`
       codex_share_context_terms: false,
       codex_correction_preferences: scenario === "codex-connected" ? "Claude\nFlutter\nWhisper" : "",
       blocked_reason: scenario === "codex-connected" ? null : "codex_consent_required",
+    });
+    modelById("large-v3-turbo").downloaded = true;
+  }
+
+  if (
+    scenario === "dictation-processing" ||
+    scenario === "dictation-recovery" ||
+    scenario === "dictation-recovery-long"
+  ) {
+    Object.assign(state.status, {
+      model_present: true,
+      accessibility: true,
+      hotkey_active: true,
+      setup_completed: true,
+      successful_pastes_this_launch: 3,
+      mic_test_passed_this_launch: true,
     });
     modelById("large-v3-turbo").downloaded = true;
   }
@@ -525,6 +541,40 @@ const bridge = String.raw`
   };
   window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
   window.__CLARO_QA__ = { scenario, state, emit };
+  if (
+    scenario === "dictation-processing" ||
+    scenario === "dictation-recovery" ||
+    scenario === "dictation-recovery-long"
+  ) {
+    setTimeout(() => {
+      state.status.dictation_state = "processing";
+      emit("dictation-status", {
+        session: 1,
+        phase: "processing",
+        outcome: null,
+        recovery_available: false,
+      });
+    }, 250);
+  }
+  if (scenario === "dictation-recovery" || scenario === "dictation-recovery-long") {
+    setTimeout(() => {
+      state.status.dictation_state = "idle";
+      const recoveredText = scenario === "dictation-recovery-long"
+        ? "這是一段用來驗證長時間聽寫恢復體驗的測試內容。使用者可能已經連續說了好幾分鐘，包含會議重點、日期、待辦事項與需要交付的細節；即使自動貼上失敗，完整文字也必須留在畫面上，能夠清楚閱讀、選取與複製，而且不能因為內容較長就把按鈕擠出視窗或遮住後續操作。Claro 應該明確告訴使用者這段文字仍然安全，不需要重新說一次，並提供前往歷史紀錄的恢復路徑。"
+        : "明天會議改到下午三點。";
+      state.pendingResult = {
+        raw: recoveredText,
+        text: recoveredText,
+        reason: "paste_failed",
+      };
+      emit("dictation-status", {
+        session: 1,
+        phase: "finished",
+        outcome: "paste_failed",
+        recovery_available: true,
+      });
+    }, 1200);
+  }
 })();
 </script>`;
 
