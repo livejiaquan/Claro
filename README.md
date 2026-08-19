@@ -35,7 +35,8 @@
 
 ## 安裝（從原始碼）
 
-需求：macOS 11+、Intel 或 Apple Silicon、Rust stable、Node 22+、`brew install cmake`。
+需求：macOS 11+、Intel 或 Apple Silicon、Rust stable、Node 20.19+（或 22.12+）、
+`brew install cmake`。Node 版本需符合 Vite 7 的最低要求；不相容時 `npm install` 會顯示警告。
 
 ```bash
 git clone https://github.com/livejiaquan/Claro && cd Claro/desktop
