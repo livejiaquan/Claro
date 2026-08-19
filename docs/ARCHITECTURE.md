@@ -106,9 +106,10 @@ StaticText/TextField/TextArea/Heading 內容性角色）。
 **踩過的坑與防護（改這個檔前必讀）：**
 - system-wide AX 元素查 `AXFocusedApplication` 會回 -25204（CannotComplete）——
   **必須走 NSWorkspace 拿前景 pid** 再 `AXUIElementCreateApplication`。
-- AX 呼叫可能卡住：一般 Context capture 有 380ms 整批預算；貼上目標只讀
+- AX 呼叫可能卡住：一般 Context capture 有 380ms 整批預算；Context 目標指紋只讀
   metadata，單次 AX timeout 40ms、整批 240ms。Context 在 keyDown 後背景擷取，
-  放開後 pipeline 最多再等到 250ms deadline；逾時即 fail closed。
+  放開後 pipeline 最多再等到 250ms deadline；逾時只停用該次 Context。貼上交付
+  不再要求 AX metadata，只在 Cmd+V 前確認目前有外部前景 App。
 - CF 記憶體：AX 回傳都是 create rule（+1 retain），用 `Owned` RAII 包，drop 時 CFRelease。
   CFArray 的元素歸陣列持有，要留用必須自己 CFRetain。
 - **隱私鐵律**：焦點元件 role/subrole 是 `AXSecureTextField` 整塊跳過；
@@ -134,7 +135,7 @@ StaticText/TextField/TextArea/Heading 內容性角色）。
 | mode | 允許的改動 | guard |
 |---|---|---|
 | `raw` | 無——完全逐字（也是所有失敗的安全退回） | — |
-| `clean`（新安裝預設意圖） | 刪停頓邊界純填充詞、明確改口只留最終版、補不改語氣的標點；**LLM 不得修改任何文字／英數 token**——專有詞修正交給 STT Context 偏置＋個人字典 | 錨點 multiset（數字/否定/日期/術語）＋語意字元序列比對（窄容忍：前一字元是空白且非句首的「那個/就是說」可缺席——STT 不替停頓補標點，中英間距後的填充詞實測會卡）＋相似度/新增內容比例 |
+| `clean`（選用） | 刪停頓邊界純填充詞、明確改口只留最終版、補不改語氣的標點；**LLM 不得修改任何文字／英數 token**——專有詞修正交給 STT Context 偏置＋個人字典 | 錨點 multiset（數字/否定/日期/術語）＋語意字元序列比對（窄容忍：前一字元是空白且非句首的「那個/就是說」可缺席——STT 不替停頓補標點，中英間距後的填充詞實測會卡）＋相似度/新增內容比例 |
 | `correct`（首次啟用需明確同意） | 最多三個英文專業詞拼法正規化。target-only whitespace merge 已因 `A PI→API`、`The Rapist→TheRapist` 反例全面關閉；空白合併與已知 source→target 一律走個人字典。目前 Codex 只保留尾端兩字母單連字號的極窄實驗 heuristic（如 `Clau-de→Claude`），並明示它只是降低風險、不是語意證明。不允許純改大小寫、猜測字母替換、新增分詞，也不改數字、日期、否定、URL、email、path、版本或帶數字 token | Codex structured edits 逐項驗證；replacement 必須命中使用者詞彙／正確拼法清單，或另行同意且 guard 可採用的 canonical Context term。source 必須是恰一個連字號、左側至少四字母、右側恰兩字母，移除後逐字等於 target；proposal text 必須逐位元等於本機 deterministic 套用結果。`A PI→API`、`The Rapist→TheRapist`、`Under-score→Underscore`、`re-sign→resign`、字母不同、同音誤認、普通詞分合與含數字固定格式只走使用者明確建立的個人字典 |
 | `organize`（首次啟用需明確同意） | 完整句讀重排、分段、明確列舉格式化、完全重複合併 | 事實錨點＋內容覆蓋比對 |
 
@@ -205,9 +206,14 @@ ggml/Metal 資源**留給 atexit teardown 會 `ggml_abort`**（SIGABRT＋crash �
 
 ## 8. 貼上（`inject.rs`）
 
-逐 item／type eager 備份 NSPasteboard（任一格式讀取失敗就不注入）→ 寫入文字與
-私有 ownership marker → 等 50ms → 再驗 changeCount／marker／session／焦點 →
+逐 item／type eager 備份 NSPasteboard（每個 item 至少要有一種可讀格式）→ 寫入文字與
+私有 ownership marker → 等 100ms → 再驗 changeCount／marker／session／目前前景 App →
 CGEvent 合成 Cmd+V → 成功時等 300ms → 只在 ownership 未改變時完整還原。
+備份以 item 為安全邊界：同一 item 的冗餘 lazy flavor 若暫時不可讀，保留其餘
+可 materialize 格式繼續交付；整個 item 都無法保存時才 fail closed。
+貼上前重新讀取目前前景 App，因此使用者可在處理期間切到另一個輸入框；
+Context 仍使用 keyDown 當下的 session-bound snapshot。交付不要求 AX 欄位 identifier
+或 title；沒有外部前景 App 時不送 Cmd+V，結果進 pending recovery queue。
 富文字、圖片與檔案格式都保留；使用者在期間 Copy 的新內容不會被 Claro 覆蓋。
 
 ## 9. 設定與資料（`settings.rs`、`history.rs`）
@@ -222,7 +228,7 @@ CGEvent 合成 Cmd+V → 成功時等 300ms → 只在 ownership 未改變時完
 
 ## 10. 前端（`desktop/src/`）
 
-- `App.tsx`：側欄殼＋每 2s 輪詢 `get_status`＋事件監聽（模型下載進度、麥克風電平）。
+- `App.tsx`：側欄殼＋每 2s 輪詢 `get_status`＋事件監聽（模型下載進度、麥克風電平、聽寫處理／終態）。後端在非成功、非主動取消的終態先喚回主視窗，再送事件；paste/focus 失敗可直接顯示 pending 文字與複製動作，不要求使用者重新說一次。
 - 頁面：`Home`（統計卡＋未就緒 banner）、`History`、`Settings`（所有設定列）。
 - `downloadState.ts` 合併事件與後端模型清單：準備、下載、取消中、已取消、
   失敗可續傳與完成都有單一狀態；終態優先於可能過期的 `downloading=true`。

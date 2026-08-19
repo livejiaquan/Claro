@@ -27,18 +27,18 @@
 | 4 | 第一次聽寫 | completion backend gate | TextEdit | 未成功 paste 前不能完成；成功後才寫 setup_completed |
 | 5 | 明確改口 7am→3pm | guard fixture | 多 provider | 只保留 3pm；其他句子的否定/待辦不丟 |
 | 6 | 跳序、完全重複、購物清單 | guard fixture | Apple/Builtin | 可重排、合併完全重複、明確列舉可用 bullets，不新增標題 |
-| 7 | 跨 App Context／焦點切換 | fingerprint equality＋pending queue tests | Mail→Slack／Cursor | keyDown App id 不同時丟棄 Context；paste target 不同時不自動貼上；結果依序進 process-memory recovery queue |
-| 7b | 同 App 視窗／欄位切換 | full-fingerprint Context regression＋同批 AX refs static | 同 App 兩視窗／兩欄位 | metadata hash 不同時不自動貼上；ContextSnapshot fingerprint 與 keyDown 目標一致；真實 App 的 AX metadata 可辨識率仍待矩陣 |
+| 7 | 跨 App Context／焦點切換 | session-bound Context＋current-App paste＋pending queue tests | Mail→Slack／Cursor | keyDown App id 不同時丟棄 Context；完成時把 Cmd+V 送到目前外部前景 App，沒有外部前景 App 才進 recovery queue |
+| 7b | 同 App 視窗／欄位切換 | full-fingerprint Context regression＋current-App paste | 同 App 兩視窗／兩欄位 | ContextSnapshot 仍綁定 keyDown 目標；貼上跟隨 Cmd+V 當下焦點，不因 AX metadata 缺少 identifier/title 而拒絕 |
 | 8 | 密碼管理器與 secure field | denylist tests | Passwords/1Password | 零 Context 內容；仍可純聽寫 |
 | 9 | 空白、太短、STT/paste 失敗 | History UI QA | fault injection | History 顯示錯誤與恢復資訊，不再把空文字紀錄隱藏 |
 | 10 | 下載準備、取消、中斷與磁碟不足 | downloader/session ordering tests＋Vitest＋UI QA | throttled network/full disk | 等推論鎖時可取消；終態先清 gate/downloading 再送事件；準備／下載／取消中／已取消／失敗／完成可辨；重試續傳；hash 不符不載入 |
 | 11 | 富文字/圖片/檔案剪貼簿 | NSPasteboard tests | Office/Finder | 完整還原；使用者中途 Copy 不被覆蓋 |
-| 12 | Esc 取消 | state/llama cancel＋pre-Cmd+V guard tests | Apple/Builtin/HTTP | overlay 立即取消；builtin 檢查 cancel、6 秒 generation／8 秒 total 邏輯預算；HTTP/Apple 最遲 5 秒返回；50ms clipboard settle 後仍重驗 session／focus |
+| 12 | Esc 取消 | state/llama cancel＋pre-Cmd+V guard tests | Apple/Builtin/HTTP | overlay 立即取消；builtin 檢查 cancel、6 秒 generation／8 秒 total 邏輯預算；HTTP/Apple 最遲 5 秒返回；100ms clipboard settle 後仍重驗 session／前景 App |
 | 13 | 隱藏視窗待機與端到端延遲 | history timing＋privacy-safe summary test | Instruments 10 min | hidden 時停止 2 秒 polling；`release_to_paste` p50/p95 可重跑且摘要不輸出內容；模型卸載後 RSS <300 MB |
 | 14 | 注音/拼音/日文 IME | 尚缺 | 三種 IME | 貼上成功、輸入源正確還原、無重複字 |
 | 15 | 快速連續兩段／上一段晚到 | state stale-session＋session-slot＋stale-watchdog regressions | TextEdit／Slack | 舊 session 不得取走、覆蓋或貼出新 session 的 target/context/result |
 | 16 | 5 分鐘 force-stop | state-machine＋stale-watchdog generation test；300 秒 wall test 尚缺 | 長錄音 | 到上限後只送一次 force-stop、只處理一次、狀態回 IDLE、overlay 不殘留 |
-| 17 | History 關閉＋失焦／貼上失敗 | FIFO pending queue regressions＋History UI QA | 任意 App | 不落盤；多段結果依序保留，可在本次執行期間複製或捨棄，不被後續成功／失敗覆蓋 |
+| 17 | History 關閉＋失焦／貼上失敗 | newest-first pending queue regressions＋History UI QA | 任意 App | 不落盤；最新失敗先顯示，較舊結果仍依序保留，可在本次執行期間複製或捨棄；失敗會喚回主視窗，不被後續成功／失敗覆蓋 |
 | 18 | config/history 損毀或磁碟寫滿 | parser tests；併發 locking／disk-full regression 尚缺 | fault injection | config 安全回預設；History 壞行跳過；落盤失敗不影響聽寫與救援文字 |
 | 19 | 睡眠喚醒／錄音中切麥克風路由 | 尚缺 | AirPods/USB | 不 crash、不保留幽靈錄音；舊 mic test 不得替新裝置通過 gate |
 | 20 | keyDown 遇到遲緩／無回應 AX App | 40ms per-call／約250ms batch deadline static；fake-delay regression 尚缺 | 可控制 AX 延遲的測試 App | keyDown 只固定 focus reference（不讀內容／逐項 metadata）；keyDown→錄音提示 p95 ≤150ms；後續 target/context 與 paste-time fingerprint 各約 ≤250ms，逾時 fail closed |
@@ -58,9 +58,9 @@
 ## keyDown AX 延遲：最小可驗證實作方案
 
 1. keyDown 讓 `audio::start_capture` 與最小 `AXFocusedUIElement` seed 並行；seed 不讀文字或逐項 metadata。麥克風 stream ready 後才完成 bounded target fingerprint、讀設定與擷取 Context，避免 AX 排在開麥前切掉第一個音節。
-2. target fingerprint 與 ContextSnapshot 使用固定的 window／focused element refs；App id 或完整 fingerprint 不符就丟棄 Context。PasteTarget 取不到可辨識 metadata 時 unknown→unknown 不得放行。
-3. Context worker 與 paste-time fingerprint capture 各設約 250ms wall-clock 上限；單次 AX messaging timeout 40ms。逾時時不自動貼上，文字進 History 或 process-memory pending queue。
-4. 已覆蓋舊 session 不得取走新 session slot、同 App 不同 fingerprint 不得使用 Context／自動貼上、stale watchdog 與 Cmd+V 前 target guard；仍需注入 500ms fake AX，驗證 bounded return 與 audio callback 的 p95。
+2. target fingerprint 與 ContextSnapshot 使用固定的 window／focused element refs；App id 或完整 fingerprint 不符就丟棄 Context。這個嚴格指紋不再阻擋貼上交付。
+3. Context worker／fingerprint capture 各設約 250ms wall-clock 上限；單次 AX messaging timeout 40ms。逾時只停用該次 Context，不應阻止文字送到目前外部前景 App。
+4. 已覆蓋舊 session 不得取走新 session slot、切換 App 不得帶走舊 Context、stale watchdog 與 Cmd+V 前 current-App guard；仍需注入 500ms fake AX，驗證 bounded return 與 audio callback 的 p95。
 5. Native 驗收記錄 keyDown→第一個錄音狀態事件的 p50/p95，至少測 TextEdit、Mail、Chrome、Electron App 與刻意延遲的 AX 測試 App；不以單次順暢操作代替數字。
 
 ## 黑箱競品對照語料

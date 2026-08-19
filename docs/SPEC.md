@@ -59,12 +59,12 @@ Claro 是 macOS（後續跨平台）語音輸入工具：按熱鍵說話 → 本
 單次聽寫（`pipeline.rs`，各階段耗時記錄進 history）：
 
 1. 熱鍵按下即建立 session；麥克風 stream 初始化與最長 50ms 的 AX focused-element seed 並行，避免 AX 排在開麥前切掉首音節；stream ready 後完成有界 target hash 與背景 Context 擷取。正常放開保留 200ms post-roll，取消／退出立即停止；收集音訊後以正規化前 RMS／clipping ratio 留下診斷（防呆：<0.3s、RMS 靜音 → error 態）
-2. processing 最多等待該 session 的 context 250ms；Context 與 fingerprint 使用同一批 retained AX refs，失敗、逾時或目標不一致時靜默降級為無上下文。貼上前與 Cmd+V 前一刻都重驗 App／視窗／焦點 fingerprint；失焦時只保留結果、不貼到錯誤位置
+2. processing 最多等待該 session 的 context 250ms；Context 與 fingerprint 使用同一批 retained AX refs，失敗、逾時或目標不一致時靜默降級為無上下文。貼上前與 Cmd+V 前一刻只重新讀取目前前景 App，不再要求 AX 視窗／欄位 metadata：Context 不跟著切換，但文字會直接送到使用者當下選定的 App；若沒有前景 App 或目前是 Claro 自己，才保留結果供複製
 3. `stt.transcribe(audio, req)`：production 暫以 `zh` hint 為預設；`auto`／`zh` 必須在同一真人 corpus 成對比較後才可改預設。只有支援 decode prompt 的 Whisper family 才附 `initial_prompt`，內容只放個人字典＋上下文 canonical terms，不把它當 LLM 指令句。現行 Qwen3-ASR backend 接受 language hint，但不接受 Whisper run extension
 4. 確定性規則：個人字典替換、CJK 空白清理（移植 `_clean_transcript`）
 5. 依 `polish_mode` 處理：RAW 不呼叫 LLM；CLEAN 做保守校訂；ORGANIZE 在使用者明確同意後才允許跨句重排。provider 不可用、隱私 gate 阻擋或防呆不通過時，一律退回 deterministic base text
 6. OpenCC s2twp 終盤 → 可選混排規則（盤古之白、全半形標點）
-7. 取消檢查（session 序號 + CancelToken）→ 寫入暫存剪貼簿後、真正送 Cmd+V 前再次執行 session／focus guard；未取消且目標仍相同才 `inject.paste()`
+7. 取消檢查（session 序號 + CancelToken）→ 寫入暫存剪貼簿後、真正送 Cmd+V 前再次執行 session guard 與目前外部前景 App 檢查；未取消且前景不是 Claro 自己才 `inject.paste()`。AX 欄位 metadata 不作為交付 gate，因此 WebView／Electron 欄位缺少 identifier 時仍可貼上
 8. history 落盤（raw、text、status、timings）；overlay 顯示結果態
 
 執行緒模型：熱鍵事件由單一 dispatcher 序列化餵狀態機（沿用 prototype 的教訓：keyDown/keyUp 亂序會卡死；Handy 的 `transcription_coordinator` 同構，印證此設計）；audio、pipeline 各自 spawn；UI 溝通全走 tauri events。
@@ -160,7 +160,7 @@ Claro 已實作並以 fixture 驗證的上下文雙重用途：
 - `AXSecureTextField` 永不讀取
 - 內建排除清單（密碼管理器等）＋全域開關；使用者自訂 per-app 停用仍是 M3 待辦
 - 上下文只存在記憶體，**永不落盤**、永不進 history
-- 稽核視圖：settings 顯示「上一次聽寫擷取了什麼」，一鍵清除；開關關閉時零 AX **文字**擷取。防誤貼仍會讀取 App／視窗／焦點 metadata 並立即 hash，只存在本次 session，不讀欄位值、不顯示、不落盤
+- 稽核視圖：settings 顯示「上一次聽寫擷取了什麼」，一鍵清除；開關關閉時零 AX **文字**擷取。Context 綁定仍會讀取 App／視窗／焦點 metadata 並立即 hash，只存在本次 session，不讀欄位值、不顯示、不落盤；貼上交付則跟隨 Cmd+V 當下的前景 App
 
 ## 8. 潤飾層與 CJK 處理（護城河）
 
@@ -185,7 +185,7 @@ prototype 教訓：1.5B 級模型會洩漏提示詞、亂加列表符號 → 預
 | 模式 | 契約 | LLM 行為 |
 |---|---|---|
 | `raw` | 只做 OpenCC、CJK 標點／空白與個人字典等確定性處理 | **永不呼叫 LLM** |
-| `clean` | 去除有停頓邊界的純填充詞、保留明確自我更正後版本、補不改變問句／驚嘆語氣的標點；LLM 不得修改任何文字或英數 token，不跨句重排、不濃縮。專有詞正確率由 STT Context 偏置與使用者字典負責 | 新安裝的預設意圖；provider 未就緒時安全退回 RAW |
+| `clean` | 去除有停頓邊界的純填充詞、保留明確自我更正後版本、補不改變問句／驚嘆語氣的標點；LLM 不得修改任何文字或英數 token，不跨句重排、不濃縮。專有詞正確率由 STT Context 偏置與使用者字典負責 | 選用；provider 未就緒時安全退回 RAW |
 | `correct` | 允許最多三個英文／專業詞拼法正規化。正確寫法必須大小寫敏感地出現在使用者詞彙／正確拼法清單，或另行同意送出的 canonical Context terms。深度 review 已證實 target-only whitespace merge 無法從局部形狀區分 `G PT→GPT`／`A PI→API` 或 `Py Torch→PyTorch`／`The Rapist→TheRapist`，所以 production guard 全面拒絕空白合併。目前只保留「恰一個連字號、左側至少四個純字母、右側恰兩個純字母、移除後字母與大小寫逐字等於 target」的極窄實驗 heuristic（如 `Clau-de→Claude`）；這只是降低風險，不是語意證明。空白合併、純改大小寫、其他標點／底線格式、字母不同、同音誤認與真正 fuzzy alias 一律只能走使用者明確建立的個人字典；`A PI→API`、`The Rapist→TheRapist`、`Under-score→Underscore`、`us→US`、`re-sign→resign` 等反例明確拒絕。數字、日期、否定、URL、email、path、版本與帶數字 token 不可由此路徑修改 | 首次啟用必須明確同意它會改變拼法格式，UI 必須標示實驗性與仍可能誤改；structured edits 由本機逐項授權，proposal text 必須逐位元等於本機套用 edit 的結果；不確定、未授權或 guard 不通過即退回 deterministic base text |
 | `organize` | 只允許完整句讀重排、分段、明確改口、完全相同內容合併與明確列舉格式化；不得改動或新增姓名、術語、數字、日期／時間、否定、條件、決策、待辦與因果 | 首次啟用必須明確同意；不確定或 guard 不通過即退回原文 |
 
@@ -218,7 +218,9 @@ STT 必須另建可重跑的真人台灣語音 corpus，不得拿文字 fixture 
 
 ## 9. 文字注入
 
-macOS 使用 `NSPasteboard` 在清空前逐 item、逐 type 完整 materialize 備份（文字、RTF、HTML、圖片、file URL 與自訂格式）→ 寫入結果與 Claro owner marker → CGEvent 合成 Cmd+V → 延遲 → 僅在 pasteboard `changeCount` 與 marker 仍屬本次注入時還原。任一格式無法完整備份就 fail closed；若使用者期間另行 Copy，絕不以舊內容覆蓋。Cmd modifier 的 release 必須走 cleanup path。IME 防護仍是第 8 節所列 M4 待辦。Windows 期：SendInput ＋ UIA，介面已由 `TextInjector` trait 隔離。
+macOS 使用 `NSPasteboard` 在清空前逐 item、逐 type eager materialize 備份（文字、RTF、HTML、圖片、file URL 與自訂格式）→ 寫入結果與 Claro owner marker → CGEvent 合成 Cmd+V → 延遲 → 僅在 pasteboard `changeCount` 與 marker 仍屬本次注入時還原。macOS 的 lazy provider 偶爾會讓同一 item 的某個冗餘 flavor 無法 materialize；此時保留該 item 其餘所有可讀格式，不得因此讓整段聽寫在 Cmd+V 前失敗。只有某個 item 完全沒有任何可備份格式時才 fail closed；若使用者期間另行 Copy，絕不以舊內容覆蓋。Cmd modifier 的 release 必須走 cleanup path。IME 防護仍是第 8 節所列 M4 待辦。Windows 期：SendInput ＋ UIA，介面已由 `TextInjector` trait 隔離。
+
+辨識或貼上失敗不得只留在短暫 overlay：後端先把可恢復文字放入本次程序的 pending queue，再送 terminal event；主視窗會自動喚回並顯示原因、目前結果與「複製結果」。成功貼上與使用者主動取消維持背景，不搶回焦點。多段未處理結果採最新失敗優先顯示，較舊內容仍保留在後方；History 關閉時不落盤，但本次程序內仍可複製或捨棄。
 
 ## 10. 隱私模型
 
@@ -281,7 +283,7 @@ Advanced 視覺化仍是 M5 驗收項目。
 | D8 | 剪貼簿還原延遲：沿用 prototype 300ms（Handy 的 50ms 會 race 慢 app），後續改剪貼簿 changeCount 輪詢 | 已定 |
 | D9 | IME 切換無現成實作，M4 spike TIS API 序列 | 已定 |
 | D10 | M1 沿用 prototype 的 Swift `mic_indicator`（Rust spawn＋同一 socket 協議），動畫原封不動；Tauri 原生 overlay（nspanel＋穿透，沿用同視覺基礎）延至 M5 打磨期 | **已定**（使用者指定保留現有動畫基礎） |
-| D11 | 文字行為拆為 RAW／CLEAN／ORGANIZE，與 Apple／Builtin／Local service／Cloud provider 分離；CLEAN 是預設意圖，ORGANIZE 明確 opt-in，所有不確定情況回退 deterministic RAW | **已定（2026-07-12，P0 Trust & Release Pass）** |
+| D11 | 文字行為拆為 RAW／CLEAN／ORGANIZE，與 Apple／Builtin／Local service／Cloud provider 分離；新安裝預設 RAW，CLEAN／ORGANIZE 皆為選用，所有不確定情況回退 deterministic RAW | **已定（2026-08-11，P0 Delivery Trust Pass）** |
 | D12 | macOS bundle identifier 在公開前凍結為 `dev.claro.desktop`；不以 `.app` 結尾，避免與 App bundle 副檔名混淆。未來如需變更必須附 TCC 遷移說明 | **已定（2026-07-12，P0 Trust & Release Pass）** |
 | D13 | 首次設定與模型生命週期由唯讀 `HardwareProfile` 決策：Intel 推薦 Turbo Q5、8–12GB Apple Silicon 推薦 large-v3 Q5、16GB+ 推薦完整 large-v3；8–12GB 路徑不讓 STT 與 4B LLM 同時常駐。Qwen3-ASR 在長音訊分段與真人台灣 corpus 通過前只供離線 eval，production UI fail closed。只改推薦與資源策略，任何正式模型下載仍須使用者明確按下 | **已定；2026-07-15 Accuracy Pass 收斂** |
 | D14 | Typeless 等閉源產品只做官方資料與人工可觀察輸出的產品評測；不反組譯、不解密私有流量、不把其輸出用於訓練、fine-tune、prompt distillation 或自動資料抽取，也不宣稱知道其模型、prompt 或內部管線。Claro 以 session-bound AX context、可稽核 surface 分類與 Meaning Lock 建立可獨立驗證的對標行為與評測目標 | **已定（2026-07-12，見 `docs/research/typeless-black-box-2026-07-12.md`）** |
