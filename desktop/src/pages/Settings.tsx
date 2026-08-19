@@ -54,12 +54,13 @@ const POLISH_MODES: { id: PolishMode; title: string; tag?: string; description: 
   {
     id: "raw",
     title: "原樣轉錄",
+    tag: "建議",
     description: "不使用文字整理模型；只套用繁體、個人字典與基本標點。",
   },
   {
     id: "clean",
     title: "保守校訂",
-    tag: "預設",
+    tag: "選用",
     description: "只處理有停頓邊界的語助詞、明確改口與標點；不改字、不跨句重排、不濃縮。",
   },
   {
@@ -1168,7 +1169,7 @@ export default function Settings({
         })}
       </Section>
 
-      <Section title="AI 潤飾">
+      <Section title="文字整理（選用）">
         {polishError && (
           <div
             className="config-error"

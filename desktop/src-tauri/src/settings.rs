@@ -24,7 +24,7 @@ fn default_stt_model() -> &'static str {
     crate::hardware::recommended_stt()
 }
 
-/// 聽寫後處理模式。模式與 LLM provider 分離：即使預設意圖是 Clean，
+/// 聽寫後處理模式。模式與 LLM provider 分離；新安裝預設 Raw，
 /// provider=off 時 pipeline 仍會安全退回 deterministic base text。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -67,8 +67,9 @@ pub fn default_config() -> Map<String, Value> {
         "whisper_model": stt_model,
         "llm_model": "mlx-community/Qwen2.5-7B-Instruct-4bit",
         "llm_enabled": true,
-        // 輸出意圖預設 CLEAN；provider 仍預設 off，所以未選引擎時安全退回原文。
-        "polish_mode": "clean",
+        // 文字整理是選用能力。新安裝預設 RAW，先讓第一次聽寫只有 STT 與貼上兩個
+        // 必要環節；使用者看過行為界線後才自行開啟 CLEAN／ORGANIZE／CORRECT。
+        "polish_mode": "raw",
         // 預設硬斷自訂雲端潤飾；只允許使用者經明確同意解除。
         "local_only": true,
         // CORRECT 可替換使用者授權的英文字詞，須獨立於格式整理與雲端傳送同意。
@@ -262,10 +263,10 @@ impl Settings {
     }
 
     /// RAW / CLEAN / CORRECT / ORGANIZE。未知或損壞值一律安全退回 RAW；
-    /// 缺值（舊設定）採用新的產品預設 CLEAN。
+    /// 缺值採用產品安全預設 RAW。
     pub fn polish_mode(&self) -> PolishMode {
         match self.raw.get("polish_mode").and_then(Value::as_str) {
-            None => PolishMode::Clean,
+            None => PolishMode::Raw,
             Some(value) => PolishMode::from_str(value).unwrap_or_else(|_| {
                 tracing::warn!("unknown polish_mode '{value}', falling back to raw");
                 PolishMode::Raw
@@ -700,11 +701,11 @@ mod tests {
     }
 
     #[test]
-    fn polish_mode_defaults_clean_but_unknown_is_safe_raw() {
+    fn polish_mode_defaults_raw_and_unknown_is_safe_raw() {
         let dir = tempdir();
         let missing = dir.join("missing.json");
         let defaults = Settings::from_path(&missing);
-        assert_eq!(defaults.polish_mode(), PolishMode::Clean);
+        assert_eq!(defaults.polish_mode(), PolishMode::Raw);
         assert!(defaults.local_only());
 
         let invalid = dir.join("invalid-mode.json");

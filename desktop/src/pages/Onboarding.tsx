@@ -154,11 +154,11 @@ export default function Onboarding({
   const polishReady = Boolean(
     llm && (llm.polish_mode === "raw" || (llm.effective_mode !== "raw" && !llm.blocked_reason)),
   );
-  const requiredReady = permissionsReady && microphoneReady && status.model_present && polishReady;
+  const requiredReady = permissionsReady && microphoneReady && status.model_present;
   const firstDictationDone = status.successful_pastes_this_launch > 0;
   const completionReady = status.setup_completed || (requiredReady && firstDictationDone);
   const checkedCount =
-    Number(permissionsReady) + Number(microphoneReady) + Number(status.model_present) + Number(polishReady);
+    Number(permissionsReady) + Number(microphoneReady) + Number(status.model_present);
   const recommendedBuiltin =
     builtinLlms.find((model) => model.id === hardware?.recommended_llm_model) ?? builtinLlms[0];
   const onboardingModel =
@@ -307,11 +307,15 @@ export default function Onboarding({
         <div>
           <span className="setup-eyebrow">首次設定・隨時可重新檢查</span>
           <h1>讓 Claro 聽得到，也貼得出去。</h1>
-          <p>完成權限、麥克風、語音模型與文字整理四項檢查，再做一次真正的聽寫。</p>
+          <p>先完成 3 項必要檢查；接著做一次真正的聽寫，確認文字能貼到游標處。</p>
         </div>
-        <div className="setup-score" aria-label={`已通過 ${checkedCount} 個檢查，共 4 個`}>
-          <strong>{checkedCount}/4</strong>
-          <span>本次檢查</span>
+        <div
+          className="setup-score"
+          aria-label={`已通過 ${checkedCount} 個必要檢查，共 3 個；${requiredReady ? "下一步是做第一次聽寫" : "請先完成必要檢查"}`}
+        >
+          <strong>{checkedCount}/3</strong>
+          <span>必要檢查</span>
+          {requiredReady && <span className="setup-score-next">下一步：第一次聽寫</span>}
         </div>
       </div>
 
@@ -412,6 +416,16 @@ export default function Onboarding({
           {!modelsLoading && !modelsError && (
             <div className="setup-model-list">
               {hardware && <div className="setup-inline-state">已依這台 Mac 的 {hardware.memory_gb} GB 記憶體選好推薦方案。</div>}
+              {onboardingModel && !onboardingModel.downloaded && (
+                <div className="setup-download-expectation" role="note">
+                  <strong>下載前先知道</strong>
+                  <span>
+                    需要網路，約 {onboardingModel.size_mb >= 1024
+                      ? `${(onboardingModel.size_mb / 1024).toFixed(1)} GB`
+                      : `${onboardingModel.size_mb} MB`}；時間取決於網路速度。下載中可取消，已完成的部分會保留，下次可續傳。
+                  </span>
+                </div>
+              )}
               {(onboardingModel ? [onboardingModel] : []).map((model) => {
                 const activationStatus = progress?.model_id === model.id ? progress.activation_status : "none";
                 const activationPending = activationStatus !== "none";
@@ -488,12 +502,12 @@ export default function Onboarding({
         aria-labelledby="setup-polish-title"
         aria-busy={Boolean(onboardingLlmDownload?.active || polishSelectionPending)}
       >
-        <div className="setup-step-number" aria-hidden="true">4</div>
+        <div className="setup-step-number" aria-hidden="true">＋</div>
         <div className="setup-step-body">
           <div className="setup-step-heading">
             <div>
-              <h2 id="setup-polish-title">選擇文字整理</h2>
-              <p>不需要另外安裝任何工具。建議使用這台 Mac 的推薦方案，也可以先不整理。</p>
+              <h2 id="setup-polish-title">文字整理（選用）</h2>
+              <p>這不會修正語音辨識錯字，也不是完成設定的必要步驟；建議先用原樣轉錄，之後再決定是否整理語助詞與段落。</p>
             </div>
             <StepStatus
               ready={polishReady}
@@ -551,7 +565,7 @@ export default function Onboarding({
                       下載約 {recommendedBuiltin.size_mb >= 1024
                         ? `${(recommendedBuiltin.size_mb / 1024).toFixed(1)} GB`
                         : `${recommendedBuiltin.size_mb} MB`}
-                      ・自動調整記憶體用量，閒置後會釋放資源
+                      ・需要網路；下載中可取消，已完成的部分會保留，下次可續傳。自動調整記憶體用量，閒置後會釋放資源
                     </span>
                     {onboardingLlmDownload && (
                       <DownloadStatus
@@ -584,8 +598,8 @@ export default function Onboarding({
 
               <div className="setup-model-row">
                 <div className="flex-1 min-w-0">
-                  <strong>原樣轉錄（不整理）</strong>
-                  <span>只做語音轉文字、個人字典與基本標點。</span>
+                  <strong>原樣轉錄（建議先用）</strong>
+                  <span>只做語音轉文字、個人字典與基本標點；少一個等待與失敗環節。</span>
                 </div>
                 {llm?.polish_mode !== "raw" && (
                   <button className="btn no-drag" onClick={chooseRaw}>使用原樣轉錄</button>
@@ -609,11 +623,11 @@ export default function Onboarding({
       </section>
 
       <section className={`setup-step setup-first-dictation ${completionReady ? "ready" : "blocked"}`} aria-labelledby="setup-first-title">
-        <div className="setup-step-number" aria-hidden="true">5</div>
+        <div className="setup-step-number setup-step-next" aria-hidden="true">→</div>
         <div className="setup-step-body">
           <div className="setup-step-heading">
             <div>
-              <h2 id="setup-first-title">做第一次聽寫</h2>
+              <h2 id="setup-first-title">下一步：做第一次聽寫</h2>
               {status.setup_completed ? (
                 requiredReady ? (
                   <p>先前已完成首次設定；目前權限、模型與文字整理也已就緒。</p>
@@ -624,10 +638,17 @@ export default function Onboarding({
                 firstDictationDone ? (
                   <p>已偵測到本次啟動真正完成的聽寫與貼上，可以完成設定。</p>
                 ) : (
-                  <p>切到 TextEdit 或任意文字輸入框，按住 <Hotkey combo={status.hotkey} /> 說「Claro 測試一二三」，放開並確認文字真的貼上，再回到這裡。</p>
+                  <>
+                    <p>這是前三項檢查後的最後確認，不計入上方檢查分數；做完後回到 Claro 完成設定。</p>
+                    <ol className="setup-first-dictation-list">
+                      <li>切到 TextEdit 或任意可輸入文字的 App。</li>
+                      <li>按住 <Hotkey combo={status.hotkey} />，說「Claro 測試一二三」，放開。</li>
+                      <li>看到文字貼上後回到 Claro；沒貼上就再試一次，或到歷史紀錄複製結果。</li>
+                    </ol>
+                  </>
                 )
               ) : (
-                <p>完成前四項檢查後，這裡會顯示第一次聽寫操作。</p>
+                <p>先完成上方 3 項必要檢查；完成後回到這裡做一次貼上測試。</p>
               )}
             </div>
             <StepStatus
@@ -635,7 +656,7 @@ export default function Onboarding({
               label={
                 status.setup_completed
                   ? requiredReady ? "設定已完成" : "需重新檢查"
-                  : completionReady ? "已完成真實聽寫" : requiredReady ? "等待第一次貼上" : "等待前面步驟"
+                  : completionReady ? "已完成真實聽寫" : requiredReady ? "等待第一次貼上" : "先完成 3 項檢查"
               }
             />
           </div>

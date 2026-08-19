@@ -2703,6 +2703,7 @@ mod tests {
     fn local_only_blocks_remote_custom_but_not_loopback_custom() {
         let remote = settings_from(json!({
             "llm_provider": "custom",
+            "polish_mode": "clean",
             "llm_polish_model": "model",
             "llm_base_url": "https://api.example.com/v1",
             "local_only": true,
@@ -2714,6 +2715,7 @@ mod tests {
 
         let loopback = settings_from(json!({
             "llm_provider": "custom",
+            "polish_mode": "clean",
             "llm_polish_model": "model",
             "llm_base_url": "http://127.0.0.1:8080/v1",
             "local_only": true,
